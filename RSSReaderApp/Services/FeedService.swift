@@ -4,6 +4,90 @@ import FeedKit
 import SwiftUI // For UIImage
 import SwiftSoup
 
+private let articleAntiBlockTextPhrases = [
+    "ad or script blocking software",
+    "ad blocking software is interfering",
+    "script blocking software is interfering",
+    "disable any ad or script blocking software",
+    "disable any ad blocking software",
+    "disable any script blocking software"
+]
+
+private let articleAdvertisingSelectors = [
+    "script",
+    "style",
+    "iframe",
+    "frame",
+    "ins",
+    "noscript",
+    "object",
+    "embed",
+    "form",
+    "amp-ad",
+    "amp-embed",
+    "[role=\"advertisement\"]",
+    "[data-ad]",
+    "[data-ads]",
+    "[data-ad-client]",
+    "[data-ad-slot]",
+    "[data-ad-unit]",
+    "[data-dfp]",
+    "[data-gpt]",
+    "[data-google-query-id]",
+    "[data-taboola]",
+    "[data-outbrain]",
+    "[data-sponsored]",
+    ".advertisement",
+    ".ad-container",
+    ".ad-container--leaderboard",
+    ".ad-container--river",
+    ".adsbygoogle",
+    ".author_ad",
+    ".inlinead",
+    ".google-auto-placed",
+    ".googlepublisherpluginad",
+    ".sponsor-block",
+    ".newsletter-block",
+    ".comments-link",
+    ".st-related-posts"
+]
+
+private func containsArticleAntiBlockText(_ text: String) -> Bool {
+    let normalized = text
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    guard !normalized.isEmpty else { return false }
+    return articleAntiBlockTextPhrases.contains { normalized.contains($0) }
+}
+
+private func stripArticleAdvertisingElements(in document: SwiftSoup.Document) {
+    for selector in articleAdvertisingSelectors {
+        try? document.select(selector).remove()
+    }
+
+    try? document.select("p, div, section, aside, figure, span, strong, b").forEach { element in
+        let text = (try? element.text().trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+        if !text.isEmpty && text.count < 900 && containsArticleAntiBlockText(text) {
+            try? element.remove()
+        }
+    }
+}
+
+private func stripArticleAdvertisingElements(in element: SwiftSoup.Element) {
+    for selector in articleAdvertisingSelectors {
+        try? element.select(selector).remove()
+    }
+
+    try? element.select("p, div, section, aside, figure, span, strong, b").forEach { candidate in
+        let text = (try? candidate.text().trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+        if !text.isEmpty && text.count < 900 && containsArticleAntiBlockText(text) {
+            try? candidate.remove()
+        }
+    }
+}
+
 // MARK: - String Extension for HTML Processing
 extension String {
     func removingHTML() -> String {
@@ -20,6 +104,7 @@ extension String {
         // Just clean up the HTML without inserting image markers
         do {
             let document = try SwiftSoup.parse(self)
+            stripArticleAdvertisingElements(in: document)
             
             // Fix image URLs to ensure they're absolute
             let imgElements = try document.select("img")
@@ -181,6 +266,9 @@ class FeedService {
             // --- Fallback: Extract first <img> from content if no standard URL found ---
             if articleImageURL == nil, !htmlContent.isEmpty {
                 articleImageURL = self.extractFirstImageURL(fromHTML: htmlContent)
+                if let feedTitle = feed.title, feedTitle.lowercased().contains("macrumors") {
+                    print("MacRumors image extraction: \(articleImageURL?.absoluteString ?? "nil") for article: \(rawTitle)")
+                }
             }
             // --- End Fallback ---
             
@@ -199,8 +287,15 @@ class FeedService {
                 }
             }
             
+            let articleId = generateStableArticleID(
+                guid: item.guid?.value,
+                link: item.link,
+                title: rawTitle,
+                feedURL: url
+            )
+            
             var article = Article(
-                id: item.guid?.value ?? UUID().uuidString,
+                id: articleId,
                 title: rawTitle.removingHTML(),
                 content: htmlContent.processHTMLContent(),
                 url: URL(string: item.link ?? ""),
@@ -244,8 +339,15 @@ class FeedService {
             let articleImageURL = self.extractFirstImageURL(fromHTML: htmlContent)
             // --- End Fallback ---
             
+            let articleId = generateStableArticleID(
+                guid: entry.id,
+                link: articleURLString,
+                title: rawTitle,
+                feedURL: url
+            )
+            
             var article = Article(
-                id: entry.id ?? UUID().uuidString,
+                id: articleId,
                 title: rawTitle.removingHTML(),
                 content: htmlContent.processHTMLContent(),
                 url: URL(string: articleURLString ?? ""),
@@ -289,11 +391,21 @@ class FeedService {
             // --- Fallback: Extract first <img> from content if no standard URL found ---
             if articleImageURL == nil, !htmlContent.isEmpty {
                 articleImageURL = self.extractFirstImageURL(fromHTML: htmlContent)
+                if let feedTitle = feed.title, feedTitle.lowercased().contains("macrumors") {
+                    print("MacRumors image extraction: \(articleImageURL?.absoluteString ?? "nil") for article: \(rawTitle)")
+                }
             }
             // --- End Fallback ---
 
+            let articleId = generateStableArticleID(
+                guid: item.id,
+                link: item.url,
+                title: rawTitle,
+                feedURL: url
+            )
+
             var article = Article(
-                id: item.id ?? UUID().uuidString,
+                id: articleId,
                 title: rawTitle.removingHTML(),
                 content: htmlContent.processHTMLContent(),
                 url: URL(string: item.url ?? ""),
@@ -409,6 +521,7 @@ class FeedService {
                 
                 do {
                     let doc = try SwiftSoup.parse(html)
+                    stripArticleAdvertisingElements(in: doc)
                     
                     // Site-specific handling for known problematic sites
                     let host = url.host?.lowercased() ?? ""
@@ -422,8 +535,7 @@ class FeedService {
                     try doc.select("a.more-link, .more-link, .read-more, .readmore, " +
                                   ".sharedaddy, .share-buttons, .social-share, " +
                                   ".comments, .article-comments, " +
-                                  ".related-posts, .recommended, " +
-                                  "script, style, iframe, .advertisement, .ad-container").remove()
+                                  ".related-posts, .recommended").remove()
                     
                     // Try multiple content selectors in order of specificity
                     let potentialContentSelectors = [
@@ -454,6 +566,8 @@ class FeedService {
                     
                     // Fix images to ensure they have proper src attributes
                     if let element = mainElement {
+                        stripArticleAdvertisingElements(in: element)
+
                         let imgElements = try element.select("img")
                         for img in imgElements {
                             // Handle data-lazy-src which is common in WordPress sites
@@ -505,10 +619,10 @@ class FeedService {
     }
     
     /// Special handler for 9to5Mac articles which have a specific structure
-    private func handle9to5Mac(doc: Document, article: Article) -> Article {
+    private func handle9to5Mac(doc: SwiftSoup.Document, article: Article) -> Article {
         do {
             // Remove sponsor blocks, newsletter forms, and other clutter
-            try doc.select(".sponsor-block, .newsletter-block, .comments-link, .st-related-posts, script, style, form").remove()
+            stripArticleAdvertisingElements(in: doc)
             
             // 9to5Mac uses a specific content structure
             let contentSelectors = [
@@ -528,6 +642,8 @@ class FeedService {
             guard let contentElement = mainElement else {
                 return article
             }
+
+            stripArticleAdvertisingElements(in: contentElement)
             
             // Fix images to ensure they have proper src attributes
             let imgElements = try contentElement.select("img")
@@ -629,5 +745,35 @@ class FeedService {
         }
         return nil
     }
-}
+    
+    /// Generate a stable article ID so read state persists across refreshes and devices.
+    /// Uses guid > link > hash(title + feedURL) priority. Does NOT use publishDate in fallback
+    /// because some feeds don't provide dates consistently, causing Date() fallback which
+    /// changes on every fetch and breaks read state tracking.
+    private func generateStableArticleID(guid: String?, link: String?, title: String, feedURL: String) -> String {
+        let trimmedGUID = guid?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedGUID, !trimmedGUID.isEmpty {
+            return ArticleIDNormalizer.normalize(trimmedGUID)
+        }
 
+        let trimmedLink = link?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedLink, !trimmedLink.isEmpty {
+            return ArticleIDNormalizer.normalize(trimmedLink)
+        }
+
+        // Deterministic hash from title + feedURL (both are stable across fetches)
+        // Using feedURL ensures uniqueness across different feeds with same title
+        let seed = "\(title)|\(feedURL)"
+        let hash = djb2Hex(seed)
+        return "hash-\(hash)"
+    }
+    
+    /// Simple deterministic hash (djb2) encoded as hex.
+    private func djb2Hex(_ string: String) -> String {
+        var hash: UInt64 = 5381
+        for byte in string.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(byte) // hash * 33 + byte
+        }
+        return String(hash, radix: 16)
+    }
+}
