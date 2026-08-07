@@ -108,6 +108,10 @@ func formatAskAIResponseForDisplay(_ input: String) -> String {
 }
 
 // MARK: - Ask AI Response Sheet
+#if os(macOS)
+private let macAskAIPanelTint = Color(red: 0.30, green: 0.46, blue: 0.64).opacity(0.26)
+#endif
+
 #if os(iOS) || os(macOS)
 struct AskAIResponseSheet: View {
     let isLoading: Bool
@@ -116,17 +120,116 @@ struct AskAIResponseSheet: View {
     let onClose: () -> Void
     let onCopy: () -> Void
 
+    @EnvironmentObject private var appState: AppState
+    @State private var isAskingFollowUp = false
+    @State private var followUpResponse: String?
+    @State private var showFollowUpSheet = false
+
     var body: some View {
+        rootContainer
+            .askAILoadingOverlay(isAskingFollowUp)
+            .sheet(isPresented: $showFollowUpSheet) {
+                AskAIResponseSheet(
+                    isLoading: false,
+                    response: followUpResponse,
+                    errorMessage: nil,
+                    onClose: {
+                        showFollowUpSheet = false
+                    },
+                    onCopy: copyFollowUpResponse
+                )
+                .environmentObject(appState)
+                #if os(macOS)
+                .frame(
+                    minWidth: 480,
+                    idealWidth: 640,
+                    maxWidth: .infinity,
+                    minHeight: 420,
+                    idealHeight: 520,
+                    maxHeight: .infinity
+                )
+                #endif
+            }
+    }
+
+    @ViewBuilder
+    private var rootContainer: some View {
         #if os(macOS)
-        NavigationStack {
-            content
-        }
+        macSheetContent
         #else
         NavigationView {
             content
         }
         #endif
     }
+
+    #if os(macOS)
+    private var macSheetContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Button("Close") {
+                    onClose()
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+
+                Spacer()
+
+                if response != nil {
+                    Button {
+                        onCopy()
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.title2)
+                            .frame(width: 34, height: 34)
+                            .accessibilityLabel("Copy")
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .controlSize(.large)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+
+            Text("Ask AI")
+                .font(.largeTitle.bold())
+                .padding(.horizontal, 24)
+                .padding(.top, 18)
+                .padding(.bottom, 8)
+
+            content
+                .padding(.horizontal, 8)
+        }
+        .frame(
+            minWidth: 480,
+            idealWidth: 640,
+            maxWidth: 760,
+            minHeight: 420,
+            idealHeight: 520,
+            maxHeight: 720
+        )
+        .glassEffect(
+            .regular.tint(macAskAIPanelTint),
+            in: .rect(cornerRadius: 32)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.28),
+                            Color.white.opacity(0.08)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.8
+                )
+        }
+    }
+    #endif
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -137,9 +240,15 @@ struct AskAIResponseSheet: View {
 
             if let response {
                 ScrollView {
-                    Text(formatAskAIResponseForDisplay(response))
+                    SelectableText(formatAskAIResponseForDisplay(response))
+                        .font(.body)
+                        .onAskAI {
+                            askFollowUp(selectedText: $0, currentAnswer: response, useWebAI: false)
+                        }
+                        .onAskAIWeb {
+                            askFollowUp(selectedText: $0, currentAnswer: response, useWebAI: true)
+                        }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
                         .padding(.horizontal, 4)
                 }
             } else if let errorMessage {
@@ -151,10 +260,9 @@ struct AskAIResponseSheet: View {
             Spacer()
         }
         .padding()
-        .navigationTitle("Ask AI")
         #if os(iOS)
+        .navigationTitle("Ask AI")
         .navigationBarTitleDisplayMode(.inline)
-        #endif
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Close") {
@@ -169,6 +277,65 @@ struct AskAIResponseSheet: View {
                 }
             }
         }
+        #endif
+    }
+
+    private func askFollowUp(selectedText: String, currentAnswer: String, useWebAI: Bool) {
+        guard !isAskingFollowUp else { return }
+
+        let selected = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let context = formatAskAIResponseForDisplay(currentAnswer)
+        guard !selected.isEmpty, !context.isEmpty else { return }
+
+        let prompt = """
+        Answer the question using only the selected text and the current Ask AI answer.
+
+        Rules:
+        - Return plain text only.
+        - Do not use Markdown symbols, headings, bullets, or code fences.
+        - Use short paragraphs separated by a blank line when the answer has multiple ideas.
+        - If the current answer does not contain enough information, say so.
+
+        Question:
+        What is said about this selected text in the current answer?
+
+        Selected text:
+        \(selected)
+
+        Current Ask AI Answer:
+        \(context)
+        """
+
+        followUpResponse = nil
+        isAskingFollowUp = true
+
+        let completion: (String) -> Void = { answer in
+            DispatchQueue.main.async {
+                followUpResponse = formatAskAIResponseForDisplay(answer)
+                isAskingFollowUp = false
+                showFollowUpSheet = true
+            }
+        }
+
+        if useWebAI {
+            appState.askWebQuestionAboutSelection(
+                prompt: prompt,
+                title: "Ask AI Web",
+                completion: completion
+            )
+        } else {
+            appState.askQuestionAboutSelection(prompt: prompt, completion: completion)
+        }
+    }
+
+    private func copyFollowUpResponse() {
+        guard let followUpResponse, !followUpResponse.isEmpty else { return }
+        #if os(iOS)
+        UIPasteboard.general.string = followUpResponse
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(followUpResponse, forType: .string)
+        #endif
     }
 }
 #endif
@@ -185,7 +352,7 @@ struct AskAILoadingOverlay: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(.thinMaterial, in: Capsule())
         .overlay(
             Capsule()
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
@@ -246,6 +413,8 @@ struct SelectableText: View {
     var framePadding: EdgeInsets? = nil
     var onAskAISelection: ((String) -> Void)? = nil
     var onAskAIWebSelection: ((String) -> Void)? = nil
+    var summaryReferenceCount: Int = 0
+    var onSummaryReferenceTap: ((Int) -> Void)? = nil
     @Environment(\.askAISelectionHandler) private var askAISelectionHandler
     @Environment(\.askAIWebSelectionHandler) private var askAIWebSelectionHandler
 
@@ -283,7 +452,9 @@ struct SelectableText: View {
             lineLimit: lineLimit,
             underline: underline,
             onAskAI: onAskAISelection ?? askAISelectionHandler,
-            onAskAIWeb: onAskAIWebSelection ?? askAIWebSelectionHandler
+            onAskAIWeb: onAskAIWebSelection ?? askAIWebSelectionHandler,
+            summaryReferenceCount: summaryReferenceCount,
+            onSummaryReferenceTap: onSummaryReferenceTap
         )
         .frame(width: frameWidth, height: frameHeight)
         .frame(maxWidth: frameMaxWidth, maxHeight: frameMaxHeight)
@@ -390,6 +561,13 @@ struct SelectableText: View {
     func onAskAIWeb(_ handler: ((String) -> Void)?) -> SelectableText {
         var copy = self
         copy.onAskAIWebSelection = handler
+        return copy
+    }
+
+    func summaryReferences(count: Int, onTap: ((Int) -> Void)?) -> SelectableText {
+        var copy = self
+        copy.summaryReferenceCount = count
+        copy.onSummaryReferenceTap = onTap
         return copy
     }
 }
@@ -661,6 +839,31 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
     let underline: Bool
     let onAskAI: ((String) -> Void)?
     let onAskAIWeb: ((String) -> Void)?
+    let summaryReferenceCount: Int
+    let onSummaryReferenceTap: ((Int) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onSummaryReferenceTap: onSummaryReferenceTap)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var onSummaryReferenceTap: ((Int) -> Void)?
+
+        init(onSummaryReferenceTap: ((Int) -> Void)?) {
+            self.onSummaryReferenceTap = onSummaryReferenceTap
+        }
+
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            guard let url = link as? URL,
+                  url.scheme == "rssreader-summary",
+                  let value = url.pathComponents.last,
+                  let referenceNumber = Int(value) else {
+                return false
+            }
+            onSummaryReferenceTap?(referenceNumber)
+            return true
+        }
+    }
 
     func makeNSView(context: Context) -> AskAISelectableTextView {
         let textView = AskAISelectableTextView()
@@ -680,12 +883,14 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         textView.setContentCompressionResistancePriority(.required, for: .vertical)
         textView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         textView.setContentHuggingPriority(.required, for: .vertical)
+        textView.delegate = context.coordinator
         return textView
     }
 
     func updateNSView(_ nsView: AskAISelectableTextView, context: Context) {
         nsView.onAskAI = onAskAI
         nsView.onAskAIWeb = onAskAIWeb
+        context.coordinator.onSummaryReferenceTap = onSummaryReferenceTap
 
         let fontKey: String
         let baseFont: NSFont
@@ -800,10 +1005,18 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         hasher.combine(underline)
         hasher.combine(lineLimit ?? -1)
         hasher.combine(paragraphStyle.alignment.rawValue)
+        hasher.combine(summaryReferenceCount)
         let signature = hasher.finalize()
 
         if nsView.lastRenderedText != text || nsView.renderSignature != signature {
-            nsView.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: attributes))
+            let attributedText = NSMutableAttributedString(string: text, attributes: attributes)
+            applySummaryReferenceLinks(
+                to: attributedText,
+                text: text,
+                maximumReference: summaryReferenceCount,
+                baseFont: finalFont
+            )
+            nsView.textStorage?.setAttributedString(attributedText)
 
             if let limit = lineLimit {
                 nsView.textContainer?.maximumNumberOfLines = limit
@@ -815,6 +1028,38 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             nsView.lastRenderedText = text
             nsView.renderSignature = signature
             nsView.invalidateIntrinsicContentSize()
+        }
+    }
+
+    private func applySummaryReferenceLinks(
+        to attributedText: NSMutableAttributedString,
+        text: String,
+        maximumReference: Int,
+        baseFont: NSFont
+    ) {
+        guard maximumReference > 0, !text.isEmpty else { return }
+        let phrasePattern = #"\b(?:post|posts|article|articles|item|items)\s+\d+(?:\s*(?:,|\band\b|&)\s*(?:(?:post|posts|article|articles|item|items)\s+)?\d+)*"#
+        guard let phraseRegex = try? NSRegularExpression(pattern: phrasePattern, options: [.caseInsensitive]),
+              let numberRegex = try? NSRegularExpression(pattern: #"\d+"#) else { return }
+
+        let source = text as NSString
+        let sourceRange = NSRange(location: 0, length: source.length)
+        for phraseMatch in phraseRegex.matches(in: text, range: sourceRange) {
+            for numberMatch in numberRegex.matches(in: text, range: phraseMatch.range) {
+                let number = Int(source.substring(with: numberMatch.range)) ?? 0
+                guard (1...maximumReference).contains(number),
+                      let destination = URL(string: "rssreader-summary://item/\(number)") else { continue }
+                attributedText.addAttributes(
+                    [
+                        .link: destination,
+                        .foregroundColor: NSColor.linkColor,
+                        .backgroundColor: NSColor.linkColor.withAlphaComponent(0.16),
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                        .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
+                    ],
+                    range: numberMatch.range
+                )
+            }
         }
     }
 }

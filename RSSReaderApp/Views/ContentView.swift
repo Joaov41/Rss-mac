@@ -60,7 +60,15 @@ enum ReaderModeService {
     /// JavaScript that loads Readability.js and extracts the article content.
     /// Returns a clean HTML document with just the article content.
     static func toggleScript(useCompactTitle: Bool) -> String {
-        let readability = loadReadabilitySource()
+        useCompactTitle ? compactToggleScript : regularToggleScript
+    }
+
+    private static let compactToggleScript = makeToggleScript(useCompactTitle: true)
+    private static let regularToggleScript = makeToggleScript(useCompactTitle: false)
+    private static let readabilitySource = loadReadabilitySource()
+
+    private static func makeToggleScript(useCompactTitle: Bool) -> String {
+        let readability = readabilitySource
         let titleFontSize = useCompactTitle ? 28 : 30
         let antiBlockPhrasesLiteral = articleReaderJavaScriptArrayLiteral(articleReaderAntiBlockPhrases)
         let readerScript = """
@@ -1320,31 +1328,23 @@ private extension View {
     func feedListColumnStyle(
         colorScheme: ColorScheme,
         scrollOffset: CGFloat,
-        restoreOffset: CGPoint? = nil,
-        onContentOffsetChange: ((CGPoint) -> Void)? = nil,
-        onRestoreComplete: (() -> Void)? = nil,
+        restorationKey: String,
+        trackedItemIDs: [String],
         onScrollOffsetChange: @escaping (CGFloat) -> Void
     ) -> some View {
         #if os(macOS)
         return self
             .scrollContentBackground(.hidden)
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                max(0, geometry.contentOffset.y + geometry.contentInsets.top)
-            } action: { _, newOffset in
-                onScrollOffsetChange(newOffset)
-            }
             .background {
                 AppColors.feedListBackground(for: colorScheme, scrollOffset: 0)
                     .ignoresSafeArea()
             }
-            .background(
-                FeedListScrollOffsetObserver(
-                    restoreOffset: restoreOffset,
-                    onContentOffsetChange: onContentOffsetChange,
-                    onRestoreComplete: onRestoreComplete,
-                    onOffsetChange: { _ in }
+            .modifier(
+                MacNativeScrollRestorationModifier(
+                    restorationKey: restorationKey,
+                    trackedItemIDs: trackedItemIDs,
+                    onOffsetChange: onScrollOffsetChange
                 )
-                .frame(width: 0, height: 0)
             )
         #else
         return self
@@ -1358,177 +1358,161 @@ private extension View {
 }
 
 #if os(macOS)
-private struct FeedListScrollOffsetObserver: NSViewRepresentable {
-    let restoreOffset: CGPoint?
-    let onContentOffsetChange: ((CGPoint) -> Void)?
-    let onRestoreComplete: (() -> Void)?
+private struct MacNativeScrollGeometry: Equatable {
+    let contentOffset: CGPoint
+    let containerSize: CGSize
+}
+
+@MainActor
+private final class MacNativeScrollRestorationTracker {
+    var geometry = MacNativeScrollGeometry(contentOffset: .zero, containerSize: .zero)
+    var visibleIDs: [String] = []
+    var isRestoring = false
+    var lastReportedOffset: CGFloat = -1
+    var restoreTask: Task<Void, Never>?
+}
+
+private struct MacNativeScrollRestorationModifier: ViewModifier {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let restorationKey: String
+    let trackedItemIDs: [String]
     let onOffsetChange: (CGFloat) -> Void
 
-    init(
-        restoreOffset: CGPoint? = nil,
-        onContentOffsetChange: ((CGPoint) -> Void)? = nil,
-        onRestoreComplete: (() -> Void)? = nil,
-        onOffsetChange: @escaping (CGFloat) -> Void
-    ) {
-        self.restoreOffset = restoreOffset
-        self.onContentOffsetChange = onContentOffsetChange
-        self.onRestoreComplete = onRestoreComplete
-        self.onOffsetChange = onOffsetChange
+    @State private var scrollPosition = ScrollPosition(idType: String.self)
+    @State private var tracker = MacNativeScrollRestorationTracker()
+
+    private var contentFingerprint: UInt64 {
+        trackedItemIDs.reduce(14_695_981_039_346_656_037) { hash, id in
+            id.utf8.reduce(hash) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        }
     }
 
-    func makeNSView(context: Context) -> ObserverView {
-        let view = ObserverView(frame: .zero)
-        view.restoreOffset = restoreOffset
-        view.onContentOffsetChange = onContentOffsetChange
-        view.onRestoreComplete = onRestoreComplete
-        view.onOffsetChange = onOffsetChange
-        return view
-    }
-
-    func updateNSView(_ nsView: ObserverView, context: Context) {
-        nsView.restoreOffset = restoreOffset
-        nsView.onContentOffsetChange = onContentOffsetChange
-        nsView.onRestoreComplete = onRestoreComplete
-        nsView.onOffsetChange = onOffsetChange
-        nsView.attachToEnclosingScrollViewIfNeeded()
-        nsView.applyRestoreIfNeeded()
-    }
-
-    final class ObserverView: NSView {
-        var restoreOffset: CGPoint?
-        var onContentOffsetChange: ((CGPoint) -> Void)?
-        var onRestoreComplete: (() -> Void)?
-        var onOffsetChange: ((CGFloat) -> Void)?
-        private weak var observedScrollView: NSScrollView?
-        private var lastReportedOffset: CGFloat = -1
-        private var attachRetryCount = 0
-        private var isAttachRetryScheduled = false
-        private var isApplyingRestore = false
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            attachToEnclosingScrollViewIfNeeded()
-            applyRestoreIfNeeded()
-        }
-
-        deinit {
-            removeObservers()
-        }
-
-        func attachToEnclosingScrollViewIfNeeded() {
-            guard let scrollView = enclosingScrollView else {
-                scheduleAttachRetryIfNeeded()
-                return
+    func body(content: Content) -> some View {
+        content
+            .scrollPosition($scrollPosition)
+            .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { ids in
+                tracker.visibleIDs = ids
             }
-
-            attachRetryCount = 0
-            isAttachRetryScheduled = false
-
-            guard observedScrollView !== scrollView else {
-                reportOffset(from: scrollView)
-                applyRestoreIfNeeded()
-                return
-            }
-
-            removeObservers()
-            observedScrollView = scrollView
-
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleBoundsDidChange),
-                name: NSView.boundsDidChangeNotification,
-                object: scrollView.contentView
-            )
-            scrollView.contentView.postsBoundsChangedNotifications = true
-            scrollView.drawsBackground = false
-            reportOffset(from: scrollView)
-            applyRestoreIfNeeded()
-        }
-
-        func applyRestoreIfNeeded() {
-            guard !isApplyingRestore,
-                  let scrollView = observedScrollView,
-                  let restoreOffset else { return }
-
-            isApplyingRestore = true
-            apply(restoreOffset, in: scrollView)
-
-            DispatchQueue.main.async { [weak self, weak scrollView] in
-                guard let self, let scrollView else { return }
-                self.apply(restoreOffset, in: scrollView)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self, weak scrollView] in
-                guard let self, let scrollView else { return }
-                self.apply(restoreOffset, in: scrollView)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self, weak scrollView] in
-                guard let self else { return }
-                if let scrollView {
-                    self.apply(restoreOffset, in: scrollView)
-                    self.reportOffset(from: scrollView)
+            .onScrollGeometryChange(
+                for: MacNativeScrollGeometry.self,
+                of: { MacNativeScrollGeometry(contentOffset: $0.contentOffset, containerSize: $0.containerSize) }
+            ) { _, geometry in
+                tracker.geometry = geometry
+                let normalizedOffset = max(0, geometry.contentOffset.y)
+                let quantizedOffset = (normalizedOffset / 8).rounded() * 8
+                if abs(quantizedOffset - tracker.lastReportedOffset) >= 8 {
+                    tracker.lastReportedOffset = quantizedOffset
+                    onOffsetChange(quantizedOffset)
                 }
-                self.restoreOffset = nil
-                self.isApplyingRestore = false
-                self.onRestoreComplete?()
             }
+            .onScrollPhaseChange { _, newPhase in
+                if newPhase == .idle {
+                    saveSnapshot()
+                }
+            }
+            .onAppear {
+                restorePosition()
+            }
+            .onDisappear {
+                saveSnapshot()
+                tracker.restoreTask?.cancel()
+                tracker.restoreTask = nil
+            }
+    }
+
+    private func preferredAnchorID() -> String? {
+        let visible = Set(tracker.visibleIDs)
+        return trackedItemIDs.first(where: visible.contains)
+            ?? scrollPosition.viewID(type: String.self)
+            ?? appState.getSavedScrollPosition(for: restorationKey)
+    }
+
+    private func saveSnapshot() {
+        guard !tracker.isRestoring else { return }
+        let anchorID = preferredAnchorID()
+        let anchorIndex = anchorID.flatMap { trackedItemIDs.firstIndex(of: $0) } ?? 0
+        appState.saveScrollRestorationSnapshot(
+            ScrollRestorationSnapshot(
+                anchorID: anchorID,
+                anchorIndex: anchorIndex,
+                contentOffset: tracker.geometry.contentOffset,
+                contentFingerprint: contentFingerprint,
+                containerWidth: tracker.geometry.containerSize.width,
+                dynamicTypeSize: String(describing: dynamicTypeSize)
+            ),
+            for: restorationKey
+        )
+    }
+
+    private func restorePosition() {
+        tracker.restoreTask?.cancel()
+        guard let snapshot = appState.scrollRestorationSnapshot(for: restorationKey) else {
+            if let savedID = appState.getSavedScrollPosition(for: restorationKey),
+               trackedItemIDs.contains(savedID) {
+                var target = scrollPosition
+                target.scrollTo(id: savedID, anchor: .center)
+                scrollPosition = target
+            }
+            return
         }
 
-        private func apply(_ offset: CGPoint, in scrollView: NSScrollView) {
-            var target = offset
+        tracker.isRestoring = true
+        let fingerprint = contentFingerprint
+        let ids = trackedItemIDs
+        let dynamicType = String(describing: dynamicTypeSize)
 
-            if let documentView = scrollView.documentView {
-                let documentBounds = documentView.bounds
-                let visibleBounds = scrollView.contentView.bounds
-                let maxX = max(documentBounds.minX, documentBounds.maxX - visibleBounds.width)
-                let maxY = max(documentBounds.minY, documentBounds.maxY - visibleBounds.height)
+        tracker.restoreTask = Task { @MainActor in
+            for attempt in 0..<3 {
+                guard !Task.isCancelled else { return }
+                if attempt > 0 {
+                    try? await Task.sleep(for: .milliseconds(60 * attempt))
+                } else {
+                    await Task.yield()
+                }
 
-                target.x = min(max(target.x, documentBounds.minX), maxX)
-                target.y = min(max(target.y, documentBounds.minY), maxY)
+                guard tracker.geometry.containerSize.width > 0, !ids.isEmpty else { continue }
+
+                let canRestoreExactOffset = snapshot.contentFingerprint == fingerprint
+                    && abs(snapshot.containerWidth - tracker.geometry.containerSize.width) <= 1
+                    && snapshot.dynamicTypeSize == dynamicType
+
+                var target = scrollPosition
+                if canRestoreExactOffset {
+                    target.scrollTo(point: snapshot.contentOffset)
+                } else if let anchorID = fallbackAnchorID(for: snapshot, in: ids) {
+                    target.scrollTo(id: anchorID, anchor: .top)
+                }
+                scrollPosition = target
+
+                try? await Task.sleep(for: .milliseconds(50))
+                guard !Task.isCancelled else { return }
+
+                if canRestoreExactOffset,
+                   abs(tracker.geometry.contentOffset.y - snapshot.contentOffset.y) > 2,
+                   let anchorID = fallbackAnchorID(for: snapshot, in: ids) {
+                    var fallback = scrollPosition
+                    fallback.scrollTo(id: anchorID, anchor: .top)
+                    scrollPosition = fallback
+                }
+
+                tracker.isRestoring = false
+                tracker.restoreTask = nil
+                return
             }
 
-            scrollView.contentView.scroll(to: target)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            tracker.isRestoring = false
+            tracker.restoreTask = nil
         }
+    }
 
-        private func scheduleAttachRetryIfNeeded() {
-            guard window != nil, attachRetryCount < 40, !isAttachRetryScheduled else { return }
-
-            attachRetryCount += 1
-            isAttachRetryScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                guard let self else { return }
-                self.isAttachRetryScheduled = false
-                self.attachToEnclosingScrollViewIfNeeded()
-                self.applyRestoreIfNeeded()
-            }
+    private func fallbackAnchorID(for snapshot: ScrollRestorationSnapshot, in ids: [String]) -> String? {
+        if let anchorID = snapshot.anchorID, ids.contains(anchorID) {
+            return anchorID
         }
-
-        private func removeObservers() {
-            if let observedScrollView {
-                NotificationCenter.default.removeObserver(
-                    self,
-                    name: NSView.boundsDidChangeNotification,
-                    object: observedScrollView.contentView
-                )
-            }
-        }
-
-        @objc private func handleBoundsDidChange(_ notification: Notification) {
-            guard let scrollView = observedScrollView else { return }
-            reportOffset(from: scrollView)
-        }
-
-        private func reportOffset(from scrollView: NSScrollView) {
-            if !isApplyingRestore {
-                onContentOffsetChange?(scrollView.contentView.bounds.origin)
-            }
-
-            let normalizedOffset = normalizedMacScrollOffset(from: scrollView)
-            guard normalizedOffset == 0 || abs(normalizedOffset - lastReportedOffset) >= 1 else { return }
-
-            lastReportedOffset = normalizedOffset
-            onOffsetChange?(normalizedOffset)
-        }
+        guard !ids.isEmpty else { return nil }
+        return ids[min(max(snapshot.anchorIndex, 0), ids.count - 1)]
     }
 }
 
@@ -2083,6 +2067,31 @@ private struct RedditSortPicker: View {
     }
 }
 
+#if os(macOS)
+private struct MacRedditSummaryScopeButtonGlassModifier: ViewModifier {
+    let tint: Color
+
+    func body(content: Content) -> some View {
+        content
+            .buttonStyle(.plain)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .glassEffect(
+                .regular.tint(tint).interactive(),
+                in: .rect(cornerRadius: 14)
+            )
+    }
+}
+
+private extension View {
+    func macRedditSummaryScopeButtonGlass(tint: Color) -> some View {
+        modifier(MacRedditSummaryScopeButtonGlassModifier(tint: tint))
+    }
+}
+#endif
+
 struct ContentView: View {
     @EnvironmentObject var appState: AppState
     // Programmatic pop for NavigationStack on iPhone
@@ -2093,11 +2102,6 @@ struct ContentView: View {
     @State private var showAddSubscription = false
     @State private var selectedCategory: FeedCategory = .all
     @State private var showSettings = false
-    @State private var currentlyVisibleSubscription: String?
-    @State private var isSidebarProgrammaticRestoreInFlight = false
-    @State private var programmaticRestoreInFlightKeys: Set<String> = []
-    @State private var feedListContentOffsets: [String: CGPoint] = [:]
-    @State private var pendingFeedListRestoreOffsets: [String: CGPoint] = [:]
     @State private var showRedditSummaryScopePicker = false
     @State private var redditSummaryScopeSubreddit: String?
     @State private var isArticleReadingChromeHidden = false
@@ -2305,68 +2309,10 @@ struct ContentView: View {
 
     private func articleHasVisibleAIBox(_ article: Article) -> Bool {
         appState.isSummarizingArticle(article)
-            || appState.isWaitingForAppleIntelligence
             || ArticleQAState.shared.showQAInterface
             || !(article.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
-    private var shouldRestoreScrollAfterSelectionClears: Bool {
-        #if os(iOS)
-        return UIDevice.current.userInterfaceIdiom == .phone
-        #else
-        return true
-        #endif
-    }
-
-    private func feedRowPositionTracker(id: String, in coordinateSpace: String, enabled: Bool = true) -> some View {
-        GeometryReader { proxy in
-            Color.clear.preference(
-                key: SubscriptionRowOffsetPreferenceKey.self,
-                value: enabled ? [id: proxy.frame(in: .named(coordinateSpace)).minY] : [:]
-            )
-        }
-    }
-
-    private func saveNearestVisibleFeedRow(from offsets: [String: CGFloat], for key: String) {
-        guard !programmaticRestoreInFlightKeys.contains(key),
-              !offsets.isEmpty else { return }
-
-        if let nearestToTop = offsets.min(by: { abs($0.value) < abs($1.value) })?.key {
-            appState.saveScrollPosition(for: key, itemID: nearestToTop)
-        }
-    }
-
-    private func saveFeedListContentOffset(_ offset: CGPoint, for key: String) {
-        guard key != "sidebar_subscriptions",
-              !programmaticRestoreInFlightKeys.contains(key),
-              appState.selectedArticleId == nil,
-              appState.selectedRedditPostId == nil else { return }
-
-        feedListContentOffsets[key] = offset
-    }
-
-    private func requestExactFeedListRestore(for key: String) -> Bool {
-        guard key != "sidebar_subscriptions",
-              let offset = feedListContentOffsets[key] else {
-            return false
-        }
-
-        programmaticRestoreInFlightKeys.insert(key)
-        pendingFeedListRestoreOffsets[key] = offset
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.80) {
-            guard pendingFeedListRestoreOffsets[key] == offset else { return }
-            finishExactFeedListRestore(for: key)
-        }
-        return true
-    }
-
-    private func finishExactFeedListRestore(for key: String) {
-        pendingFeedListRestoreOffsets[key] = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            programmaticRestoreInFlightKeys.remove(key)
-        }
-    }
-    
     var body: some View {
         // FIX: Use a stack-based navigation approach instead
         ZStack {
@@ -2504,7 +2450,8 @@ struct ContentView: View {
                             // Action buttons
                             #if os(macOS)
                             if let article = appState.selectedArticle {
-                                HStack(spacing: 12) {
+                                MacArticleActionCapsule {
+                                HStack(spacing: 1) {
                                     Button(action: {
                                         withAnimation(.easeInOut(duration: 0.18)) {
                                             articleViewMode = articleViewMode == .reader ? .rss : .reader
@@ -2515,9 +2462,9 @@ struct ContentView: View {
                                             Text(articleViewMode.rawValue)
                                                 .lineLimit(1)
                                         }
-                                        .font(.system(size: 14, weight: .semibold))
-                                        .padding(.horizontal, 14)
-                                        .frame(height: 36)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .padding(.horizontal, 11)
+                                        .frame(height: 32)
                                         .background(.ultraThinMaterial, in: Capsule(style: .continuous))
                                         .overlay(
                                             Capsule(style: .continuous)
@@ -2567,6 +2514,7 @@ struct ContentView: View {
                                     .buttonStyle(MacArticleChromeIconButtonStyle())
                                     .accessibilityLabel("Ask about this article")
                                     .help("Ask about this article")
+                                }
                                 }
                             }
                             #else
@@ -2779,18 +2727,25 @@ struct ContentView: View {
                             } label: {
                                 Image(systemName: "list.bullet.rectangle")
                                     .font(.title2)
-                                    .foregroundColor(.white)
+                                    .foregroundStyle(.primary)
                                     .frame(width: 50, height: 50)
-                                    .background(
-                                        Circle()
-                                            .fill(Color.blue)
-                                            .shadow(radius: 4)
-                                    )
                             }
+                            .buttonStyle(.plain)
+#if os(macOS)
+                            .batchPodcastGlass(in: Circle())
+#else
+                            .glassEffectCompat(in: Circle())
+#endif
+                            .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
                             .padding()
                         }
                     }
                 }
+
+                // Podcast presentation is rooted here so minimizing the
+                // podcast sheet does not cancel generation or playback.
+                BatchPodcastPresentationHost(session: appState.batchPodcastSession)
+                    .environmentObject(appState)
             }
         )
         // (iOS share presented via ActivityViewPresenter background anchor near the button)
@@ -2916,17 +2871,15 @@ struct ContentView: View {
     // MARK: - Feed Views
     var allView: some View {
         ScrollViewReader { scrollProxy in
-            let listSpaceName = "allCategoryList"
-
             List {
                 ForEach(appState.feeds.flatMap { $0.articles }
                     .sorted(by: { $0.publishDate > $1.publishDate })) { article in
                         
                     // Use a button for navigation instead of NavigationLink
                     Button(action: {
-                        programmaticRestoreInFlightKeys.insert("all_category")
                         appState.activeSubscriptionURL = nil
                         appState.lastSelectedCategory = .all
+                        appState.saveScrollPosition(for: "all_category", itemID: article.id)
                         // Set article and navigate
                         appState.setSelectedArticle(article)
                         if !article.isRead {
@@ -2938,27 +2891,19 @@ struct ContentView: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                     .id(articleListID(for: article)) // Set ID for scroll position tracking
-                    .background(feedRowPositionTracker(id: articleListID(for: article), in: listSpaceName))
                 }
             }
             .listStyle(.plain)
-            .coordinateSpace(name: listSpaceName)
 	            .feedListColumnStyle(
 	                colorScheme: colorScheme,
 	                scrollOffset: feedListScrollOffset,
-                    restoreOffset: pendingFeedListRestoreOffsets["all_category"],
-                    onContentOffsetChange: { offset in
-                        saveFeedListContentOffset(offset, for: "all_category")
-                    },
-                    onRestoreComplete: {
-                        finishExactFeedListRestore(for: "all_category")
-                    }
+                    restorationKey: "all_category",
+                    trackedItemIDs: appState.feeds.flatMap { $0.articles }
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
 	            ) { offset in
 	                feedListScrollOffset = offset
 	            }
-            .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-                saveNearestVisibleFeedRow(from: offsets, for: "all_category")
-            }
 	            .onAppear {
                 #if os(iOS)
                 // Update navigation state for iPhone
@@ -2968,12 +2913,6 @@ struct ContentView: View {
                     appState.activeSubscriptionURL = nil
                 }
                 #endif
-                // Restore scroll position when view appears
-                restoreScrollPosition(for: "all_category", using: scrollProxy)
-            }
-            .onChange(of: appState.selectedArticleId) { newValue in
-                guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                restoreScrollPosition(for: "all_category", using: scrollProxy)
             }
             .navigationTitle("All Articles")
             .toolbar {
@@ -2994,8 +2933,6 @@ struct ContentView: View {
     
     var unreadView: some View {
         ScrollViewReader { scrollProxy in
-            let listSpaceName = "unreadCategoryList"
-
             List {
                 Section(header: Text("RSS Articles")) {
                     let unreadArticles = appState.feeds.flatMap { $0.articles }
@@ -3009,10 +2946,10 @@ struct ContentView: View {
                         } else {
                             ForEach(unreadArticles) { article in
                                 Button(action: {
-                                    programmaticRestoreInFlightKeys.insert("unread_category")
                                     // Record that we're in the Unread category before navigating
                                     appState.activeSubscriptionURL = nil
                                     appState.lastSelectedCategory = .unread
+                                    appState.saveScrollPosition(for: "unread_category", itemID: article.id)
 
                                     // Set article and navigate
                                     appState.setSelectedArticle(article)
@@ -3023,7 +2960,6 @@ struct ContentView: View {
                                 }
                             .buttonStyle(PlainButtonStyle())
                             .id(articleListID(for: article)) // Set ID for scroll position tracking
-                            .background(feedRowPositionTracker(id: articleListID(for: article), in: listSpaceName))
                         }
                     }
                 }
@@ -3040,10 +2976,10 @@ struct ContentView: View {
                         } else {
                             ForEach(unreadPosts) { post in
                                 Button(action: {
-                                    programmaticRestoreInFlightKeys.insert("unread_category")
                                     // Record that we're in the Unread category before navigating
                                     appState.activeSubscriptionURL = nil
                                     appState.lastSelectedCategory = .unread
+                                    appState.saveScrollPosition(for: "unread_category", itemID: post.id)
 
                                     // Set post and navigate
                                     appState.setSelectedRedditPost(post)
@@ -3054,29 +2990,26 @@ struct ContentView: View {
                                 }
                             .buttonStyle(PlainButtonStyle())
                             .id(redditPostListID(for: post)) // Set ID for scroll position tracking
-                            .background(feedRowPositionTracker(id: redditPostListID(for: post), in: listSpaceName))
                         }
                     }
                 }
             }
             .listStyle(.plain)
-            .coordinateSpace(name: listSpaceName)
 	            .feedListColumnStyle(
 	                colorScheme: colorScheme,
 	                scrollOffset: feedListScrollOffset,
-                    restoreOffset: pendingFeedListRestoreOffsets["unread_category"],
-                    onContentOffsetChange: { offset in
-                        saveFeedListContentOffset(offset, for: "unread_category")
-                    },
-                    onRestoreComplete: {
-                        finishExactFeedListRestore(for: "unread_category")
-                    }
+                    restorationKey: "unread_category",
+                    trackedItemIDs: appState.feeds.flatMap { $0.articles }
+                        .filter { !$0.isRead }
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
+                        + appState.redditFeeds.flatMap { $0.posts }
+                        .filter { !$0.isRead }
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
 	            ) { offset in
 	                feedListScrollOffset = offset
 	            }
-            .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-                saveNearestVisibleFeedRow(from: offsets, for: "unread_category")
-            }
 	            .onAppear {
                 // Update the last selected category when this view appears
                 appState.lastSelectedCategory = .unread
@@ -3089,16 +3022,6 @@ struct ContentView: View {
                 }
                 #endif
                 
-                // Restore scroll position when view appears
-                restoreScrollPosition(for: "unread_category", using: scrollProxy)
-            }
-            .onChange(of: appState.selectedArticleId) { newValue in
-                guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                restoreScrollPosition(for: "unread_category", using: scrollProxy)
-            }
-            .onChange(of: appState.selectedRedditPostId) { newValue in
-                guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                restoreScrollPosition(for: "unread_category", using: scrollProxy)
             }
             .navigationTitle("Unread")
             .toolbar {
@@ -3132,6 +3055,7 @@ struct ContentView: View {
                         ForEach(favoriteArticles) { article in
                             Button(action: {
                                 // Set article and navigate
+                                appState.saveScrollPosition(for: "favorites_category", itemID: article.id)
                                 appState.setSelectedArticle(article)
                                 if !article.isRead {
                                     appState.markArticleAsRead(article)
@@ -3141,6 +3065,7 @@ struct ContentView: View {
                                     .contentShape(Rectangle())
                             }
                         .buttonStyle(PlainButtonStyle())
+                        .id(articleListID(for: article))
                         .swipeActions {
                             Button(role: .destructive) {
                                 appState.toggleArticleFavorite(article)
@@ -3165,6 +3090,7 @@ struct ContentView: View {
                         ForEach(favoritePosts) { post in
                             Button(action: {
                                 // Set post and navigate
+                                appState.saveScrollPosition(for: "favorites_category", itemID: post.id)
                                 appState.setSelectedRedditPost(post)
                                 if !post.isRead {
                                     appState.markRedditPostAsRead(post)
@@ -3174,6 +3100,7 @@ struct ContentView: View {
                                     .contentShape(Rectangle())
                             }
                         .buttonStyle(PlainButtonStyle())
+                        .id(redditPostListID(for: post))
                         .swipeActions {
                             Button(role: .destructive) {
                                 appState.toggleRedditPostFavorite(post)
@@ -3188,7 +3115,16 @@ struct ContentView: View {
         .listStyle(.plain)
 	            .feedListColumnStyle(
 	                colorScheme: colorScheme,
-	                scrollOffset: feedListScrollOffset
+	                scrollOffset: feedListScrollOffset,
+                    restorationKey: "favorites_category",
+                    trackedItemIDs: appState.feeds.flatMap { $0.articles }
+                        .filter(\.isFavorite)
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
+                        + appState.redditFeeds.flatMap { $0.posts }
+                        .filter(\.isFavorite)
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
 	            ) { offset in
 	                feedListScrollOffset = offset
 	            }
@@ -3228,8 +3164,6 @@ struct ContentView: View {
 
     var todayView: some View {
         ScrollViewReader { scrollProxy in
-            let listSpaceName = "todayCategoryList"
-
             List {
                 let todayArticles = filteredTodayArticles
                 let todayRedditPosts = filteredTodayRedditPosts
@@ -3304,10 +3238,10 @@ struct ContentView: View {
                     Section(header: Text("RSS Articles")) {
                             ForEach(todayArticles) { article in
                                 Button(action: {
-                                    programmaticRestoreInFlightKeys.insert("today_category")
                                     // Record that we're in the Today category before navigating
                                     appState.activeSubscriptionURL = nil
                                     appState.lastSelectedCategory = .today
+                                    appState.saveScrollPosition(for: "today_category", itemID: article.id)
 
                                     // Set article and navigate
                                     appState.setSelectedArticle(article)
@@ -3320,7 +3254,6 @@ struct ContentView: View {
                                 }
                             .buttonStyle(PlainButtonStyle())
                             .id(articleListID(for: article)) // Set ID for scroll position tracking
-                            .background(feedRowPositionTracker(id: articleListID(for: article), in: listSpaceName))
                         }
                     }
                 }
@@ -3331,10 +3264,10 @@ struct ContentView: View {
                     Section(header: Text("Reddit Posts")) {
                             ForEach(todayRedditPosts) { post in
                                 Button(action: {
-                                    programmaticRestoreInFlightKeys.insert("today_category")
                                     // Record that we're in the Today category before navigating
                                     appState.activeSubscriptionURL = nil
                                     appState.lastSelectedCategory = .today
+                                    appState.saveScrollPosition(for: "today_category", itemID: post.id)
 
                                     // Set post and navigate
                                     appState.setSelectedRedditPost(post)
@@ -3347,7 +3280,6 @@ struct ContentView: View {
                                 }
                             .buttonStyle(PlainButtonStyle())
                             .id(redditPostListID(for: post)) // Set ID for scroll position tracking
-                            .background(feedRowPositionTracker(id: redditPostListID(for: post), in: listSpaceName))
                         }
                     }
                 }
@@ -3359,23 +3291,14 @@ struct ContentView: View {
                 }
             }
             .listStyle(.plain)
-            .coordinateSpace(name: listSpaceName)
 	                .feedListColumnStyle(
 	                    colorScheme: colorScheme,
 	                    scrollOffset: feedListScrollOffset,
-                        restoreOffset: pendingFeedListRestoreOffsets["today_category"],
-                        onContentOffsetChange: { offset in
-                            saveFeedListContentOffset(offset, for: "today_category")
-                        },
-                        onRestoreComplete: {
-                            finishExactFeedListRestore(for: "today_category")
-                        }
+                        restorationKey: "today_category",
+                        trackedItemIDs: filteredTodayArticles.map(\.id) + filteredTodayRedditPosts.map(\.id)
 	                ) { offset in
 	                    feedListScrollOffset = offset
 	                }
-            .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-                saveNearestVisibleFeedRow(from: offsets, for: "today_category")
-            }
 	                .onAppear {
                 // Update the last selected category when this view appears
                 if appState.lastSelectedCategory != .today {
@@ -3403,16 +3326,6 @@ struct ContentView: View {
                     }
                 }
 
-                // Restore scroll position when view appears
-                restoreScrollPosition(for: "today_category", using: scrollProxy)
-            }
-            .onChange(of: appState.selectedArticleId) { newValue in
-                guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                restoreScrollPosition(for: "today_category", using: scrollProxy)
-            }
-            .onChange(of: appState.selectedRedditPostId) { newValue in
-                guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                restoreScrollPosition(for: "today_category", using: scrollProxy)
             }
             .navigationTitle("Today")
                             .toolbar {
@@ -3509,17 +3422,15 @@ struct ContentView: View {
         var redditView: some View {
             ZStack(alignment: .top) {
                 ScrollViewReader { scrollProxy in
-                    let listSpaceName = "redditCategoryList"
-
                     ScrollView {
                         LazyVStack(spacing: 12) {
                             ForEach(appState.redditFeeds.flatMap { $0.posts }
                                 .sorted(by: { $0.publishDate > $1.publishDate })) { post in
                                     Button(action: {
-                                        programmaticRestoreInFlightKeys.insert("reddit_category")
                                         // Record that we're in the Reddit category before navigating
                                         appState.activeSubscriptionURL = nil
                                         appState.lastSelectedCategory = .reddit
+                                        appState.saveScrollPosition(for: "reddit_category", itemID: post.id)
 
                                         // First set the post selection
                                         appState.setSelectedRedditPost(post)
@@ -3533,34 +3444,22 @@ struct ContentView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .id(redditPostListID(for: post)) // Set ID for scroll position tracking
-                                .background(feedRowPositionTracker(id: redditPostListID(for: post), in: listSpaceName))
                         }
-                }
+                        .scrollTargetLayout()
+                    }
                     .padding(.top, redditFloatingContentTopInset(hasStatus: appState.aggregatedRedditStatusMessage != nil))
                     .padding(.bottom, 8)
                     .padding(.horizontal, 4)
-                    .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                        max(0, geometry.contentOffset.y + geometry.contentInsets.top)
-                    } action: { _, newOffset in
-                        feedListScrollOffset = newOffset
-                    }
                 }
                 .feedListColumnStyle(
                     colorScheme: colorScheme,
                     scrollOffset: feedListScrollOffset,
-                    restoreOffset: pendingFeedListRestoreOffsets["reddit_category"],
-                    onContentOffsetChange: { offset in
-                        saveFeedListContentOffset(offset, for: "reddit_category")
-                    },
-                    onRestoreComplete: {
-                        finishExactFeedListRestore(for: "reddit_category")
-                    }
+                    restorationKey: "reddit_category",
+                    trackedItemIDs: appState.redditFeeds.flatMap { $0.posts }
+                        .sorted(by: { $0.publishDate > $1.publishDate })
+                        .map(\.id)
                 ) { offset in
                     feedListScrollOffset = offset
-                }
-                .coordinateSpace(name: listSpaceName)
-                .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-                    saveNearestVisibleFeedRow(from: offsets, for: "reddit_category")
                 }
                 .onAppear {
                     // Update the last selected category when this view appears
@@ -3574,12 +3473,6 @@ struct ContentView: View {
                     }
                         #endif
                         
-                        // Restore scroll position when view appears
-                        restoreScrollPosition(for: "reddit_category", using: scrollProxy)
-                    }
-                    .onChange(of: appState.selectedRedditPostId) { newValue in
-                        guard shouldRestoreScrollAfterSelectionClears, newValue == nil else { return }
-                        restoreScrollPosition(for: "reddit_category", using: scrollProxy)
                     }
                 }
 
@@ -3694,20 +3587,17 @@ struct ContentView: View {
 
     private func feedArticlesList(feed: Feed, subscription: Subscription, scrollProxy: ScrollViewProxy) -> some View {
         let articles = displayArticles(for: feed)
-        let listSpaceName = "subscriptionFeedList-\(subscription.id.uuidString)"
         #if os(iOS)
-        let shouldManageSubscriptionScroll = UIDevice.current.userInterfaceIdiom == .phone
         let showsSubscriptionArticleSource = true
         #else
-        let shouldManageSubscriptionScroll = true
         let showsSubscriptionArticleSource = false
         #endif
 
             return List {
                 ForEach(articles) { article in
                     Button(action: {
-                        programmaticRestoreInFlightKeys.insert(subscription.url)
                         appState.rememberCurrentSubscription(url: subscription.url)
+                        appState.saveScrollPosition(for: subscription.url, itemID: article.id)
                         appState.setSelectedArticle(article)
                         appState.lastSelectedCategory = article.isFavorite ? .favorites : .all
                         if !article.isRead {
@@ -3719,30 +3609,14 @@ struct ContentView: View {
                     }
                 .buttonStyle(PlainButtonStyle())
                 .id(articleListID(for: article))
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: SubscriptionRowOffsetPreferenceKey.self,
-                            value: shouldManageSubscriptionScroll
-                                ? [articleListID(for: article): proxy.frame(in: .named(listSpaceName)).minY]
-                                : [:]
-                        )
-                    }
-                )
             }
         }
         .listStyle(.plain)
-        .coordinateSpace(name: listSpaceName)
 	        .feedListColumnStyle(
 	            colorScheme: colorScheme,
 	            scrollOffset: feedListScrollOffset,
-                restoreOffset: pendingFeedListRestoreOffsets[subscription.url],
-                onContentOffsetChange: { offset in
-                    saveFeedListContentOffset(offset, for: subscription.url)
-                },
-                onRestoreComplete: {
-                    finishExactFeedListRestore(for: subscription.url)
-                }
+                restorationKey: subscription.url,
+                trackedItemIDs: articles.map(\.id)
 	        ) { offset in
 	            feedListScrollOffset = offset
 	        }
@@ -3754,24 +3628,13 @@ struct ContentView: View {
         #else
         .navigationTitle("")
         #endif
-        .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-            guard shouldManageSubscriptionScroll,
-                  !offsets.isEmpty else { return }
-            saveNearestVisibleFeedRow(from: offsets, for: subscription.url)
-        }
         .onAppear {
             #if os(iOS)
             if UIDevice.current.userInterfaceIdiom == .phone {
                 appState.activeSubscriptionURL = subscription.url
             }
             #endif
-	            guard shouldManageSubscriptionScroll || shouldRestoreScrollAfterSelectionClears else { return }
-	            restoreScrollPosition(for: subscription.url, using: scrollProxy, animated: false)
-	        }
-	        .onChange(of: appState.selectedArticleId) { newValue in
-	            guard (shouldManageSubscriptionScroll || shouldRestoreScrollAfterSelectionClears), newValue == nil else { return }
-	            restoreScrollPosition(for: subscription.url, using: scrollProxy, animated: false)
-	        }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 summarizeFeedButton(feed: feed, subscription: subscription)
@@ -3785,13 +3648,10 @@ struct ContentView: View {
     private func redditSubscriptionView(feed: RedditFeed, subscription: Subscription) -> some View {
         ScrollViewReader { scrollProxy in
             #if os(iOS)
-            let shouldManageSubscriptionScroll = UIDevice.current.userInterfaceIdiom == .phone
             let showsSubscriptionSubredditLabel = true
             #else
-            let shouldManageSubscriptionScroll = true
             let showsSubscriptionSubredditLabel = false
             #endif
-            let listSpaceName = "subscriptionRedditList-\(subscription.id.uuidString)"
             ZStack(alignment: .top) {
                 let status = appState.redditStatusMessages[subscription.url]
 
@@ -3799,8 +3659,8 @@ struct ContentView: View {
                         LazyVStack(spacing: 12) {
                             ForEach(feed.posts) { post in
                                 Button(action: {
-                                    programmaticRestoreInFlightKeys.insert(subscription.url)
                                     appState.rememberCurrentSubscription(url: subscription.url)
+                                    appState.saveScrollPosition(for: subscription.url, itemID: post.id)
                                     appState.setSelectedRedditPost(post)
                                     appState.lastSelectedCategory = .reddit
                                     if !post.isRead {
@@ -3815,38 +3675,18 @@ struct ContentView: View {
                             }
                             .buttonStyle(.plain)
                             .id(redditPostListID(for: post))
-                            .background(
-                                GeometryReader { proxy in
-                                    Color.clear.preference(
-                                        key: SubscriptionRowOffsetPreferenceKey.self,
-                                        value: shouldManageSubscriptionScroll
-                                            ? [redditPostListID(for: post): proxy.frame(in: .named(listSpaceName)).minY]
-                                            : [:]
-                                    )
-                                }
-                            )
                         }
+                        .scrollTargetLayout()
                     }
                     .padding(.top, redditFloatingContentTopInset(hasStatus: status != nil))
                     .padding(.bottom, 8)
                     .padding(.horizontal, 4)
-                    .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                        max(0, geometry.contentOffset.y + geometry.contentInsets.top)
-                    } action: { _, newOffset in
-                        feedListScrollOffset = newOffset
-                    }
                 }
-                .coordinateSpace(name: listSpaceName)
 	                .feedListColumnStyle(
 	                    colorScheme: colorScheme,
 	                    scrollOffset: feedListScrollOffset,
-                        restoreOffset: pendingFeedListRestoreOffsets[subscription.url],
-                        onContentOffsetChange: { offset in
-                            saveFeedListContentOffset(offset, for: subscription.url)
-                        },
-                        onRestoreComplete: {
-                            finishExactFeedListRestore(for: subscription.url)
-                        }
+                        restorationKey: subscription.url,
+                        trackedItemIDs: feed.posts.map(\.id)
 	                ) { offset in
 	                    feedListScrollOffset = offset
 	                }
@@ -3863,24 +3703,13 @@ struct ContentView: View {
                 AppColors.feedListBackground(for: colorScheme, scrollOffset: feedListScrollOffset)
                     .ignoresSafeArea()
             }
-            .onPreferenceChange(SubscriptionRowOffsetPreferenceKey.self) { offsets in
-                guard shouldManageSubscriptionScroll,
-                      !offsets.isEmpty else { return }
-                saveNearestVisibleFeedRow(from: offsets, for: subscription.url)
-            }
             .onAppear {
                 #if os(iOS)
                 if UIDevice.current.userInterfaceIdiom == .phone {
                     appState.activeSubscriptionURL = subscription.url
                 }
                 #endif
-	                guard shouldManageSubscriptionScroll || shouldRestoreScrollAfterSelectionClears else { return }
-	                restoreScrollPosition(for: subscription.url, using: scrollProxy, animated: false)
-	            }
-	            .onChange(of: appState.selectedRedditPostId) { newValue in
-	                guard (shouldManageSubscriptionScroll || shouldRestoreScrollAfterSelectionClears), newValue == nil else { return }
-	                restoreScrollPosition(for: subscription.url, using: scrollProxy, animated: false)
-	            }
+            }
             #if os(iOS)
             .navigationTitle("r/\(feed.subreddit)")
             .navigationBarTitleDisplayMode(.inline)
@@ -3992,6 +3821,82 @@ struct ContentView: View {
         }
     }
 
+    private var redditSummaryScopePanelTint: Color {
+        Color(red: 0.30, green: 0.38, blue: 0.48).opacity(0.28)
+    }
+
+    private var redditSummaryScopeButtonTint: Color {
+        Color(red: 0.34, green: 0.47, blue: 0.62).opacity(0.30)
+    }
+
+    @ViewBuilder
+    private func redditSummaryScopePickerActions(subscription: Subscription) -> some View {
+        #if os(macOS)
+        GlassEffectContainer(spacing: 10) {
+            redditSummaryScopePickerActionContent(subscription: subscription)
+        }
+        #else
+        redditSummaryScopePickerActionContent(subscription: subscription)
+        #endif
+    }
+
+    private func redditSummaryScopePickerActionContent(subscription: Subscription) -> some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Button("New") {
+                    dismissRedditSummaryScopePicker()
+                    appState.summarizeSubredditPostsGlobally(subreddit: subscription.url, topComments: 10)
+                }
+                #if os(macOS)
+                .macRedditSummaryScopeButtonGlass(tint: redditSummaryScopeButtonTint)
+                #else
+                .buttonStyle(LiquidGlassButtonStyle())
+                #endif
+
+                Button("Hot") {
+                    dismissRedditSummaryScopePicker()
+                    appState.summarizeSubredditHotPostsGlobally(subreddit: subscription.url, topComments: 10)
+                }
+                #if os(macOS)
+                .macRedditSummaryScopeButtonGlass(tint: redditSummaryScopeButtonTint)
+                #else
+                .buttonStyle(LiquidGlassButtonStyle())
+                #endif
+            }
+
+            HStack(spacing: 12) {
+                Button("Top Day") {
+                    dismissRedditSummaryScopePicker()
+                    appState.summarizeSubredditTopDayPostsGlobally(subreddit: subscription.url, topComments: 10)
+                }
+                #if os(macOS)
+                .macRedditSummaryScopeButtonGlass(tint: redditSummaryScopeButtonTint)
+                #else
+                .buttonStyle(LiquidGlassButtonStyle())
+                #endif
+
+                Button("Top Week") {
+                    dismissRedditSummaryScopePicker()
+                    appState.summarizeSubredditTopWeekPostsGlobally(subreddit: subscription.url, topComments: 10)
+                }
+                #if os(macOS)
+                .macRedditSummaryScopeButtonGlass(tint: redditSummaryScopeButtonTint)
+                #else
+                .buttonStyle(LiquidGlassButtonStyle())
+                #endif
+            }
+
+            Button("Cancel") {
+                dismissRedditSummaryScopePicker()
+            }
+            #if os(macOS)
+            .macRedditSummaryScopeButtonGlass(tint: redditSummaryScopeButtonTint)
+            #else
+            .buttonStyle(LiquidGlassButtonStyle(isTranslucent: true))
+            #endif
+        }
+    }
+
     @ViewBuilder
     private func redditSummaryScopePickerOverlay(feed: RedditFeed, subscription: Subscription) -> some View {
         ZStack {
@@ -4009,43 +3914,17 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                VStack(spacing: 10) {
-                    HStack(spacing: 12) {
-                        Button("New") {
-                            dismissRedditSummaryScopePicker()
-                            appState.summarizeSubredditPostsGlobally(subreddit: subscription.url, topComments: 10)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-
-                        Button("Hot") {
-                            dismissRedditSummaryScopePicker()
-                            appState.summarizeSubredditHotPostsGlobally(subreddit: subscription.url, topComments: 10)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                    }
-
-                    HStack(spacing: 12) {
-                        Button("Top Day") {
-                            dismissRedditSummaryScopePicker()
-                            appState.summarizeSubredditTopDayPostsGlobally(subreddit: subscription.url, topComments: 10)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-
-                        Button("Top Week") {
-                            dismissRedditSummaryScopePicker()
-                            appState.summarizeSubredditTopWeekPostsGlobally(subreddit: subscription.url, topComments: 10)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                    }
-                }
-
-                Button("Cancel") {
-                    dismissRedditSummaryScopePicker()
-                }
-                .buttonStyle(LiquidGlassButtonStyle(isTranslucent: true))
+                redditSummaryScopePickerActions(subscription: subscription)
             }
             .padding(16)
+            #if os(macOS)
+            .glassEffect(
+                .regular.tint(redditSummaryScopePanelTint),
+                in: .rect(cornerRadius: 20)
+            )
+            #else
             .glassEffectCompat(in: RoundedRectangle(cornerRadius: 16))
+            #endif
             .padding()
         }
     }
@@ -4121,51 +4000,6 @@ struct ContentView: View {
     
 	    // MARK: - Helper Functions
 
-    private func restoreScrollPosition(for key: String, using proxy: ScrollViewProxy, animated: Bool = true) {
-        let isSidebarKey = key == "sidebar_subscriptions"
-
-        if !isSidebarKey, requestExactFeedListRestore(for: key) {
-            return
-        }
-
-        guard let rawID = appState.getSavedScrollPosition(for: key) else {
-            programmaticRestoreInFlightKeys.remove(key)
-            if isSidebarKey {
-                isSidebarProgrammaticRestoreInFlight = false
-            }
-            return
-        }
-        let scrollAction: () -> Void
-        programmaticRestoreInFlightKeys.insert(key)
-        if isSidebarKey {
-            isSidebarProgrammaticRestoreInFlight = true
-        }
-        if isSidebarKey, let uuid = UUID(uuidString: rawID) {
-            scrollAction = { proxy.scrollTo(uuid, anchor: .top) }
-        } else {
-            scrollAction = { proxy.scrollTo(rawID, anchor: .top) }
-        }
-        DispatchQueue.main.async {
-            if animated {
-                withAnimation {
-                    scrollAction()
-                }
-            } else {
-                scrollAction()
-            }
-
-            guard isSidebarKey else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                isSidebarProgrammaticRestoreInFlight = false
-                programmaticRestoreInFlightKeys.remove(key)
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            programmaticRestoreInFlightKeys.remove(key)
-        }
-    }
-
     private func restoreNavigationState() -> some View {
         Group {
             if let activeURL = appState.activeSubscriptionURL {
@@ -4193,72 +4027,32 @@ struct ContentView: View {
 }
 
 // MARK: - Sidebar Helpers
-private struct SidebarRowOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct SubscriptionRowOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
 private extension ContentView {
     @ViewBuilder
     func sidebarList(scrollProxy: ScrollViewProxy?) -> some View {
-        #if os(iOS)
-        let shouldAutoRestoreSidebarOnSelectionChange = UIDevice.current.userInterfaceIdiom == .phone
-        #else
-        let shouldAutoRestoreSidebarOnSelectionChange = false
-        #endif
-
         List {
             feedSection()
             subscriptionsSection(scrollProxy: scrollProxy)
             sidebarSettingsSection()
         }
+        #if os(macOS)
+        .modifier(
+            MacNativeScrollRestorationModifier(
+                restorationKey: "sidebar_subscriptions",
+                trackedItemIDs: appState.subscriptions.map(\.url),
+                onOffsetChange: { _ in }
+            )
+        )
+        #endif
         .listStyle(.plain)
 #if os(macOS)
         .background(MacListSelectionClearView())
 #endif
-        .coordinateSpace(name: "sidebarListSpace")
         .scrollContentBackground(.hidden)
         .frame(minWidth: 200)
         .background(sidebarSurfaceBackground.ignoresSafeArea(edges: .top))
         .transaction { tx in tx.animation = nil }
         .animation(nil, value: appState.subscriptions.count)
-        .onPreferenceChange(SidebarRowOffsetPreferenceKey.self) { offsets in
-            guard !isSidebarProgrammaticRestoreInFlight, !offsets.isEmpty else { return }
-            if let nearestToTop = offsets.min(by: { abs($0.value) < abs($1.value) })?.key {
-                appState.saveScrollPosition(for: "sidebar_subscriptions", itemID: nearestToTop)
-            }
-        }
-        .onAppear {
-            guard let scrollProxy = scrollProxy else { return }
-            restoreScrollPosition(for: "sidebar_subscriptions", using: scrollProxy, animated: false)
-        }
-        .onChange(of: appState.selectedArticleId) { newValue in
-            guard shouldAutoRestoreSidebarOnSelectionChange,
-                  newValue == nil,
-                  let scrollProxy = scrollProxy else { return }
-            restoreScrollPosition(for: "sidebar_subscriptions", using: scrollProxy, animated: false)
-        }
-        .onChange(of: appState.selectedRedditPostId) { newValue in
-            guard shouldAutoRestoreSidebarOnSelectionChange,
-                  newValue == nil,
-                  let scrollProxy = scrollProxy else { return }
-            restoreScrollPosition(for: "sidebar_subscriptions", using: scrollProxy, animated: false)
-        }
-        .onChange(of: appState.activeSubscriptionURL) { newValue in
-            guard shouldAutoRestoreSidebarOnSelectionChange,
-                  newValue == nil,
-                  let scrollProxy = scrollProxy else { return }
-            restoreScrollPosition(for: "sidebar_subscriptions", using: scrollProxy, animated: false)
-        }
     }
 
     @ViewBuilder
@@ -4403,20 +4197,9 @@ private extension ContentView {
         ) {
             ForEach(appState.subscriptions) { subscription in
                 subscriptionSidebarRow(for: subscription)
-                .id(subscription.id)
+                .id(subscription.url)
                 .buttonStyle(.plain)
                 .sidebarSubscriptionGlass(isSelected: appState.activeSubscriptionURL == subscription.url)
-                .onAppear {
-                    currentlyVisibleSubscription = subscription.id.uuidString
-                }
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: SidebarRowOffsetPreferenceKey.self,
-                            value: [subscription.id.uuidString: proxy.frame(in: .named("sidebarListSpace")).minY]
-                        )
-                    }
-                )
             }
             .onDelete { indexSet in
                 appState.removeSubscription(at: indexSet)
@@ -4452,7 +4235,7 @@ private extension ContentView {
             clearContentSelection()
             appState.activeSubscriptionURL = subscription.url
             appState.lastSelectedCategory = subscription.type == .reddit ? .reddit : .all
-            appState.saveScrollPosition(for: "sidebar_subscriptions", itemID: subscription.id.uuidString)
+            appState.saveScrollPosition(for: "sidebar_subscriptions", itemID: subscription.url)
         } label: {
             subscriptionRowContent(for: subscription)
         }
@@ -4616,29 +4399,28 @@ private struct MacArticleActionCapsule<Content: View>: View {
     }
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 1) {
             content
         }
-        .padding(4)
-        .background {
+        .padding(3)
+        .modifier(
+            SummaryTTSMiniPlayerGlassModifier(
+                tint: .clear
+            )
+        )
+        .overlay {
             Capsule(style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    Capsule(style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.62, green: 0.76, blue: 1.0).opacity(colorScheme == .dark ? 0.24 : 0.16),
-                                    Color(red: 0.32, green: 0.43, blue: 0.68).opacity(colorScheme == .dark ? 0.18 : 0.10)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                )
-                .overlay(
-                    Capsule(style: .continuous)
-                        .stroke(Color.white.opacity(colorScheme == .dark ? 0.32 : 0.46), lineWidth: 1)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(colorScheme == .dark ? 0.38 : 0.34),
+                            Color.white.opacity(0.10),
+                            Color.black.opacity(0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.8
                 )
         }
         .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 10, x: 0, y: 5)
@@ -4651,15 +4433,72 @@ private struct MacArticleChromeIconButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 15, weight: .semibold))
+            .font(.system(size: 14, weight: .semibold))
             .symbolRenderingMode(.hierarchical)
-            .frame(width: 44, height: 36)
+            .frame(width: 40, height: 32)
             .contentShape(Capsule(style: .continuous))
-            .background(.ultraThinMaterial, in: Capsule(style: .continuous))
-            .overlay(
+            .background {
                 Capsule(style: .continuous)
-                    .stroke(Color.white.opacity(colorScheme == .dark ? 0.34 : 0.42), lineWidth: 1)
+                    .fill(configuration.isPressed ? Color.white.opacity(0.16) : Color.clear)
+            }
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+private struct MacSummaryActionCapsule<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            content
+        }
+        .modifier(MacSummaryActionPillModifier())
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct MacSummaryActionPillModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content
+            .padding(2)
+            .modifier(
+                SummaryTTSMiniPlayerGlassModifier(
+                    tint: .clear
+                )
             )
+            .overlay {
+                Capsule(style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(colorScheme == .dark ? 0.38 : 0.34),
+                                Color.white.opacity(0.10),
+                                Color.black.opacity(0.12)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            }
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 8, x: 0, y: 4)
+    }
+}
+
+private struct MacSummaryActionIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .frame(width: 32, height: 26)
+            .contentShape(Capsule(style: .continuous))
             .background {
                 Capsule(style: .continuous)
                     .fill(configuration.isPressed ? Color.white.opacity(0.16) : Color.clear)
@@ -4670,12 +4509,105 @@ private struct MacArticleChromeIconButtonStyle: ButtonStyle {
 }
 #endif
 
+private func expandedCardPreviewText(from content: String, maxCharacters: Int = 320) -> String {
+    var cleaned = content
+        .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "&[^;]+;", with: " ", options: .regularExpression)
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if cleaned.count > maxCharacters {
+        cleaned = String(cleaned.prefix(maxCharacters)) + "..."
+    }
+
+    return cleaned
+}
+
+private struct FeedRowThumbnailView: View {
+    let url: URL
+    let width: CGFloat
+    let height: CGFloat
+    let contentMode: SwiftUI.ContentMode
+    let usesBlurredBackdrop: Bool
+
+    init(
+        url: URL,
+        width: CGFloat,
+        height: CGFloat,
+        contentMode: SwiftUI.ContentMode,
+        usesBlurredBackdrop: Bool = false
+    ) {
+        self.url = url
+        self.width = width
+        self.height = height
+        self.contentMode = contentMode
+        self.usesBlurredBackdrop = usesBlurredBackdrop
+    }
+
+    var body: some View {
+        AsyncImage(url: url, transaction: Transaction(animation: .none)) { phase in
+            switch phase {
+            case .success(let image):
+                if usesBlurredBackdrop {
+                    ZStack {
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: width, height: height)
+                            .clipped()
+                            .blur(radius: 14)
+                            .scaleEffect(1.08)
+
+                        Color.black.opacity(0.12)
+
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: width, height: height)
+                    }
+                } else {
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: contentMode)
+                        .frame(width: width, height: height)
+                        .clipped()
+                }
+            case .failure:
+                ZStack {
+                    Rectangle()
+                        .fill(AppColors.systemGray5)
+                    Image(systemName: "photo")
+                        .foregroundColor(.gray)
+                }
+            case .empty:
+                ZStack {
+                    Rectangle()
+                        .fill(AppColors.systemGray5)
+                    ProgressView()
+                }
+            @unknown default:
+                EmptyView()
+            }
+        }
+        .frame(width: width, height: height)
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 // MARK: - Article Row
 struct ArticleRow: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     let article: Article
     var showsPublicationSource = true
+
+    private let thumbnailWidth: CGFloat = 300
+    private let thumbnailHeight: CGFloat = 160
+
+    private var previewText: String {
+        expandedCardPreviewText(from: article.content, maxCharacters: 520)
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -4702,70 +4634,44 @@ struct ArticleRow: View {
                     .foregroundColor(.secondary)
             }
             
-            // Article title with clean typography
-            Text(article.title)
-                .font(.system(size: 17, weight: .semibold))
-                // Use primary color that adapts to color scheme
-                .foregroundColor(.primary)
-                .lineLimit(3)
-                .padding(.bottom, 2)
-            
-            // Content layout - horizontal on larger screens
-            HStack(alignment: .top, spacing: 12) {
-                // Text preview
-                if !article.content.isEmpty {
-                    Text(cleanContentPreview(article.content))
-                        .font(.system(size: 14))
-                        // Use secondary color that adapts to color scheme
-                        .foregroundColor(.secondary)
-                        .lineLimit(2)
-                        .lineSpacing(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                
-                // Image if available
-                if let imageURL = article.imageURL {
-                    AsyncImage(url: imageURL, transaction: Transaction(animation: .none)) { phase in
-                        ZStack {
-                            Rectangle()
-                                .fill(AppColors.systemGray5)
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(article.title)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
 
-                            switch phase {
-                            case .success(let image):
-                                image
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                            case .failure:
-                                Image(systemName: "photo")
-                                    .foregroundColor(.secondary)
-                            case .empty:
-                                ProgressView()
-                            @unknown default:
-                                EmptyView()
-                            }
-                        }
+                    if !previewText.isEmpty {
+                        Text(previewText)
+                            .font(.system(size: 14))
+                            .foregroundColor(.secondary)
+                            .lineLimit(6)
+                            .lineSpacing(2)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 170)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
+
+                if let imageURL = article.imageURL {
+                    FeedRowThumbnailView(
+                        url: imageURL,
+                        width: thumbnailWidth,
+                        height: thumbnailHeight,
+                        contentMode: .fill
+                    )
                 }
             }
             
             // Status indicators
             HStack(spacing: 12) {
-                // Replace "New" badge with "Seen" badge
-                if article.isRead { // Check if IS read
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle") // Checkmark icon
-                            .font(.system(size: 10))
-                        Text("Seen") // "Seen" text
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.gray.opacity(0.2)) // Grey background
-                    .foregroundColor(Color.gray.opacity(0.9)) // Grey foreground
-                    .cornerRadius(4)
+                if article.isRead {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.gray.opacity(0.9))
+                        .accessibilityLabel("Seen")
                 }
                 
                 if article.summary != nil {
@@ -4837,21 +4743,6 @@ struct ArticleRow: View {
         return formatter.string(from: date)
     }
     
-    // Clean up content for preview
-    private func cleanContentPreview(_ content: String) -> String {
-        var cleaned = content
-            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "&[^;]+;", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Limit preview length
-        if cleaned.count > 140 {
-            cleaned = String(cleaned.prefix(140)) + "..."
-        }
-        
-        return cleaned
-    }
 }
 
 // MARK: - Reddit Post Row
@@ -4859,6 +4750,14 @@ struct RedditPostRow: View {
     let post: RedditPost
     var showsSubredditLabel = true
     @Environment(\.colorScheme) private var colorScheme
+
+    private let thumbnailWidth: CGFloat = 300
+    private let thumbnailHeight: CGFloat = 160
+
+    private var previewText: String {
+        let expanded = expandedCardPreviewText(from: post.content)
+        return expanded.isEmpty ? post.cleanPreviewText : expanded
+    }
     
     var body: some View {
         ZStack {
@@ -4930,17 +4829,17 @@ struct RedditPostRow: View {
                     
                     // Post title
                     Text(post.title)
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.system(size: 18, weight: .semibold))
                         .lineLimit(3)
                         // Revert color change - always use primary color
                         .foregroundColor(.primary)
                     
                     // Post content preview
-                    if !post.content.isEmpty {
-                        Text(post.content)
+                    if !previewText.isEmpty {
+                        Text(previewText)
                             .font(.system(size: 14))
                             .foregroundColor(.secondary)
-                            .lineLimit(2)
+                            .lineLimit(5)
                     }
                     
                     // Comments and other metadata
@@ -4968,19 +4867,11 @@ struct RedditPostRow: View {
                         }
                         .foregroundColor(.secondary)
                         
-                        // Add "Seen" badge if read
                         if post.isRead {
-                            HStack(spacing: 4) {
-                                Image(systemName: "checkmark.circle")
-                                    .font(.system(size: 10))
-                                Text("Seen")
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.gray.opacity(0.2))
-                            .foregroundColor(Color.gray.opacity(0.9))
-                            .cornerRadius(4)
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color.gray.opacity(0.9))
+                                .accessibilityLabel("Seen")
                         }
                         
                         Spacer()
@@ -4990,36 +4881,13 @@ struct RedditPostRow: View {
                 
                 // Right side: image
                 if let imageURL = post.bestImageURL {
-                    AsyncImage(url: imageURL) { phase in
-                        switch phase {
-                        case .empty:
-                            ZStack {
-                                Rectangle()
-                                    .fill(Color.gray.opacity(0.15))
-                                ProgressView()
-                            }
-                            .frame(width: 100, height: 100)
-                            .cornerRadius(8)
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 100, height: 100)
-                                .clipped()
-                                .cornerRadius(8)
-                        case .failure:
-                            ZStack {
-                                Rectangle()
-                                    .fill(Color.gray.opacity(0.15))
-                                Image(systemName: "photo")
-                                    .foregroundColor(.gray)
-                            }
-                            .frame(width: 100, height: 100)
-                            .cornerRadius(8)
-                        @unknown default:
-                            EmptyView()
-                        }
-                    }
+                    FeedRowThumbnailView(
+                        url: imageURL,
+                        width: thumbnailWidth,
+                        height: thumbnailHeight,
+                        contentMode: .fit,
+                        usesBlurredBackdrop: true
+                    )
                 }
             }
             .padding(12)
@@ -5050,6 +4918,7 @@ struct ArticleDetailView: View {
     @State private var selectionAskAIError: String?
     @State private var selectionAskAITask: Task<Void, Never>?
     @State private var articleChromeRestoreWorkItem: DispatchWorkItem?
+    @State private var isArticleReaderLoading = true
 #if os(iOS)
     @State private var audioPlayerQA: AVAudioPlayer?
     @State private var localSpeechSynthQA: AVSpeechSynthesizer?
@@ -5163,7 +5032,7 @@ struct ArticleDetailView: View {
 
     private var articleTopOverlayMetadataOffset: CGFloat {
         #if os(macOS)
-        return 52
+        return 64
         #else
         return 94
         #endif
@@ -5213,7 +5082,13 @@ struct ArticleDetailView: View {
                     configureArticleDetailAppearance(for: article)
                 }
                 .onChange(of: article.id) { _ in
+                    isArticleReaderLoading = true
                     resetArticleReadingChrome()
+                }
+                .onChange(of: articleViewMode) { mode in
+                    if mode == .reader {
+                        isArticleReaderLoading = true
+                    }
                 }
                 .onDisappear {
                     resetArticleReadingChrome()
@@ -5262,7 +5137,9 @@ struct ArticleDetailView: View {
         #endif
         #if os(macOS)
         .overlay(alignment: .top) {
-            if !isReadingChromeHidden {
+            if !isReadingChromeHidden,
+               articleViewMode == .reader,
+               !isArticleReaderLoading {
                 articleTopChromeOverlay(article: article)
             }
         }
@@ -5282,6 +5159,25 @@ struct ArticleDetailView: View {
             scrollToArticleQAIfNeeded(isVisible: isVisible, proxy: proxy)
         }
         .askAILoadingOverlay(isSelectionAskAIInFlight)
+        #if os(macOS)
+        .overlay {
+            if showSelectionAskAIResponse {
+                ZStack {
+                    Color.black.opacity(0.10)
+                        .ignoresSafeArea()
+                    AskAIResponseSheet(
+                        isLoading: isSelectionAskAIInFlight,
+                        response: selectionAskAIResponse,
+                        errorMessage: selectionAskAIError,
+                        onClose: { showSelectionAskAIResponse = false },
+                        onCopy: copySelectionAskAIResponse
+                    )
+                    .frame(width: 640, height: 520)
+                }
+                .transition(.opacity)
+            }
+        }
+        #else
         .sheet(isPresented: $showSelectionAskAIResponse) {
             AskAIResponseSheet(
                 isLoading: isSelectionAskAIInFlight,
@@ -5291,6 +5187,7 @@ struct ArticleDetailView: View {
                 onCopy: copySelectionAskAIResponse
             )
         }
+        #endif
     }
 
     private var articleDetailBackground: some View {
@@ -5543,6 +5440,7 @@ struct ArticleDetailView: View {
 
     private func configureArticleDetailAppearance(for article: Article) {
         resetArticleReadingChrome()
+        isArticleReaderLoading = true
         articleViewMode = .reader
         if appState.selectedArticleId != article.id || appState.selectedArticle?.id != article.id {
             appState.setSelectedArticle(article)
@@ -5600,6 +5498,7 @@ struct ArticleDetailView: View {
                         feedTitle: article.feedTitle,
                         prefersCompactTitleSizing: usesCompactTitleSizing,
                         viewMode: $articleViewMode,
+                        isLoadingReader: $isArticleReaderLoading,
                         isReadingChromeHidden: isReadingChromeHidden,
                         readerViewportHeight: articleReaderViewportHeight(containerHeight: geometry.size.height),
                         scrollToTopTrigger: articleReaderScrollToTopTrigger,
@@ -5613,6 +5512,7 @@ struct ArticleDetailView: View {
                         onArticleTextScroll: noteArticleTextScrollActivity,
                         onArticleTextTap: revealArticleReadingChrome
                     )
+                    .id(article.id)
                     .padding(.top, articleViewMode == .reader ? 4 : 8)
                     .padding(.horizontal, articleContentHorizontalPadding)
 
@@ -5643,10 +5543,12 @@ struct ArticleDetailView: View {
             .background(ArticleOuterScrollViewResolver().frame(width: 0, height: 0))
             .onPreferenceChange(ArticleDetailScrollOffsetPreferenceKey.self, perform: handlePhoneArticleScrollOffsetChange)
             #elseif os(macOS)
-            .background(
-                FeedListScrollOffsetObserver(onOffsetChange: handleMacOuterArticleScrollOffsetChange)
-                    .frame(width: 0, height: 0)
-            )
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                let normalizedOffset = max(0, geometry.contentOffset.y + geometry.contentInsets.top)
+                return (normalizedOffset / 8).rounded() * 8
+            } action: { _, offset in
+                handleMacOuterArticleScrollOffsetChange(offset)
+            }
             #endif
         }
     }
@@ -5672,7 +5574,6 @@ struct ArticleDetailView: View {
 
     private func articleHasVisibleAIBox(_ article: Article) -> Bool {
         appState.isSummarizingArticle(article)
-            || appState.isWaitingForAppleIntelligence
             || qaState.showQAInterface
             || !(article.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
@@ -5962,7 +5863,9 @@ struct ArticleDetailView: View {
                 } else {
                     VStack(spacing: 8) {
                         ProgressView()
-                        Text("Summarizing article...")
+                        Text(appState.isWaitingForAppleIntelligence
+                             ? appState.appleIntelligenceWaitProgress
+                             : "Summarizing article...")
                             .foregroundColor(.secondary)
                             .font(.caption)
                     }
@@ -5971,25 +5874,6 @@ struct ArticleDetailView: View {
                     .background(AppColors.systemGray6)
                     .cornerRadius(10)
                 }
-            }
-            .padding(.bottom, 16)
-        } else if appState.isWaitingForAppleIntelligence && article.summary == nil {
-            VStack(spacing: 16) {
-                HStack {
-                    Text("Summary")
-                        .font(.headline)
-                    Spacer()
-                }
-                VStack(spacing: 8) {
-                    ProgressView()
-                    Text(appState.appleIntelligenceWaitProgress)
-                        .foregroundColor(.secondary)
-                        .font(.caption)
-                }
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(AppColors.systemGray6)
-                .cornerRadius(10)
             }
             .padding(.bottom, 16)
         } else if let summary = article.summary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -6277,15 +6161,27 @@ struct ArticleDetailView: View {
         }
     }
 
+    private var qaUtilityButtonSpacing: CGFloat {
+        #if os(macOS)
+        return 1
+        #else
+        return 12
+        #endif
+    }
+
     private func qaUtilityButtons() -> some View {
-        HStack(spacing: 12) {
+        HStack(spacing: qaUtilityButtonSpacing) {
             Button {
                 speakAnswerQA(qaState.answerText)
             } label: {
                 Image(systemName: "speaker.wave.2")
                     .font(.subheadline)
             }
+            #if os(macOS)
+            .buttonStyle(MacSummaryActionIconButtonStyle())
+            #else
             .buttonStyle(LiquidGlassButtonStyle())
+            #endif
             .ttsActiveGlow(isSynthesizingSpeechQA, color: .blue)
             .help("Read aloud (Cloud)")
             .disabled(isSynthesizingSpeechQA || isSpeakingLocallyQA || qaAnswerUnavailable)
@@ -6296,7 +6192,11 @@ struct ArticleDetailView: View {
                 Image(systemName: "stop.fill")
                     .font(.subheadline)
             }
+            #if os(macOS)
+            .buttonStyle(MacSummaryActionIconButtonStyle())
+            #else
             .buttonStyle(LiquidGlassButtonStyle())
+            #endif
             .help("Stop speech")
 
             Button {
@@ -6305,7 +6205,11 @@ struct ArticleDetailView: View {
                 Image(systemName: "speaker.wave.2.circle")
                     .font(.subheadline)
             }
+            #if os(macOS)
+            .buttonStyle(MacSummaryActionIconButtonStyle())
+            #else
             .buttonStyle(LiquidGlassButtonStyle())
+            #endif
             .ttsActiveGlow(isSpeakingLocallyQA, color: .green)
             .help("Read aloud (Local)")
             .disabled(isSynthesizingSpeechQA || qaAnswerUnavailable)
@@ -6316,10 +6220,17 @@ struct ArticleDetailView: View {
                 Image(systemName: "doc.on.doc")
                     .font(.subheadline)
             }
+            #if os(macOS)
+            .buttonStyle(MacSummaryActionIconButtonStyle())
+            #else
             .buttonStyle(LiquidGlassButtonStyle())
+            #endif
             .help("Copy answer")
             .disabled(qaAnswerUnavailable)
         }
+        #if os(macOS)
+        .modifier(MacSummaryActionPillModifier())
+        #endif
         .padding(.top, 5)
     }
 
@@ -7160,6 +7071,7 @@ struct ArticleContentRenderer: View {
     let feedTitle: String
     let prefersCompactTitleSizing: Bool
     @Binding var viewMode: ViewMode
+    @Binding var isLoadingReader: Bool
     let isReadingChromeHidden: Bool
     let readerViewportHeight: CGFloat?
     let scrollToTopTrigger: Int
@@ -7175,7 +7087,6 @@ struct ArticleContentRenderer: View {
     }
 
     @State private var contentHeight: CGFloat = 100
-    @State private var isLoadingReader: Bool = false
     @State private var readerModeAvailable: Bool = true
     @Environment(\.colorScheme) private var colorScheme
     #if os(iOS)
@@ -7213,9 +7124,11 @@ struct ArticleContentRenderer: View {
             if viewMode == .rss {
                 contentHeight = 100
             }
+            isLoadingReader = true
             readerModeAvailable = true
         }
         .onChange(of: baseURL) { _ in
+            isLoadingReader = true
             readerModeAvailable = true
         }
         .onChange(of: readerModeAvailable) { isAvailable in
@@ -7266,6 +7179,9 @@ struct ArticleContentRenderer: View {
         let isActive = viewMode == mode
 
         return Button {
+            if mode == .reader && viewMode != .reader {
+                isLoadingReader = true
+            }
             withAnimation(.easeInOut(duration: 0.2)) {
                 viewMode = mode
             }
@@ -7297,32 +7213,53 @@ struct ArticleContentRenderer: View {
     @ViewBuilder
     private var articleContentPanel: some View {
         if viewMode == .reader && canShowReaderMode {
+            let viewportHeight = readerViewportHeight ?? max(currentPlatformScreenHeight(), 320)
+
+            ZStack(alignment: .top) {
+                readerLoadingFallback(viewportHeight: viewportHeight)
+                    .opacity(isLoadingReader ? 1 : 0)
+                    .allowsHitTesting(isLoadingReader)
+                    .accessibilityHidden(!isLoadingReader)
+                    .zIndex(1)
+
             #if os(macOS)
-            ArticleReaderWebView(
-                articleURL: baseURL!,
-                isLoading: $isLoadingReader,
-                readerModeAvailable: $readerModeAvailable,
-                useCompactTitleSizing: prefersCompactTitleSizing,
-                scrollToTopTrigger: scrollToTopTrigger,
-                topContentInset: readerTopContentInset,
-                onScrollActivity: onArticleTextScroll,
-                onScrollOffsetChange: onMacArticleScrollOffsetChange
-            )
-            .frame(maxWidth: .infinity)
-            .frame(height: readerViewportHeight ?? max(currentPlatformScreenHeight(), 320))
+                ArticleReaderWebView(
+                    articleURL: baseURL!,
+                    isLoading: $isLoadingReader,
+                    readerModeAvailable: $readerModeAvailable,
+                    useCompactTitleSizing: prefersCompactTitleSizing,
+                    scrollToTopTrigger: scrollToTopTrigger,
+                    topContentInset: readerTopContentInset,
+                    onScrollActivity: onArticleTextScroll,
+                    onScrollOffsetChange: onMacArticleScrollOffsetChange
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: viewportHeight)
+                .opacity(isLoadingReader ? 0 : 1)
+                .allowsHitTesting(!isLoadingReader)
+                .accessibilityHidden(isLoadingReader)
+                .zIndex(2)
             #else
-            ArticleReaderWebView(
-                articleURL: baseURL!,
-                isLoading: $isLoadingReader,
-                readerModeAvailable: $readerModeAvailable,
-                useCompactTitleSizing: prefersCompactTitleSizing,
-                scrollToTopTrigger: scrollToTopTrigger,
-                onScrollActivity: onPhoneScrollActivity
-            )
-            .frame(maxWidth: .infinity)
-            .frame(height: readerViewportHeight ?? max(currentPlatformScreenHeight(), 320))
-            .animation(articleChromeContinuityAnimation, value: isReadingChromeHidden)
+                ArticleReaderWebView(
+                    articleURL: baseURL!,
+                    isLoading: $isLoadingReader,
+                    readerModeAvailable: $readerModeAvailable,
+                    useCompactTitleSizing: prefersCompactTitleSizing,
+                    scrollToTopTrigger: scrollToTopTrigger,
+                    onScrollActivity: onPhoneScrollActivity
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: viewportHeight)
+                .opacity(isLoadingReader ? 0 : 1)
+                .allowsHitTesting(!isLoadingReader)
+                .accessibilityHidden(isLoadingReader)
+                .animation(articleChromeContinuityAnimation, value: isReadingChromeHidden)
+                .zIndex(2)
             #endif
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: viewportHeight)
+            .animation(.easeOut(duration: 0.18), value: isLoadingReader)
         } else {
             #if os(macOS)
             HTMLWebView(
@@ -7361,6 +7298,41 @@ struct ArticleContentRenderer: View {
                     onArticleTextTap()
                 }
             )
+            #endif
+        }
+    }
+
+    @ViewBuilder
+    private func readerLoadingFallback(viewportHeight: CGFloat) -> some View {
+        if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Opening article…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: viewportHeight)
+            .articleReaderPanel(colorScheme: colorScheme)
+        } else {
+            #if os(macOS)
+            HTMLWebView(
+                htmlContent: enhanceHTML(content, articleTitle: articleTitle, feedTitle: feedTitle),
+                baseURL: baseURL,
+                contentHeight: .constant(viewportHeight),
+                onScrollOffsetChange: onMacArticleScrollOffsetChange
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: viewportHeight)
+            .articleReaderPanel(colorScheme: colorScheme)
+            #else
+            HTMLWebView(
+                htmlContent: enhanceHTML(content, articleTitle: articleTitle, feedTitle: feedTitle),
+                baseURL: baseURL,
+                contentHeight: .constant(viewportHeight)
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: viewportHeight)
+            .articleReaderPanel(colorScheme: colorScheme)
             #endif
         }
     }
@@ -9759,6 +9731,220 @@ enum SummaryCardBorderStyle {
     case reddit
 }
 
+private struct SummaryToolbarSeparator: View {
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.24))
+            .frame(width: 1, height: 24)
+            .padding(.horizontal, 4)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct SummaryTTSMiniPlayerGlassModifier: ViewModifier {
+    let tint: Color
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        if #available(iOS 26.0, *) {
+            content
+                .glassEffect(.regular.tint(tint).interactive(), in: Capsule(style: .continuous))
+        } else {
+            fallback(content)
+        }
+        #elseif os(macOS)
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(.regular.tint(tint).interactive(), in: Capsule(style: .continuous))
+        } else {
+            fallback(content)
+        }
+        #endif
+    }
+
+    private func fallback(_ content: Content) -> some View {
+        content
+            .background(tint.opacity(0.22), in: Capsule(style: .continuous))
+            .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+            .overlay {
+                Capsule(style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.30),
+                                Color.white.opacity(0.08),
+                                Color.black.opacity(0.12)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            }
+    }
+}
+
+struct SummaryTTSMiniPlayer: View {
+    let isReddit: Bool
+    let playDisabled: Bool
+    let stopDisabled: Bool
+    let localDisabled: Bool
+    let localIsActive: Bool
+    let onPlay: () -> Void
+    let onStop: () -> Void
+    let onLocal: () -> Void
+    let playHelp: String
+    let localHelp: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var playColor: Color {
+        isReddit
+            ? Color(red: 0.96, green: 0.42, blue: 0.12)
+            : Color(red: 0.27, green: 0.53, blue: 0.92)
+    }
+
+    private var glassTint: Color {
+        isReddit
+            ? Color(red: 0.35, green: 0.40, blue: 0.49).opacity(0.40)
+            : Color(red: 0.28, green: 0.43, blue: 0.61).opacity(0.42)
+    }
+
+    private var neutralIconColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.88) : Color.black.opacity(0.72)
+    }
+
+    private var controlHeight: CGFloat {
+        #if os(macOS)
+        return 18
+        #else
+        return 36
+        #endif
+    }
+
+    private var secondaryControlWidth: CGFloat {
+        #if os(macOS)
+        return 26
+        #else
+        return 58
+        #endif
+    }
+
+    private var dividerPadding: CGFloat {
+        #if os(macOS)
+        return 2
+        #else
+        return 8
+        #endif
+    }
+
+    private var playerPadding: CGFloat {
+        #if os(macOS)
+        return 1
+        #else
+        return 6
+        #endif
+    }
+
+    private var playIconSize: CGFloat {
+        #if os(macOS)
+        return 9
+        #else
+        return 16
+        #endif
+    }
+
+    private var stopIconSize: CGFloat {
+        #if os(macOS)
+        return 7
+        #else
+        return 14
+        #endif
+    }
+
+    private var localIconSize: CGFloat {
+        #if os(macOS)
+        return 9
+        #else
+        return 17
+        #endif
+    }
+
+    private var dividerHeight: CGFloat {
+        #if os(macOS)
+        return 14
+        #else
+        return 20
+        #endif
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onPlay) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: playIconSize, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: controlHeight, height: controlHeight)
+                    .background(Circle().fill(playColor))
+            }
+            .buttonStyle(.plain)
+            .disabled(playDisabled)
+            .opacity(playDisabled ? 0.45 : 1)
+            .help(playHelp)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.20))
+                .frame(width: 1, height: dividerHeight)
+                .padding(.horizontal, dividerPadding)
+
+            Button(action: onStop) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: stopIconSize, weight: .bold))
+                    .foregroundStyle(stopDisabled ? neutralIconColor.opacity(0.38) : neutralIconColor)
+                    .frame(width: secondaryControlWidth, height: controlHeight)
+            }
+            .buttonStyle(.plain)
+            .disabled(stopDisabled)
+            .help("Stop speech")
+
+            Rectangle()
+                .fill(Color.white.opacity(0.20))
+                .frame(width: 1, height: dividerHeight)
+                .padding(.horizontal, dividerPadding)
+
+            Button(action: onLocal) {
+                Image(systemName: "speaker.wave.2.circle")
+                    .font(.system(size: localIconSize, weight: .medium))
+                    .foregroundStyle(localIsActive ? Color.green : neutralIconColor)
+                    .frame(width: secondaryControlWidth, height: controlHeight)
+            }
+            .buttonStyle(.plain)
+            .disabled(localDisabled)
+            .opacity(localDisabled ? 0.45 : 1)
+            .help(localHelp)
+        }
+        .padding(playerPadding)
+        .modifier(SummaryTTSMiniPlayerGlassModifier(tint: glassTint))
+        .overlay {
+            Capsule(style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.34),
+                            Color.white.opacity(0.10),
+                            Color.black.opacity(0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.8
+                )
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Summary audio controls")
+    }
+}
+
 // Replace the ArticleGlassyBackgroundModifier with this enhanced version
 struct ArticleGlassyBackgroundModifier: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
@@ -9849,40 +10035,18 @@ struct ArticleGlassySummary: View {
             // TTS controls at the top
             HStack(spacing: 12) {
                 Spacer()
-
-                // Cloud TTS button
-                Button {
-                    speakSummary()
-                } label: {
-                    Image(systemName: "speaker.wave.2")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSynthesizingSpeech, color: .blue)
-                .help("Read aloud (Cloud)")
-                .disabled(isSynthesizingSpeech || isSpeakingLocally || summary.isEmpty)
-                
-                // Stop speech
-                Button {
-                    stopArticleSummarySpeech()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .help("Stop speech")
-                
-                // Local TTS button
-                Button {
-                    speakSummaryLocally()
-                } label: {
-                    Image(systemName: "speaker.wave.2.circle")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSpeakingLocally, color: .green)
-                .help("Read aloud (Local)")
-                .disabled(isSynthesizingSpeech || summary.isEmpty)
+                SummaryTTSMiniPlayer(
+                    isReddit: borderStyle == .reddit,
+                    playDisabled: isSynthesizingSpeech || isSpeakingLocally || summary.isEmpty,
+                    stopDisabled: !isSynthesizingSpeech && !isSpeakingLocally,
+                    localDisabled: isSynthesizingSpeech || summary.isEmpty,
+                    localIsActive: isSpeakingLocally,
+                    onPlay: speakSummary,
+                    onStop: stopArticleSummarySpeech,
+                    onLocal: speakSummaryLocally,
+                    playHelp: "Read aloud (Cloud)",
+                    localHelp: "Read aloud (Local)"
+                )
             }
             .padding(.horizontal, 20)
             .padding(.top, 16)
@@ -9943,6 +10107,9 @@ struct ArticleGlassySummary: View {
                     .padding(.bottom, 12)
             }
         }
+        #if os(macOS)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        #endif
         .modifier(ArticleGlassyBackgroundModifier(borderStyle: borderStyle))
         .onAppear {
             // Set up sound delegate callbacks
@@ -11002,6 +11169,96 @@ struct QuestionAnswerGlassModifier: ViewModifier {
     }
 }
 
+#if os(macOS)
+private let summaryAnswerGlassTint = Color(red: 0.30, green: 0.46, blue: 0.64).opacity(0.26)
+
+private struct SummaryAnswerGlassSurfaceModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .frame(
+                minWidth: 480,
+                idealWidth: 640,
+                maxWidth: 760,
+                minHeight: 420,
+                idealHeight: 520,
+                maxHeight: 720
+            )
+            .background(Color.clear)
+            .glassEffect(
+                .regular.tint(summaryAnswerGlassTint),
+                in: .rect(cornerRadius: 32)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 32, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.28),
+                                Color.white.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            }
+    }
+}
+
+private extension View {
+    func summaryAnswerGlassSurface() -> some View {
+        modifier(SummaryAnswerGlassSurfaceModifier())
+    }
+}
+
+private struct MacSummaryAnswerSheetContent: View {
+    let answer: String
+    let onClose: () -> Void
+    let onCopy: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Button("Close", action: onClose)
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.large)
+
+                Spacer()
+
+                Button(action: onCopy) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.title2)
+                        .frame(width: 34, height: 34)
+                        .accessibilityLabel("Copy")
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+
+            Text("Summary Answer")
+                .font(.largeTitle.bold())
+                .padding(.horizontal, 24)
+                .padding(.top, 18)
+                .padding(.bottom, 8)
+
+            ScrollView {
+                Text(.init(answer.isEmpty ? "No answer available." : answer))
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 20)
+                    .textSelection(.enabled)
+            }
+        }
+        .summaryAnswerGlassSurface()
+    }
+}
+#endif
+
 // Navigation button glass modifier
 struct NavigationButtonGlassModifier: ViewModifier {
     func body(content: Content) -> some View {
@@ -11021,6 +11278,14 @@ struct NavigationButtonGlassModifier: ViewModifier {
 
 // Draggable version of GlobalSummaryResultView
 struct DraggableGlobalSummaryView: View {
+    private struct SummaryScrollMetrics: Equatable {
+        let offsetY: CGFloat
+        let contentHeight: CGFloat
+        let viewportHeight: CGFloat
+
+        static let zero = SummaryScrollMetrics(offsetY: 0, contentHeight: 0, viewportHeight: 0)
+    }
+
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @State private var offset = CGSize.zero
@@ -11040,6 +11305,23 @@ struct DraggableGlobalSummaryView: View {
     @State private var selectionAskAIResponse: String?
     @State private var selectionAskAIError: String?
     @State private var selectionAskAITask: Task<Void, Never>?
+    @State private var showQuestionReliabilityWarning = false
+    @State private var pendingQuestionUsesWebAI = false
+    @State private var isSummaryContentScrolling = false
+    @State private var summaryChromeRevealTask: Task<Void, Never>?
+    @State private var isSummaryScrollActive = false
+    @State private var highlightedSummaryID: String?
+    @State private var summaryScrollProxy: ScrollViewProxy?
+    @State private var summaryScrollPosition = ScrollPosition(idType: String.self)
+    @State private var currentSummaryContentOffset: CGPoint = .zero
+    @State private var summaryScrollMetrics = SummaryScrollMetrics.zero
+    @State private var summaryReturnContentOffset: CGPoint?
+    @State private var parsedSummaries: [GlobalSummaryItem] = []
+    @State private var isRedditContent = false
+
+    private static let panelWidth: CGFloat = 400
+    private static let summaryHorizontalInset: CGFloat = 16
+    private let summaryChromeReturnDelay: UInt64 = 450_000_000
 
     // Whiteboard State Variables
     @State private var showWhiteboard: Bool = false
@@ -11066,35 +11348,26 @@ struct DraggableGlobalSummaryView: View {
     let json: String
     let error: String?
 
+    private static let overallSummaryAnchorID = "global-summary-overall-anchor"
+
     private var shouldShowExplicitWebAIControls: Bool {
         appState.settings.selectedSummaryProvider != .webAI
-    }
-    
-    private var parsedResult: GlobalSummaryResult? {
-        guard let data = json.data(using: .utf8),
-              let result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data) else {
-            return nil
-        }
-        return result
-    }
-    
-    private var parsedSummaries: [GlobalSummaryItem] {
-        return parsedResult?.summaries ?? []
-    }
-    
-    private var isRedditContent: Bool {
-        return parsedResult?.source == "reddit"
     }
     
     private var hasSummaryContent: Bool {
         !parsedSummaries.isEmpty || !(appState.aggregateSummaryText?.isEmpty ?? true)
     }
 
-    private func summaryStableID(for item: GlobalSummaryItem, index: Int) -> String {
-        if let referenceId = item.referenceId, !referenceId.isEmpty {
-            return "ref-\(referenceId)-\(index)"
+    private func summaryStableID(for item: GlobalSummaryItem) -> String {
+        let reference = item.referenceId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let subject = item.subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !reference.isEmpty {
+            return "ref-\(reference)"
         }
-        return "summary-\(item.subject)-\(index)"
+        if !subject.isEmpty {
+            return "subject-\(subject)-summary-\(item.summary.prefix(80))"
+        }
+        return "summary-\(item.summary.prefix(80))"
     }
 
     private struct ParsedSummaryRow: Identifiable {
@@ -11106,10 +11379,76 @@ struct DraggableGlobalSummaryView: View {
     private var parsedSummaryRows: [ParsedSummaryRow] {
         parsedSummaries.enumerated().map { index, item in
             ParsedSummaryRow(
-                id: summaryStableID(for: item, index: index),
+                id: summaryStableID(for: item),
                 index: index,
                 item: item
             )
+        }
+    }
+
+    private func scrollToSummary(referenceNumber: Int, using proxy: ScrollViewProxy) {
+        let index = referenceNumber - 1
+        guard parsedSummaries.indices.contains(index) else { return }
+
+        summaryReturnContentOffset = currentSummaryContentOffset
+        let targetID = summaryStableID(for: parsedSummaries[index])
+        highlightedSummaryID = targetID
+        withAnimation(.easeInOut(duration: 0.35)) {
+            proxy.scrollTo(targetID, anchor: .top)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+            guard highlightedSummaryID == targetID else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                highlightedSummaryID = nil
+            }
+        }
+    }
+
+    private func returnToSummaryOrigin() {
+        if let summaryReturnContentOffset {
+            var target = summaryScrollPosition
+            target.scrollTo(point: summaryReturnContentOffset)
+            withAnimation(.easeInOut(duration: 0.35)) {
+                summaryScrollPosition = target
+            }
+            self.summaryReturnContentOffset = nil
+            highlightedSummaryID = nil
+            return
+        }
+
+        guard let summaryScrollProxy else { return }
+        highlightedSummaryID = nil
+        withAnimation(.easeInOut(duration: 0.35)) {
+            summaryScrollProxy.scrollTo(Self.overallSummaryAnchorID, anchor: .top)
+        }
+    }
+
+    private func rebuildParsedSummaryCache(from json: String) {
+        guard let data = json.data(using: .utf8),
+              let result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data) else {
+            parsedSummaries = []
+            isRedditContent = false
+            return
+        }
+
+        parsedSummaries = result.summaries
+        isRedditContent = result.source == "reddit"
+    }
+
+    private func restoreSummaryScrollPositionAfterRefresh(from offset: CGPoint) {
+        guard summaryScrollProxy != nil else { return }
+
+        DispatchQueue.main.async {
+            guard !isSummaryScrollActive else { return }
+
+            var restoredPosition = summaryScrollPosition
+            restoredPosition.scrollTo(point: offset)
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                summaryScrollPosition = restoredPosition
+            }
         }
     }
 
@@ -11134,6 +11473,20 @@ struct DraggableGlobalSummaryView: View {
                 Text("Summary Overview")
                     .font(.headline)
                 Spacer()
+
+                if appState.aggregateSummaryText != nil {
+                    Button {
+                        returnToSummaryOrigin()
+                    } label: {
+                        Image(systemName: "house.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(summaryScrollProxy == nil)
+                    .help("Return to previous summary position")
+
+                    SummaryToolbarSeparator()
+                }
                 
                 // Minimize button
                 Button {
@@ -11145,31 +11498,17 @@ struct DraggableGlobalSummaryView: View {
                 
                 // Close button
                 Button {
-                    appState.showGlobalSummary = false
-                    appState.hasCachedSummary = false
-                    appState.globalSummaryJSON = ""
+                    appState.dismissGlobalSummaryAndClearContext()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundColor(.secondary)
                 }
             }
             .padding()
-            .background(
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(.ultraThinMaterial)
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.2),
-                            Color.clear
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .cornerRadius(12)
-                    .blendMode(.overlay)
-                }
-            )
+            // Keep the drag target, but let the outer glass surface remain the
+            // only panel background. A second material here creates the
+            // rectangular strip behind the title-bar buttons.
+            .contentShape(Rectangle())
             .gesture(
                 DragGesture()
                     .onChanged { value in
@@ -11183,10 +11522,13 @@ struct DraggableGlobalSummaryView: View {
                         isDragging = false
                     }
             )
+            .opacity(isSummaryContentScrolling ? 0 : 1)
+            .allowsHitTesting(!isSummaryContentScrolling)
             
             // Content
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+            ScrollViewReader { scrollProxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 16) {
                     if let error = error, !error.isEmpty {
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -11246,9 +11588,33 @@ struct DraggableGlobalSummaryView: View {
                                             .background(Capsule().fill(Color.secondary.opacity(0.12)))
                                     }
                                 }
+
+                                #if os(macOS)
+                                if !aggregateText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    HStack {
+                                        Spacer()
+                                        SummaryTTSMiniPlayer(
+                                            isReddit: isRedditContent,
+                                            playDisabled: isSynthesizingSpeechDrag || isSpeakingLocallyDrag,
+                                            stopDisabled: !isSynthesizingSpeechDrag && !isSpeakingLocallyDrag,
+                                            localDisabled: isSynthesizingSpeechDrag,
+                                            localIsActive: isSpeakingLocallyDrag,
+                                            onPlay: speakDragOverviewCloudTTS,
+                                            onStop: stopDragOverviewSpeech,
+                                            onLocal: speakDragOverviewLocally,
+                                            playHelp: "Read overall summary (Cloud TTS)",
+                                            localHelp: "Read overall summary (Local TTS)"
+                                        )
+                                    }
+                                }
+                                #endif
+
                                 SelectableText(.init(aggregateText))
                                     .font(.body)
                                     .foregroundColor(.primary)
+                                    .summaryReferences(count: parsedSummaries.count) { referenceNumber in
+                                        scrollToSummary(referenceNumber: referenceNumber, using: scrollProxy)
+                                    }
                             }
                             .padding()
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -11276,6 +11642,7 @@ struct DraggableGlobalSummaryView: View {
                                     }
                                 }
                             )
+                            .id(Self.overallSummaryAnchorID)
                         }
 
                         if appState.isGeneratingAggregateSummary {
@@ -11330,16 +11697,113 @@ struct DraggableGlobalSummaryView: View {
                                     borderStyle: isRedditContent ? .reddit : .article
                                 )
                                     .environmentObject(appState)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .padding(.bottom, 4)
+                            .padding(.horizontal, 4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background {
+                                if highlightedSummaryID == row.id {
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(Color.accentColor.opacity(0.12))
+                                }
+                            }
+                            .overlay {
+                                if highlightedSummaryID == row.id {
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(Color.accentColor.opacity(0.9), lineWidth: 2)
+                                }
+                            }
+                            .id(row.id)
+                            .animation(.easeInOut(duration: 0.2), value: highlightedSummaryID)
+                        }
+                    }
+                    }
+                    .frame(
+                        width: Self.panelWidth - (Self.summaryHorizontalInset * 2),
+                        alignment: .leading
+                    )
+                    .padding(.vertical, 12)
+                    .padding(.horizontal, Self.summaryHorizontalInset)
+                    .environment(\.askAISelectionHandler, askAIHandler)
+                    .environment(\.askAIWebSelectionHandler, askAIWebHandler)
+                }
+                .scrollPosition($summaryScrollPosition)
+                .frame(width: Self.panelWidth)
+                .frame(maxHeight: 400)
+                .onScrollGeometryChange(
+                    for: SummaryScrollMetrics.self,
+                    of: { geometry in
+                        SummaryScrollMetrics(
+                            offsetY: max(0, geometry.contentOffset.y),
+                            contentHeight: geometry.contentSize.height,
+                            viewportHeight: geometry.containerSize.height
+                        )
+                    }
+                ) { _, newMetrics in
+                    summaryScrollMetrics = newMetrics
+                    currentSummaryContentOffset = CGPoint(x: 0, y: newMetrics.offsetY)
+                }
+                .onScrollPhaseChange { _, newPhase in
+                    summaryChromeRevealTask?.cancel()
+                    summaryChromeRevealTask = nil
+                    if newPhase.isScrolling {
+                        isSummaryScrollActive = true
+                        if !isSummaryContentScrolling {
+                            withAnimation(.easeOut(duration: 0.12)) {
+                                isSummaryContentScrolling = true
+                            }
+                        }
+                    } else {
+                        isSummaryScrollActive = false
+                        summaryChromeRevealTask = Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: summaryChromeReturnDelay)
+                            guard !Task.isCancelled else { return }
+                            withAnimation(.easeIn(duration: 0.16)) {
+                                isSummaryContentScrolling = false
+                            }
+                            summaryChromeRevealTask = nil
                         }
                     }
                 }
-                .padding()
-                .environment(\.askAISelectionHandler, askAIHandler)
-                .environment(\.askAIWebSelectionHandler, askAIWebHandler)
+                .overlay(alignment: .trailing) {
+                    if summaryScrollMetrics.contentHeight > summaryScrollMetrics.viewportHeight + 1 {
+                        GeometryReader { proxy in
+                            let verticalInset: CGFloat = 6
+                            let trackHeight = max(1, proxy.size.height - (verticalInset * 2))
+                            let visibleFraction = min(
+                                1,
+                                summaryScrollMetrics.viewportHeight / summaryScrollMetrics.contentHeight
+                            )
+                            let thumbHeight = max(24, trackHeight * visibleFraction)
+                            let scrollRange = max(
+                                1,
+                                summaryScrollMetrics.contentHeight - summaryScrollMetrics.viewportHeight
+                            )
+                            let progress = min(max(summaryScrollMetrics.offsetY / scrollRange, 0), 1)
+                            let thumbCenterY = verticalInset
+                                + (thumbHeight / 2)
+                                + (progress * max(0, trackHeight - thumbHeight))
+
+                            Capsule(style: .continuous)
+                                .fill(Color.primary.opacity(0.34))
+                                .frame(width: 2.5, height: thumbHeight)
+                                .position(x: max(2, proxy.size.width - 8), y: thumbCenterY)
+                        }
+                        .allowsHitTesting(false)
+                        .opacity(isSummaryScrollActive ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.14), value: isSummaryScrollActive)
+                    }
+                }
+                .onAppear {
+                    summaryScrollProxy = scrollProxy
+                }
+                .onDisappear {
+                    summaryChromeRevealTask?.cancel()
+                    summaryChromeRevealTask = nil
+                    summaryScrollProxy = nil
+                }
             }
-            .frame(maxHeight: 400)
 
             // Q&A Interface
             if showQAInterface {
@@ -11428,6 +11892,8 @@ struct DraggableGlobalSummaryView: View {
                 .padding()
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 .padding(.horizontal)
+                .opacity(isSummaryContentScrolling ? 0 : 1)
+                .allowsHitTesting(!isSummaryContentScrolling)
             }
 
             // TTS status indicators
@@ -11460,7 +11926,8 @@ struct DraggableGlobalSummaryView: View {
             }
 
             // Action buttons
-            HStack(spacing: 12) {
+            MacSummaryActionCapsule {
+                HStack(spacing: 1) {
                 Button {
                     let formattedText = parsedSummaries.enumerated()
                         .map { index, item in "\(index + 1). **\(item.subject)**\n\(item.summary)" }
@@ -11469,7 +11936,7 @@ struct DraggableGlobalSummaryView: View {
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
-                .buttonStyle(LiquidGlassButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .help("Copy summaries")
 
                 if appState.aggregateSummaryText == nil {
@@ -11479,7 +11946,7 @@ struct DraggableGlobalSummaryView: View {
                     } label: {
                         Image(systemName: "sparkles")
                     }
-                    .buttonStyle(LiquidGlassButtonStyle())
+                    .buttonStyle(MacSummaryActionIconButtonStyle())
                     .help("Generate overall summary")
                     .disabled(
                         appState.isLoading ||
@@ -11496,47 +11963,12 @@ struct DraggableGlobalSummaryView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(LiquidGlassButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .help("Reload summary")
                 .disabled(appState.lastGlobalSummaryContext == nil)
                 .onAppear {
                     print("🔄 Reload button appeared - context: \(String(describing: appState.lastGlobalSummaryContext))")
                 }
-
-                // Cloud TTS button
-                Button {
-                    speakDragOverviewCloudTTS()
-                } label: {
-                    Image(systemName: "speaker.wave.2")
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSynthesizingSpeechDrag, color: .blue)
-                .help("Read aloud (Cloud TTS)")
-                .disabled(isSynthesizingSpeechDrag || isSpeakingLocallyDrag || !hasSummaryContent)
-
-                // Local TTS button
-                Button {
-                    speakDragOverviewLocally()
-                } label: {
-                    Image(systemName: "speaker.wave.2.circle")
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSpeakingLocallyDrag, color: .green)
-                .help("Read aloud (Local TTS / MLX)")
-                .disabled(isSynthesizingSpeechDrag || !hasSummaryContent)
-
-                // Stop TTS button
-                if isSynthesizingSpeechDrag || isSpeakingLocallyDrag {
-                    Button {
-                        stopDragOverviewSpeech()
-                    } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle())
-                    .help("Stop speech")
-                }
-
-                Spacer()
 
                 // C button - Copy to clipboard
                 Button {
@@ -11545,7 +11977,7 @@ struct DraggableGlobalSummaryView: View {
                     Image(systemName: "c.circle.fill")
                         .foregroundColor(.secondary)
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .disabled(!canCopySummary)
                 .help("Copy summary to clipboard")
 
@@ -11562,9 +11994,11 @@ struct DraggableGlobalSummaryView: View {
                     Image(systemName: "questionmark.circle.fill")
                         .foregroundColor(showQAInterface ? .accentColor : .secondary)
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .disabled(!hasSummaryContent)
                 .help("Ask a question about this overview")
+
+                SummaryToolbarSeparator()
 
                 // Whiteboard Button
                 Button {
@@ -11578,7 +12012,7 @@ struct DraggableGlobalSummaryView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .disabled(!hasSummaryContent || isGeneratingWhiteboard)
                 .help("Generate whiteboard summary")
 
@@ -11594,9 +12028,25 @@ struct DraggableGlobalSummaryView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(MacSummaryActionIconButtonStyle())
                 .disabled(!hasSummaryContent || isGeneratingInfographic)
                 .help("Generate infographic summary")
+
+                SummaryToolbarSeparator()
+
+                // Batch Podcast Button
+                Button {
+                    appState.presentBatchPodcast()
+                } label: {
+                    Image(systemName: "waveform.badge.mic")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(MacSummaryActionIconButtonStyle())
+                .disabled(!hasSummaryContent)
+                .accessibilityLabel("Generate batch podcast")
+                .help("Generate a podcast from this saved batch")
+
+                SummaryToolbarSeparator()
 
                 if shouldShowExplicitWebAIControls {
                     Menu {
@@ -11618,15 +12068,21 @@ struct DraggableGlobalSummaryView: View {
                         Image(systemName: "globe")
                             .foregroundColor(.secondary)
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(MacSummaryActionIconButtonStyle())
                     .disabled(!hasSummaryContent)
                     .help("Web actions for \(appState.settings.selectedWebAIProvider.displayName)")
                 }
             }
-            .padding(.horizontal)
+            }
+            #if os(macOS)
+            .frame(width: Self.panelWidth - 16, alignment: .center)
+            #endif
+            .padding(.horizontal, 8)
             .padding(.bottom, 8)
+            .opacity(isSummaryContentScrolling ? 0 : 1)
+            .allowsHitTesting(!isSummaryContentScrolling)
         }
-        .frame(width: 400)
+        .frame(width: Self.panelWidth)
         .background(
             ZStack {
                 // Glass background with gradient
@@ -11666,7 +12122,22 @@ struct DraggableGlobalSummaryView: View {
         .offset(offset)
         .scaleEffect(isDragging ? 1.05 : 1.0)
         .animation(.spring(response: 0.3), value: isDragging)
+        .onAppear {
+            rebuildParsedSummaryCache(from: json)
+        }
+        .onChange(of: json) { newValue in
+            let preservedOffset = currentSummaryContentOffset
+            rebuildParsedSummaryCache(from: newValue)
+            restoreSummaryScrollPositionAfterRefresh(from: preservedOffset)
+        }
         .sheet(isPresented: $showAnswerSheet) {
+            #if os(macOS)
+            MacSummaryAnswerSheetContent(
+                answer: qaAnswerText,
+                onClose: { showAnswerSheet = false },
+                onCopy: { copyToClipboard(qaAnswerText) }
+            )
+            #else
             NavigationStack {
                 ScrollView {
                     Text(.init(qaAnswerText.isEmpty ? "No answer available." : qaAnswerText))
@@ -11691,12 +12162,16 @@ struct DraggableGlobalSummaryView: View {
                         } label: {
                             Label("Copy", systemImage: "doc.on.doc")
                         }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.primary)
+                        .tint(.primary)
                     }
                 }
             }
             #if os(iOS)
             .presentationDetents([.medium, .large])
             .presentationCornerRadius(32)
+            #endif
             #endif
         }
         .sheet(isPresented: $showWhiteboard) {
@@ -11706,6 +12181,9 @@ struct DraggableGlobalSummaryView: View {
                     isPresented: $showWhiteboard,
                     onAskAI: { selection in
                         try await askAIResponse(for: selection, action: .standard)
+                    },
+                    onAskAIWeb: { selection in
+                        try await askAIResponse(for: selection, action: .web)
                     }
                 )
             }
@@ -11715,11 +12193,33 @@ struct DraggableGlobalSummaryView: View {
                 htmlData: infographicContent,
                 onAskAI: { selection in
                     try await askAIResponse(for: selection, action: .standard)
+                },
+                onAskAIWeb: { selection in
+                    try await askAIResponse(for: selection, action: .web)
                 }
             )
                 .environmentObject(appState)
         }
         .askAILoadingOverlay(isSelectionAskAIInFlight)
+        #if os(macOS)
+        .overlay {
+            if showSelectionAskAIResponse {
+                ZStack {
+                    Color.black.opacity(0.10)
+                        .ignoresSafeArea()
+                    AskAIResponseSheet(
+                        isLoading: isSelectionAskAIInFlight,
+                        response: selectionAskAIResponse,
+                        errorMessage: selectionAskAIError,
+                        onClose: { showSelectionAskAIResponse = false },
+                        onCopy: copySelectionAskAIResponse
+                    )
+                    .frame(width: 640, height: 520)
+                }
+                .transition(.opacity)
+            }
+        }
+        #else
         .sheet(isPresented: $showSelectionAskAIResponse) {
             AskAIResponseSheet(
                 isLoading: isSelectionAskAIInFlight,
@@ -11728,10 +12228,18 @@ struct DraggableGlobalSummaryView: View {
                 onClose: { showSelectionAskAIResponse = false },
                 onCopy: copySelectionAskAIResponse
             )
-            #if os(macOS)
-            .frame(minWidth: 480, idealWidth: 640, maxWidth: .infinity,
-                   minHeight: 420, idealHeight: 520, maxHeight: .infinity)
-            #endif
+        }
+        #endif
+        .alert("Less Reliable Answer", isPresented: $showQuestionReliabilityWarning) {
+            Button("Generate Overall Summary") {
+                appState.generateCombinedGlobalSummary(force: false)
+            }
+            Button("Continue with Saved Summaries") {
+                askGlobalSummaryQuestionUsingSavedSummaries(useWebAI: pendingQuestionUsesWebAI)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A full overall summary has not been generated. The answer will use the saved per-item summaries and may miss important details. Generate the overall summary first for a more reliable answer. No comments will be downloaded again if you continue.")
         }
         .overlay(alignment: .top) {
             if let errorMsg = whiteboardError {
@@ -11914,6 +12422,12 @@ struct DraggableGlobalSummaryView: View {
             qaInlineError = "Please enter a question first."
             return
         }
+        if isRedditContent,
+           appState.aggregateSummaryText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            pendingQuestionUsesWebAI = false
+            showQuestionReliabilityWarning = true
+            return
+        }
         
         qaInlineError = nil
         isProcessingQA = true
@@ -11935,12 +12449,36 @@ struct DraggableGlobalSummaryView: View {
             qaInlineError = "Please enter a question first."
             return
         }
+        if isRedditContent,
+           appState.aggregateSummaryText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            pendingQuestionUsesWebAI = true
+            showQuestionReliabilityWarning = true
+            return
+        }
 
         qaInlineError = nil
         isProcessingQA = true
         qaAnswerText = ""
 
         appState.askWebQuestionAboutGlobalSummary(question: trimmed) { answer in
+            DispatchQueue.main.async {
+                self.qaAnswerText = formatAskAIResponseForDisplay(answer)
+                self.isProcessingQA = false
+                self.showAnswerSheet = true
+            }
+        }
+    }
+
+    private func askGlobalSummaryQuestionUsingSavedSummaries(useWebAI: Bool) {
+        let trimmed = qaQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        qaInlineError = nil
+        isProcessingQA = true
+        qaAnswerText = ""
+        appState.askQuestionAboutSavedGlobalSummaries(
+            question: trimmed,
+            useWebAI: useWebAI
+        ) { answer in
             DispatchQueue.main.async {
                 self.qaAnswerText = formatAskAIResponseForDisplay(answer)
                 self.isProcessingQA = false
@@ -11977,8 +12515,8 @@ struct DraggableGlobalSummaryView: View {
         }
 
         var context = sections.joined(separator: "\n\n")
-        if context.count > 12000 {
-            context = String(context.prefix(12000)) + "\n\n[Context truncated]"
+        if context.count > 40000 {
+            context = String(context.prefix(40000)) + "\n\n[Context truncated]"
         }
         return context
     }
@@ -12025,7 +12563,7 @@ struct DraggableGlobalSummaryView: View {
                 }
             }
         case .applePCCGateway:
-            return try await appState.performPCCGatewayRequestAsync(
+            return try await appState.performPCCPlainTextRequestAsync(
                 prompt: prompt,
                 taskName: "Ask AI",
                 isQA: true
@@ -12049,6 +12587,16 @@ struct DraggableGlobalSummaryView: View {
     }
 
     private func askAIResponse(for selection: String, action: AskAISelectionAction) async throws -> String {
+        if isRedditContent {
+            return await withCheckedContinuation { continuation in
+                appState.askQuestionAboutGlobalSummarySelection(
+                    selectedText: selection,
+                    useWebAI: action == .web
+                ) { response in
+                    continuation.resume(returning: formatAskAIResponseForDisplay(response))
+                }
+            }
+        }
         let prompt = try makeAskAISelectionPrompt(for: selection)
         let rawResponse = try await performAskAI(prompt: prompt, action: action)
         return formatAskAIResponseForDisplay(rawResponse)
@@ -14569,6 +15117,7 @@ struct WhiteboardView: View {
     let htmlContent: String
     @Binding var isPresented: Bool
     var onAskAI: ((String) async throws -> String)? = nil
+    var onAskAIWeb: ((String) async throws -> String)? = nil
     @State private var webView: WKWebView?
     @State private var isLoading: Bool = true
     @State private var showAskAIResponse = false
@@ -14584,7 +15133,10 @@ struct WhiteboardView: View {
                     webView: $webView,
                     isLoading: $isLoading,
                     onAskAI: onAskAI == nil ? nil : { selection in
-                        handleAskAISelection(selection)
+                        handleAskAISelection(selection, useWebAI: false)
+                    },
+                    onAskAIWeb: onAskAIWeb == nil ? nil : { selection in
+                        handleAskAISelection(selection, useWebAI: true)
                     }
                 )
 
@@ -14618,6 +15170,25 @@ struct WhiteboardView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 600)
+        #if os(macOS)
+        .overlay {
+            if showAskAIResponse {
+                ZStack {
+                    Color.black.opacity(0.10)
+                        .ignoresSafeArea()
+                    AskAIResponseSheet(
+                        isLoading: isAskingAI,
+                        response: askAIResponse,
+                        errorMessage: askAIError,
+                        onClose: { showAskAIResponse = false },
+                        onCopy: copyAskAIResponse
+                    )
+                    .frame(width: 640, height: 520)
+                }
+                .transition(.opacity)
+            }
+        }
+        #else
         .sheet(isPresented: $showAskAIResponse) {
             AskAIResponseSheet(
                 isLoading: isAskingAI,
@@ -14626,23 +15197,21 @@ struct WhiteboardView: View {
                 onClose: { showAskAIResponse = false },
                 onCopy: copyAskAIResponse
             )
-            #if os(macOS)
-            .frame(minWidth: 480, idealWidth: 640, maxWidth: .infinity,
-                   minHeight: 420, idealHeight: 520, maxHeight: .infinity)
-            #endif
         }
+        #endif
     }
 
-    private func handleAskAISelection(_ selection: String) {
+    private func handleAskAISelection(_ selection: String, useWebAI: Bool) {
         let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let onAskAI else { return }
+        let handler = useWebAI ? onAskAIWeb : onAskAI
+        guard !trimmed.isEmpty, let handler else { return }
         isAskingAI = true
         askAIResponse = nil
         askAIError = nil
         showAskAIResponse = true
         Task {
             do {
-                let response = try await onAskAI(trimmed)
+                let response = try await handler(trimmed)
                 await MainActor.run {
                     self.askAIResponse = formatAskAIResponseForDisplay(response)
                     self.isAskingAI = false
@@ -14674,6 +15243,7 @@ struct WhiteboardWebView: UIViewRepresentable {
     @Binding var webView: WKWebView?
     @Binding var isLoading: Bool
     var onAskAI: ((String) -> Void)? = nil
+    var onAskAIWeb: ((String) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -14681,11 +15251,12 @@ struct WhiteboardWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.preferences.javaScriptEnabled = onAskAI != nil
+        config.preferences.javaScriptEnabled = onAskAI != nil || onAskAIWeb != nil
         let wv: WKWebView
-        if onAskAI != nil {
+        if onAskAI != nil || onAskAIWeb != nil {
             let askAIWebView = AskAIWebView(frame: .zero, configuration: config)
             askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
             askAIWebView.installAskAIMenuItemIfNeeded()
             wv = askAIWebView
         } else {
@@ -14693,7 +15264,7 @@ struct WhiteboardWebView: UIViewRepresentable {
         }
         wv.navigationDelegate = context.coordinator
         context.coordinator.webView = wv
-        if onAskAI != nil, #available(iOS 16.0, *) {
+        if onAskAI != nil || onAskAIWeb != nil, #available(iOS 16.0, *) {
             context.coordinator.installEditMenuInteraction(on: wv)
         }
         wv.isOpaque = false
@@ -14710,14 +15281,15 @@ struct WhiteboardWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
+        if let askAIWebView = uiView as? AskAIWebView {
+            askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
+            askAIWebView.installAskAIMenuItemIfNeeded()
+        }
         guard context.coordinator.lastHTML != htmlContent else { return }
         context.coordinator.lastHTML = htmlContent
         uiView.loadHTMLString(htmlContent, baseURL: nil)
 
-        if let askAIWebView = uiView as? AskAIWebView {
-            askAIWebView.onAskAI = onAskAI
-            askAIWebView.installAskAIMenuItemIfNeeded()
-        }
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, UIEditMenuInteractionDelegate {
@@ -14772,23 +15344,31 @@ struct WhiteboardWebView: UIViewRepresentable {
 
         @available(iOS 16.0, *)
         func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration, suggestedActions: [UIMenuElement]) -> UIMenu? {
-            guard parent.onAskAI != nil else {
+            guard parent.onAskAI != nil || parent.onAskAIWeb != nil else {
                 return UIMenu(children: suggestedActions)
             }
-            let askAction = UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
-                self?.sendSelectionToAskAI()
+            var actions = suggestedActions
+            if parent.onAskAI != nil {
+                actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+                    self?.sendSelection(to: self?.parent.onAskAI)
+                })
             }
-            return UIMenu(children: suggestedActions + [askAction])
+            if parent.onAskAIWeb != nil {
+                actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "globe")) { [weak self] _ in
+                    self?.sendSelection(to: self?.parent.onAskAIWeb)
+                })
+            }
+            return UIMenu(children: actions)
         }
 
-        private func sendSelectionToAskAI() {
-            guard let webView else { return }
+        private func sendSelection(to handler: ((String) -> Void)?) {
+            guard let webView, let handler else { return }
             webView.evaluateJavaScript("window.getSelection().toString()") { [weak self] result, error in
                 guard error == nil, let selection = result as? String else { return }
                 let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { return }
                 DispatchQueue.main.async {
-                    self?.parent.onAskAI?(trimmed)
+                    handler(trimmed)
                 }
             }
         }
@@ -14800,6 +15380,7 @@ struct WhiteboardWebView: NSViewRepresentable {
     @Binding var webView: WKWebView?
     @Binding var isLoading: Bool
     var onAskAI: ((String) -> Void)? = nil
+    var onAskAIWeb: ((String) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -14808,13 +15389,14 @@ struct WhiteboardWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         let preferences = WKPreferences()
-        preferences.javaScriptEnabled = onAskAI != nil
+        preferences.javaScriptEnabled = onAskAI != nil || onAskAIWeb != nil
         config.preferences = preferences
 
         let wv: WKWebView
-        if onAskAI != nil {
+        if onAskAI != nil || onAskAIWeb != nil {
             let askAIWebView = AskAIWebViewMac(frame: .zero, configuration: config)
             askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
             wv = askAIWebView
         } else {
             wv = WKWebView(frame: .zero, configuration: config)
@@ -14835,13 +15417,14 @@ struct WhiteboardWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
+        if let askAIWebView = nsView as? AskAIWebViewMac {
+            askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
+        }
         guard context.coordinator.lastHTML != htmlContent else { return }
         context.coordinator.lastHTML = htmlContent
         nsView.loadHTMLString(htmlContent, baseURL: nil)
 
-        if let askAIWebView = nsView as? AskAIWebViewMac {
-            askAIWebView.onAskAI = onAskAI
-        }
     }
 
     class Coordinator: NSObject, WKNavigationDelegate {
@@ -15221,7 +15804,7 @@ struct GlobalSummaryResultView: View {
 
                     Button {
                         dismiss()
-                        appState.showGlobalSummary = false
+                        appState.dismissGlobalSummaryAndClearContext()
                     } label: {
                         Label("Close", systemImage: "xmark.circle")
                     }

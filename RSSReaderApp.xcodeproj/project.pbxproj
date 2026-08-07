@@ -50,6 +50,12 @@
 		MACLLM0100010001000103 /* LocalLLMCompatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = MACLLM0100010001000106 /* LocalLLMCompatibility.swift */; };
 		MACLLM0100010001000111 /* LiteRTFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = MACLLM0100010001000112 /* LiteRTFoundation */; };
 		READABILITY0001000102 /* Readability.js in Resources */ = {isa = PBXBuildFile; fileRef = READABILITY0001000100 /* Readability.js */; };
+		PODMOD022F00000100000001 /* BatchPodcastModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000001 /* BatchPodcastModels.swift */; };
+		PODMOD022F00000100000002 /* BatchPodcastContextBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000002 /* BatchPodcastContextBuilder.swift */; };
+		PODMOD022F00000100000003 /* BatchPodcastService.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000003 /* BatchPodcastService.swift */; };
+		PODMOD022F00000100000004 /* BatchPodcastSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000004 /* BatchPodcastSession.swift */; };
+		PODMOD022F00000100000005 /* MLXPodcastPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000005 /* MLXPodcastPlaybackController.swift */; };
+		PODMOD022F00000100000006 /* BatchPodcastView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000006 /* BatchPodcastView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -92,6 +98,12 @@
 		MACLLM0100010001000105 /* CoreAIMLXLocalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreAIMLXLocalService.swift; sourceTree = "<group>"; };
 		MACLLM0100010001000106 /* LocalLLMCompatibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalLLMCompatibility.swift; sourceTree = "<group>"; };
 		READABILITY0001000100 /* Readability.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = Readability.js; sourceTree = "<group>"; };
+		PODMOD002F00000100000001 /* BatchPodcastModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastModels.swift; sourceTree = "<group>"; };
+		PODMOD002F00000100000002 /* BatchPodcastContextBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastContextBuilder.swift; sourceTree = "<group>"; };
+		PODMOD002F00000100000003 /* BatchPodcastService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastService.swift; sourceTree = "<group>"; };
+		PODMOD002F00000100000004 /* BatchPodcastSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastSession.swift; sourceTree = "<group>"; };
+		PODMOD002F00000100000005 /* MLXPodcastPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MLXPodcastPlaybackController.swift; sourceTree = "<group>"; };
+		PODMOD002F00000100000006 /* BatchPodcastView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -130,6 +142,7 @@
 				A1B2C3D4E5F6A7B8C9D0E22B /* Views */,
 				A1B2C3D4E5F6A7B8C9D0E22C /* Controllers */,
 				A1B2C3D4E5F6A7B8C9D0E22D /* Services */,
+				PODGRP002F00000100000001 /* Podcast */,
 				C2AAC0012E83024200F58FC6 /* Utilities */,
 				A1B2C3D4E5F6A7B8C9D0E1F3 /* RSSReaderApp.swift */,
 				READABILITY0001000100 /* Readability.js */,
@@ -213,6 +226,19 @@
 				A1B2C3D4E5F6A7B8C9D0E1FE /* Preview Assets.xcassets */,
 			);
 			path = "Preview Content";
+			sourceTree = "<group>";
+		};
+		PODGRP002F00000100000001 /* Podcast */ = {
+			isa = PBXGroup;
+			children = (
+				PODMOD002F00000100000001 /* BatchPodcastModels.swift */,
+				PODMOD002F00000100000002 /* BatchPodcastContextBuilder.swift */,
+				PODMOD002F00000100000003 /* BatchPodcastService.swift */,
+				PODMOD002F00000100000004 /* BatchPodcastSession.swift */,
+				PODMOD002F00000100000005 /* MLXPodcastPlaybackController.swift */,
+				PODMOD002F00000100000006 /* BatchPodcastView.swift */,
+			);
+			path = Podcast;
 			sourceTree = "<group>";
 		};
 		C187DB842E83023300F58FC6 /* Frameworks */ = {
@@ -352,6 +378,12 @@
 				C2AAB0032E83024100F58FC6 /* AudioUtils.swift in Sources */,
 				C2AAB0042E83024100F58FC6 /* SoundDelegate.swift in Sources */,
 				C2AAB0062E83024100F58FC6 /* iOS26GlassEffects.swift in Sources */,
+				PODMOD022F00000100000001 /* BatchPodcastModels.swift in Sources */,
+				PODMOD022F00000100000002 /* BatchPodcastContextBuilder.swift in Sources */,
+				PODMOD022F00000100000003 /* BatchPodcastService.swift in Sources */,
+				PODMOD022F00000100000004 /* BatchPodcastSession.swift in Sources */,
+				PODMOD022F00000100000005 /* MLXPodcastPlaybackController.swift in Sources */,
+				PODMOD022F00000100000006 /* BatchPodcastView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

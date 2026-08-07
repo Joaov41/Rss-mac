@@ -6,6 +6,31 @@ import AVFoundation
 import AppKit
 #endif
 
+private extension View {
+    @ViewBuilder
+    func settingsGlassButtonStyle(prominent: Bool = false) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            if prominent {
+                self.buttonStyle(.glassProminent)
+            } else {
+                self.buttonStyle(.glass)
+            }
+        } else if prominent {
+            self.buttonStyle(.borderedProminent)
+        } else {
+            self.buttonStyle(.bordered)
+        }
+        #else
+        if prominent {
+            self.buttonStyle(.borderedProminent)
+        } else {
+            self.buttonStyle(.bordered)
+        }
+        #endif
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.presentationMode) var presentationMode
@@ -208,24 +233,24 @@ struct SettingsView: View {
                                 Button("Log In to ChatGPT") {
                                     launchWebAILogin(.chatgpt)
                                 }
-                                .buttonStyle(.bordered)
+                                .settingsGlassButtonStyle()
 
                                 Button("Reset ChatGPT") {
                                     appState.resetWebAISession(for: .chatgpt)
                                 }
-                                .buttonStyle(.bordered)
+                                .settingsGlassButtonStyle()
                             }
 
                             HStack(spacing: 10) {
                                 Button("Log In to Gemini") {
                                     launchWebAILogin(.gemini)
                                 }
-                                .buttonStyle(.bordered)
+                                .settingsGlassButtonStyle()
 
                                 Button("Reset Gemini") {
                                     appState.resetWebAISession(for: .gemini)
                                 }
-                                .buttonStyle(.bordered)
+                                .settingsGlassButtonStyle()
                             }
                         }
 
@@ -260,7 +285,7 @@ struct SettingsView: View {
                             Label("Sync Now", systemImage: "arrow.clockwise.circle.fill")
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .settingsGlassButtonStyle(prominent: true)
                     .tint(.blue)
                     .disabled(appState.manualCloudSyncState == .syncing)
 
@@ -287,7 +312,7 @@ struct SettingsView: View {
                                 Label("Migrate Read History", systemImage: "arrow.triangle.2.circlepath.icloud")
                             }
                         }
-                        .buttonStyle(.bordered)
+                        .settingsGlassButtonStyle()
                         .tint(.purple)
                         .disabled(isMigratingReadHistory)
 
@@ -350,7 +375,7 @@ struct SettingsView: View {
                         } label: {
                             Label("Make this device primary", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .buttonStyle(.bordered)
+                        .settingsGlassButtonStyle()
                         .tint(.orange)
                     } else {
                         // No primary device set
@@ -372,7 +397,7 @@ struct SettingsView: View {
                         } label: {
                             Label("Make this device primary", systemImage: "checkmark.circle")
                         }
-                        .buttonStyle(.borderedProminent)
+                        .settingsGlassButtonStyle(prominent: true)
                         .tint(.green)
                     }
                 }
@@ -687,7 +712,7 @@ struct SettingsView: View {
                                 .frame(maxWidth: .infinity)
                             }
                             .disabled(isClearingCaches)
-                            .buttonStyle(.borderedProminent)
+                            .settingsGlassButtonStyle(prominent: true)
                             .tint(.red)
 
                             Text("Clears removable caches and preserves downloaded LiteRT and MLX models.")
@@ -719,7 +744,7 @@ struct SettingsView: View {
                                 .frame(maxWidth: .infinity)
                             }
                             .disabled(isCleaningFailedModelDownloads)
-                            .buttonStyle(.bordered)
+                            .settingsGlassButtonStyle()
 
                             Text("Removes only incomplete .download files. Completed LiteRT and MLX models are kept.")
                                 .font(.caption)
@@ -1267,12 +1292,12 @@ struct SettingsView: View {
                         }
                     }
                 }
-                .buttonStyle(.bordered)
+                .settingsGlassButtonStyle()
 
                 Button("Logout") {
                     appState.redditOAuthManager.logout()
                 }
-                .buttonStyle(.borderedProminent)
+                .settingsGlassButtonStyle(prominent: true)
                 .tint(.red)
             }
             .padding(.vertical, 8)
@@ -1300,7 +1325,7 @@ struct SettingsView: View {
                     Text("Sign in with Reddit")
                 }
             }
-            .buttonStyle(.borderedProminent)
+            .settingsGlassButtonStyle(prominent: true)
             .tint(.orange)
 
             Text("⚠️ Using public API - Limited to ~60 requests/min")
@@ -1366,7 +1391,7 @@ struct SettingsView: View {
                     Label("Check PCC", systemImage: "bolt.horizontal.circle")
                 }
             }
-            .buttonStyle(.bordered)
+            .settingsGlassButtonStyle()
             .disabled(isTestingPCCGatewayConnection)
 
             if let pccGatewayConnectionStatus {
@@ -1451,7 +1476,7 @@ struct SettingsView: View {
                     Label("Test Connection", systemImage: "bolt.horizontal.circle")
                 }
             }
-            .buttonStyle(.bordered)
+            .settingsGlassButtonStyle()
             .disabled(isTestingPCCGatewayConnection)
 
             if let pccGatewayConnectionStatus {
@@ -1550,7 +1575,7 @@ struct SettingsView: View {
                     Label("Test Connection", systemImage: "bolt.horizontal.circle")
                 }
             }
-            .buttonStyle(.bordered)
+            .settingsGlassButtonStyle()
             .disabled(isTestingSummarizeConnection)
 
             if let summarizeConnectionStatus {

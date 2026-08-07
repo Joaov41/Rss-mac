@@ -4,6 +4,83 @@ import LocalAuthentication
 import Network
 import Security
 
+enum PCCDisplayTextFormatter {
+    static func displayText(from response: String) -> String {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return response }
+
+        let candidate = removingJSONCodeFence(from: trimmed)
+        let repairedCandidate = repairingInvalidJSONEscapes(in: candidate)
+        guard
+            let data = repairedCandidate.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data)
+        else {
+            return response
+        }
+
+        if let dictionary = object as? [String: Any] {
+            for key in ["answer", "response", "summary", "content", "text", "result"] {
+                if let text = dictionary[key] as? String {
+                    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty { return cleaned }
+                }
+            }
+        }
+
+        return readableText(from: object) ?? response
+    }
+
+    private static func removingJSONCodeFence(from text: String) -> String {
+        guard text.hasPrefix("```"), text.hasSuffix("```") else { return text }
+        var lines = text.components(separatedBy: .newlines)
+        guard lines.count >= 3 else { return text }
+        lines.removeFirst()
+        lines.removeLast()
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func repairingInvalidJSONEscapes(in text: String) -> String {
+        text.replacingOccurrences(
+            of: #"\\(?=[^"\\/bfnrtu])"#,
+            with: #"\\\\"#,
+            options: .regularExpression
+        )
+    }
+
+    private static func readableText(from value: Any, depth: Int = 0) -> String? {
+        if let text = value as? String {
+            let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleaned.isEmpty ? nil : cleaned
+        }
+        if let values = value as? [Any] {
+            let rendered = values.compactMap { readableText(from: $0, depth: depth + 1) }
+            return rendered.isEmpty ? nil : rendered.joined(separator: "\n\n")
+        }
+        if let dictionary = value as? [String: Any] {
+            if let title = (dictionary["topic"] ?? dictionary["title"]) as? String,
+               let summary = (dictionary["summary"] ?? dictionary["content"]) as? String {
+                let heading = String(repeating: "#", count: min(6, depth + 2))
+                var output = "\(heading) \(title)\n\n\(summary)"
+                if let keyPoints = dictionary["key_points"] as? [String], !keyPoints.isEmpty {
+                    output += "\n\n" + keyPoints.map { "- \($0)" }.joined(separator: "\n")
+                }
+                return output
+            }
+
+            let rendered = dictionary.keys.sorted().compactMap { key -> String? in
+                guard let nested = dictionary[key],
+                      let text = readableText(from: nested, depth: depth + 1),
+                      !text.isEmpty else { return nil }
+                let label = key.replacingOccurrences(of: "_", with: " ")
+                let heading = String(repeating: "#", count: min(6, depth + 2))
+                return "\(heading) \(label.prefix(1).uppercased())\(label.dropFirst())\n\n\(text)"
+            }
+            return rendered.isEmpty ? nil : rendered.joined(separator: "\n\n")
+        }
+        return nil
+    }
+}
+
 enum RSSSummarizeGatewayConfig {
     static let codexModel = "cli/codex/gpt-5.5"
     static let serviceTier = "fast"
@@ -82,7 +159,7 @@ enum FMPCCGatewayError: LocalizedError {
         case .fmNotFound:
             return "Apple PCC is unavailable on this Mac."
         case .processFailed(_, let output):
-            if output.localizedCaseInsensitiveContains("PCC inference is not available") {
+            if FMPCCGatewayClient.isPCCContextUnavailable(output) {
                 return "Apple PCC is unavailable: \(output)"
             }
             if output.localizedCaseInsensitiveContains("quota") || output.localizedCaseInsensitiveContains("rate limit") {
@@ -731,8 +808,11 @@ final class FMPCCGatewayClient: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func isPCCContextUnavailable(_ output: String) -> Bool {
-        output.localizedCaseInsensitiveContains("PCC inference is not available in this context")
+    static func isPCCContextUnavailable(_ output: String) -> Bool {
+        let normalized = output.lowercased()
+        return normalized.contains("pcc inference is not available in this context")
+            || normalized.contains("private cloud compute is not available in this context")
+            || normalized.contains("please use the terminal app")
     }
 
     private static func cleanFMResponse(_ output: String) -> String {

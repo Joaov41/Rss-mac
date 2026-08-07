@@ -159,6 +159,41 @@ final class KokoroTTSService {
         #endif
     }
 
+    /// Model-safe chunks used by the Batch Podcast player. The first short
+    /// chunk lets playback begin quickly; later chunks are kept bounded and
+    /// end at sentence boundaries when possible.
+    func speechChunks(
+        from input: String,
+        firstChunkCharacters: Int = 140,
+        maximumChunkCharacters: Int = 220
+    ) -> [String] {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let firstLimit = max(1, firstChunkCharacters)
+        let maximum = max(firstLimit, maximumChunkCharacters)
+        let firstLength = min(firstLimit, trimmed.count)
+        let first = String(trimmed.prefix(firstLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+        var chunks: [String] = []
+        if !first.isEmpty { chunks.append(first) }
+
+        var remaining = String(trimmed.dropFirst(firstLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+        while !remaining.isEmpty {
+            let length = min(maximum, remaining.count)
+            var part = String(remaining.prefix(length))
+            if remaining.count > length,
+               let breakIndex = part.lastIndex(where: { $0 == "." || $0 == "!" || $0 == "?" || $0 == "\n" }),
+               breakIndex > part.startIndex {
+                part = String(part[...breakIndex])
+            }
+            part = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !part.isEmpty else { break }
+            chunks.append(part)
+            remaining = String(remaining.dropFirst(part.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return chunks
+    }
+
     func warmUp(preloadVoices: Set<String>? = nil) async throws {
         #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
         let voice = preloadVoices?.first ?? cachedVoiceForWarmup()

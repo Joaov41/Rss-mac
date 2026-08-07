@@ -4,36 +4,23 @@ set -euo pipefail
 MODE="${1:-run}"
 APP_NAME="RSSReaderApp"
 BUNDLE_ID="com.joaovalente.RSSReaderApp"
-PROJECT="RSSReaderApp.xcodeproj"
-SCHEME="RSSReaderApp (macOS)"
-CONFIGURATION="Debug"
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DERIVED_DATA_PATH="$ROOT_DIR/build/DerivedData-MacRun"
-PRODUCTS_DIR="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION"
-APP_BUNDLE="$PRODUCTS_DIR/$APP_NAME.app"
-
-cd "$ROOT_DIR"
+DERIVED_DATA="$ROOT_DIR/build/DerivedData"
+APP_BUNDLE="$DERIVED_DATA/Build/Products/Debug/RSSReaderApp.app"
+APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
-xcodebuild \
-  -project "$PROJECT" \
-  -scheme "$SCHEME" \
-  -configuration "$CONFIGURATION" \
-  -destination 'platform=macOS' \
-  -derivedDataPath "$DERIVED_DATA_PATH" \
-  SWIFT_ENABLE_EXPLICIT_MODULES=NO \
-  build
-
-if [[ ! -d "$APP_BUNDLE" ]]; then
-  APP_BUNDLE="$(find "$PRODUCTS_DIR" -maxdepth 1 -name '*.app' -type d | head -n 1)"
-fi
-
-if [[ -z "${APP_BUNDLE:-}" || ! -d "$APP_BUNDLE" ]]; then
-  echo "Unable to find built .app bundle in $PRODUCTS_DIR" >&2
-  exit 1
-fi
+build_app() {
+  DEVELOPER_DIR=/Applications/Xcode-beta3.app/Contents/Developer \
+    xcodebuild \
+      -project "$ROOT_DIR/RSSReaderApp.xcodeproj" \
+      -scheme 'RSSReaderApp (macOS)' \
+      -configuration Debug \
+      -destination 'platform=macOS' \
+      -derivedDataPath "$DERIVED_DATA" \
+      -allowProvisioningUpdates
+}
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
@@ -41,20 +28,25 @@ open_app() {
 
 case "$MODE" in
   run)
+    build_app
     open_app
     ;;
   --debug|debug)
-    lldb -- "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+    build_app
+    lldb -- "$APP_BINARY"
     ;;
   --logs|logs)
+    build_app
     open_app
     /usr/bin/log stream --info --style compact --predicate "process == \"$APP_NAME\""
     ;;
   --telemetry|telemetry)
+    build_app
     open_app
     /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\""
     ;;
   --verify|verify)
+    build_app
     open_app
     sleep 1
     pgrep -x "$APP_NAME" >/dev/null

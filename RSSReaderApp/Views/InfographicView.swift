@@ -13,6 +13,7 @@ struct InfographicView: View {
     var loadingLabel: String? = nil
     var emptyLabel: String? = nil
     var onAskAI: ((String) async throws -> String)? = nil
+    var onAskAIWeb: ((String) async throws -> String)? = nil
     @Environment(\.dismiss) var dismiss
     @State private var isSaving = false
     @State private var saveMessage: String?
@@ -68,7 +69,10 @@ struct InfographicView: View {
                         webView: $webViewRef,
                         isLoading: $isLoading,
                         onAskAI: onAskAI == nil ? nil : { selection in
-                            handleAskAISelection(selection)
+                            handleAskAISelection(selection, useWebAI: false)
+                        },
+                        onAskAIWeb: onAskAIWeb == nil ? nil : { selection in
+                            handleAskAISelection(selection, useWebAI: true)
                         }
                     )
                     .edgesIgnoringSafeArea(.bottom)
@@ -141,6 +145,25 @@ struct InfographicView: View {
             }
         }
         #endif
+        #if os(macOS)
+        .overlay {
+            if showAskAIResponse {
+                ZStack {
+                    Color.black.opacity(0.10)
+                        .ignoresSafeArea()
+                    AskAIResponseSheet(
+                        isLoading: isAskingAI,
+                        response: askAIResponse,
+                        errorMessage: askAIError,
+                        onClose: { showAskAIResponse = false },
+                        onCopy: copyAskAIResponse
+                    )
+                    .frame(width: 640, height: 520)
+                }
+                .transition(.opacity)
+            }
+        }
+        #else
         .sheet(isPresented: $showAskAIResponse) {
             AskAIResponseSheet(
                 isLoading: isAskingAI,
@@ -149,11 +172,8 @@ struct InfographicView: View {
                 onClose: { showAskAIResponse = false },
                 onCopy: copyAskAIResponse
             )
-            #if os(macOS)
-            .frame(minWidth: 480, idealWidth: 640, maxWidth: .infinity,
-                   minHeight: 420, idealHeight: 520, maxHeight: .infinity)
-            #endif
         }
+        #endif
     }
     
     private func copyHTMLToClipboard() {
@@ -169,16 +189,17 @@ struct InfographicView: View {
         }
     }
 
-    private func handleAskAISelection(_ selection: String) {
+    private func handleAskAISelection(_ selection: String, useWebAI: Bool) {
         let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let onAskAI else { return }
+        let handler = useWebAI ? onAskAIWeb : onAskAI
+        guard !trimmed.isEmpty, let handler else { return }
         isAskingAI = true
         askAIResponse = nil
         askAIError = nil
         showAskAIResponse = true
         Task {
             do {
-                let response = try await onAskAI(trimmed)
+                let response = try await handler(trimmed)
                 await MainActor.run {
                     self.askAIResponse = formatAskAIResponseForDisplay(response)
                     self.isAskingAI = false
@@ -340,6 +361,7 @@ struct WebView: UIViewRepresentable {
     @Binding var webView: WKWebView?
     @Binding var isLoading: Bool
     var onAskAI: ((String) -> Void)? = nil
+    var onAskAIWeb: ((String) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -347,11 +369,12 @@ struct WebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.preferences.javaScriptEnabled = onAskAI != nil
+        config.preferences.javaScriptEnabled = onAskAI != nil || onAskAIWeb != nil
         let webView: WKWebView
-        if onAskAI != nil {
+        if onAskAI != nil || onAskAIWeb != nil {
             let askAIWebView = AskAIWebView(frame: .zero, configuration: config)
             askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
             askAIWebView.installAskAIMenuItemIfNeeded()
             webView = askAIWebView
         } else {
@@ -359,7 +382,7 @@ struct WebView: UIViewRepresentable {
         }
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
-        if onAskAI != nil, #available(iOS 16.0, *) {
+        if onAskAI != nil || onAskAIWeb != nil, #available(iOS 16.0, *) {
             context.coordinator.installEditMenuInteraction(on: webView)
         }
         webView.isOpaque = false
@@ -374,14 +397,15 @@ struct WebView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: WKWebView, context: Context) {
+        if let askAIWebView = uiView as? AskAIWebView {
+            askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
+            askAIWebView.installAskAIMenuItemIfNeeded()
+        }
         guard context.coordinator.lastHTML != htmlContent else { return }
         context.coordinator.lastHTML = htmlContent
         uiView.loadHTMLString(htmlContent, baseURL: nil)
 
-        if let askAIWebView = uiView as? AskAIWebView {
-            askAIWebView.onAskAI = onAskAI
-            askAIWebView.installAskAIMenuItemIfNeeded()
-        }
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, UIEditMenuInteractionDelegate {
@@ -438,23 +462,31 @@ struct WebView: UIViewRepresentable {
 
         @available(iOS 16.0, *)
         func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration, suggestedActions: [UIMenuElement]) -> UIMenu? {
-            guard parent.onAskAI != nil else {
+            guard parent.onAskAI != nil || parent.onAskAIWeb != nil else {
                 return UIMenu(children: suggestedActions)
             }
-            let askAction = UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
-                self?.sendSelectionToAskAI()
+            var actions = suggestedActions
+            if parent.onAskAI != nil {
+                actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+                    self?.sendSelection(to: self?.parent.onAskAI)
+                })
             }
-            return UIMenu(children: suggestedActions + [askAction])
+            if parent.onAskAIWeb != nil {
+                actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "globe")) { [weak self] _ in
+                    self?.sendSelection(to: self?.parent.onAskAIWeb)
+                })
+            }
+            return UIMenu(children: actions)
         }
 
-        private func sendSelectionToAskAI() {
-            guard let webView else { return }
+        private func sendSelection(to handler: ((String) -> Void)?) {
+            guard let webView, let handler else { return }
             webView.evaluateJavaScript("window.getSelection().toString()") { [weak self] result, error in
                 guard error == nil, let selection = result as? String else { return }
                 let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { return }
                 DispatchQueue.main.async {
-                    self?.parent.onAskAI?(trimmed)
+                    handler(trimmed)
                 }
             }
         }
@@ -476,6 +508,7 @@ struct WebView: NSViewRepresentable {
     @Binding var webView: WKWebView?
     @Binding var isLoading: Bool
     var onAskAI: ((String) -> Void)? = nil
+    var onAskAIWeb: ((String) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -483,11 +516,12 @@ struct WebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.preferences.javaScriptEnabled = onAskAI != nil
+        config.preferences.javaScriptEnabled = onAskAI != nil || onAskAIWeb != nil
         let webView: WKWebView
-        if onAskAI != nil {
+        if onAskAI != nil || onAskAIWeb != nil {
             let askAIWebView = AskAIWebViewMac(frame: .zero, configuration: config)
             askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
             webView = askAIWebView
         } else {
             webView = WKWebView(frame: .zero, configuration: config)
@@ -503,13 +537,14 @@ struct WebView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
+        if let askAIWebView = nsView as? AskAIWebViewMac {
+            askAIWebView.onAskAI = onAskAI
+            askAIWebView.onAskAIWeb = onAskAIWeb
+        }
         guard context.coordinator.lastHTML != htmlContent else { return }
         context.coordinator.lastHTML = htmlContent
         nsView.loadHTMLString(htmlContent, baseURL: nil)
 
-        if let askAIWebView = nsView as? AskAIWebViewMac {
-            askAIWebView.onAskAI = onAskAI
-        }
     }
 
     class Coordinator: NSObject, WKNavigationDelegate {

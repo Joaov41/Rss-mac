@@ -141,6 +141,7 @@ final class GlobalSummaryService {
     private var webRequestHandler: ((WebAIProvider, String, String, WebAIResponseFormat, @escaping (Result<String, Error>) -> Void) -> Void)?
     var warningReporter: ((String) -> Void)?
     var throughputReporter: ((String) -> Void)?
+    var redditCommentsCacheReporter: (([(RedditPost, [String])]) -> Void)?
 
     init(summaryService: SummaryService, redditService: RedditService, settingsProvider: @escaping () -> AppSettings = { PersistenceManager.shared.loadSettings() }, cloudRequestHandler: ((String, @escaping (String) -> Void) -> Void)? = nil) {
         self.summaryService = summaryService
@@ -306,6 +307,11 @@ final class GlobalSummaryService {
 
                     let ordered = results.compactMap { $0 }.sorted { $0.index < $1.index }
                     let postIds = ordered.map { $0.post.id }
+                    let cachedContexts = ordered.map { triple in
+                        let comments = triple.topLevel.map { "u/\($0.author): \(Self.firstNChars($0.body, 500))" }
+                        return (triple.post, comments)
+                    }
+                    self.redditCommentsCacheReporter?(cachedContexts)
                     let payload: [RedditPayloadItem] = ordered.map { triple in
                         let truncated = triple.topLevel.map { "u/\($0.author): \(Self.firstNChars($0.body, 500))" }
                         return RedditPayloadItem(
@@ -1181,6 +1187,15 @@ class QAService {
     }
 }
 
+struct ScrollRestorationSnapshot: Equatable {
+    let anchorID: String?
+    let anchorIndex: Int
+    let contentOffset: CGPoint
+    let contentFingerprint: UInt64
+    let containerWidth: CGFloat
+    let dynamicTypeSize: String
+}
+
 @MainActor
 class AppState: ObservableObject {
     // MARK: - Published Properties
@@ -1206,7 +1221,8 @@ class AppState: ObservableObject {
     // Scroll position tracking
     // Map of subscription URL/category key to item ID.
     // Not @Published to avoid triggering list diffing while SwiftUI updates rows.
-    var scrollPositions: [String: String] = [:]
+    private var scrollPositions: [String: String] = [:]
+    private var scrollRestorationSnapshots: [String: ScrollRestorationSnapshot] = [:]
 
     // MARK: - Navigation History
     @Published private var navigationHistory: [NavigationItem] = []
@@ -1344,6 +1360,17 @@ class AppState: ObservableObject {
     func saveScrollPosition(for subscriptionURL: String, itemID: String) {
         scrollPositions[subscriptionURL] = itemID
     }
+
+    func saveScrollRestorationSnapshot(_ snapshot: ScrollRestorationSnapshot, for key: String) {
+        scrollRestorationSnapshots[key] = snapshot
+        if let anchorID = snapshot.anchorID {
+            scrollPositions[key] = anchorID
+        }
+    }
+
+    func scrollRestorationSnapshot(for key: String) -> ScrollRestorationSnapshot? {
+        scrollRestorationSnapshots[key]
+    }
     
     // Get saved scroll position for a subscription
     func getSavedScrollPosition(for subscriptionURL: String) -> String? {
@@ -1373,6 +1400,7 @@ class AppState: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var isRefreshingFeeds: Bool = false
     @Published private var activeArticleSummaryIDs: Set<String> = []
+    @Published private var activeRedditSummaryIDs: Set<String> = []
     @Published var settings: AppSettings = AppSettings() {
         didSet {
             // Save settings when changed
@@ -1421,6 +1449,11 @@ class AppState: ObservableObject {
         return activeArticleSummaryIDs.contains(article.id)
     }
 
+    func isSummarizingRedditPost(_ post: RedditPost?) -> Bool {
+        guard let post else { return false }
+        return activeRedditSummaryIDs.contains(post.id)
+    }
+
     private func beginArticleSummary(_ article: Article?) {
         guard let article else { return }
         activeArticleSummaryIDs.insert(article.id)
@@ -1429,6 +1462,26 @@ class AppState: ObservableObject {
     private func finishArticleSummary(_ article: Article?) {
         guard let article else { return }
         activeArticleSummaryIDs.remove(article.id)
+    }
+
+    private func beginRedditSummary(_ post: RedditPost?) {
+        guard let post else { return }
+        activeRedditSummaryIDs.insert(post.id)
+    }
+
+    private func finishRedditSummary(_ post: RedditPost?) {
+        guard let post else { return }
+        activeRedditSummaryIDs.remove(post.id)
+    }
+
+    private func beginSummary(article: Article?, redditPost: RedditPost?) {
+        beginArticleSummary(article)
+        beginRedditSummary(redditPost)
+    }
+
+    private func finishSummary(article: Article?, redditPost: RedditPost?) {
+        finishArticleSummary(article)
+        finishRedditSummary(redditPost)
     }
     
     // Today summary state
@@ -1461,6 +1514,7 @@ class AppState: ObservableObject {
     @Published var aggregateSummaryProviderName: String?
     @Published var aggregateSummaryError: String?
     private var aggregateSummarySourceFingerprint: String?
+    let batchPodcastSession = BatchPodcastSession()
 
     // Global Summary Q&A state
     @Published var isWaitingForGlobalQA: Bool = false
@@ -1472,6 +1526,150 @@ class AppState: ObservableObject {
     private var globalSummaryComments: [(RedditPost, [String])] = [] // Cached comments for Q&A
     // Global Q&A character limits (per item, not total count)
     // No limit on number of items - sends all articles/posts from the summary
+
+    func dismissGlobalSummaryAndClearContext() {
+        showGlobalSummary = false
+        hasCachedSummary = false
+        globalSummaryJSON = ""
+        globalSummaryComments = []
+        batchPodcastSession.invalidate()
+    }
+
+    func presentBatchPodcast() {
+        let hostA = KokoroVoice(rawValue: summaryService.getKokoroVoice()) ?? .alba
+        let hostB = KokoroVoice.allCases.first(where: { $0 != hostA }) ?? .marius
+        do {
+            let context = try makeBatchPodcastContext(allowSummariesOnly: false)
+            batchPodcastSession.present(
+                context: context,
+                requiresSummariesOnlyConfirmation: false,
+                hostAVoice: hostA,
+                hostBVoice: hostB
+            )
+        } catch BatchPodcastError.summariesOnlyRequiresExplicitOptIn {
+            do {
+                let context = try makeBatchPodcastContext(allowSummariesOnly: true)
+                batchPodcastSession.present(
+                    context: context,
+                    requiresSummariesOnlyConfirmation: true,
+                    hostAVoice: hostA,
+                    hostBVoice: hostB
+                )
+            } catch {
+                batchPodcastSession.presentError(error.localizedDescription)
+            }
+        } catch {
+            batchPodcastSession.presentError(error.localizedDescription)
+        }
+    }
+
+    func makeBatchPodcastContext(allowSummariesOnly: Bool) throws -> BatchPodcastContext {
+        guard let data = globalSummaryJSON.data(using: .utf8),
+              let result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data) else {
+            throw BatchPodcastError.noBatchEvidence
+        }
+        let snapshot = BatchPodcastSnapshot(
+            posts: globalSummaryPosts,
+            articles: globalSummaryArticles,
+            cachedComments: globalSummaryComments,
+            summaryResult: result,
+            overallSummary: aggregateSummaryText
+        )
+        return try BatchPodcastContextBuilder.build(
+            snapshot: snapshot,
+            allowSummariesOnly: allowSummariesOnly
+        )
+    }
+
+    private func generateBatchPodcastText(
+        prompt: String,
+        title: String,
+        provider: AppSettings.SummaryProvider
+    ) async throws -> String {
+        switch provider {
+        case .webAI:
+            return try await performWebAIRequestAsync(
+                title: title,
+                prompt: prompt,
+                responseFormat: .strictJSON
+            )
+        case .gemini:
+            return try await summaryService.generateContentWithGemini(prompt: prompt)
+        case .appleCloud:
+            return await withCheckedContinuation { continuation in
+                launchCloudRequest(for: prompt, type: .summary) { response in
+                    continuation.resume(returning: response)
+                }
+            }
+        case .applePCCGateway:
+            return try await performPCCGatewayRequestAsync(prompt: prompt, taskName: title)
+        case .summarizeDaemon:
+            return try await performSummarizeRequestAsync(prompt: prompt, taskName: title)
+        case .appleLocal:
+            guard #available(macOS 15.2, *), LocalSummaryService.isAvailable() else {
+                throw BatchPodcastError.providerFailure("Apple Local is not available on this Mac.")
+            }
+            return try await withCheckedThrowingContinuation { continuation in
+                LocalSummaryService.summarizeText(prompt) { result in
+                    continuation.resume(with: result)
+                }
+            }
+        case .mlxLocal, .coreAIMLXLocal:
+            return try await generateBatchPodcastLocalText(prompt: prompt, provider: provider)
+        }
+    }
+
+    private func generateBatchPodcastLocalText(
+        prompt: String,
+        provider: AppSettings.SummaryProvider
+    ) async throws -> String {
+        let useCoreAIMLX = provider == .coreAIMLXLocal
+        let configuredContext = useCoreAIMLX ? settings.coreAIMLXMaxContextTokens : settings.mlxMaxContextTokens
+        let contextTokens = useCoreAIMLX
+            ? AppSettings.effectiveCoreAIMLXContextTokens(configuredContext)
+            : AppSettings.effectiveLiteRTContextTokens(configuredContext)
+        let configuredOutput = useCoreAIMLX ? settings.coreAIMLXMaxOutputTokens : settings.mlxMaxOutputTokens
+        let hardOutputCap = useCoreAIMLX ? 512 : 1_024
+        let outputTokens = min(max(256, configuredOutput), hardOutputCap)
+        let promptBudget = max(2_000, (contextTokens - outputTokens - 100) * 4)
+        let boundedPrompt: String
+        if prompt.count <= promptBudget {
+            boundedPrompt = prompt
+        } else {
+            let half = max(1, promptBudget / 2)
+            boundedPrompt = String(prompt.prefix(half)) + "\n\n[Middle of the supplied evidence was bounded for the local model.]\n\n" + String(prompt.suffix(half))
+        }
+
+        let modelID = (useCoreAIMLX ? settings.coreAIMLXModelID : settings.mlxModelID)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelID.isEmpty else {
+            throw BatchPodcastError.providerFailure("\(provider.displayName) model ID is not configured.")
+        }
+
+        let systemPrompt = "Use only the supplied saved evidence. Return the requested JSON and do not invent facts."
+        let metrics: MLXGenerationMetrics
+        if useCoreAIMLX {
+            metrics = try await CoreAIMLXLocalService.shared.generateTextWithMetrics(
+                prompt: boundedPrompt,
+                systemPrompt: systemPrompt,
+                modelID: modelID,
+                maxOutputTokens: outputTokens,
+                maxContextTokens: contextTokens
+            )
+            await CoreAIMLXLocalService.shared.clearTransientCache()
+        } else {
+            metrics = try await LiteRTLocalService.shared.generateTextWithMetrics(
+                prompt: boundedPrompt,
+                systemPrompt: systemPrompt,
+                modelID: modelID,
+                maxOutputTokens: outputTokens,
+                maxContextTokens: contextTokens
+            )
+            await LiteRTLocalService.shared.clearTransientCache()
+        }
+        recordMLXThroughput(metrics: metrics)
+        return metrics.text
+    }
 
     func redditPostForGlobalSummaryReference(_ referenceId: String) -> RedditPost? {
         if let post = globalSummaryPosts.first(where: { $0.id == referenceId }) {
@@ -1612,9 +1810,26 @@ class AppState: ObservableObject {
                 self?.mlxLastThroughput = throughputText
             }
         }
+        self.globalSummaryService.redditCommentsCacheReporter = { [weak self] contexts in
+            DispatchQueue.main.async {
+                self?.globalSummaryComments = contexts
+            }
+        }
 
         // 7. Load data from storage (subscriptions, etc.)
         loadSavedData()
+
+        // Batch Podcast keeps its generation state outside the sheet so the
+        // episode can continue while the user uses the rest of the app.
+        batchPodcastSession.configureTextGenerator(
+            provider: { [weak self] in self?.settings.selectedSummaryProvider ?? .gemini },
+            generator: { [weak self] prompt, title, provider in
+                guard let self else {
+                    throw BatchPodcastError.providerFailure("The podcast provider is unavailable.")
+                }
+                return try await self.generateBatchPodcastText(prompt: prompt, title: title, provider: provider)
+            }
+        )
 
         // 7.5 Warm up MLX/AppleLocal model in the background if needed
         Task { [weak self] in await self?.warmUpMLXIfNeeded() }
@@ -1694,7 +1909,8 @@ class AppState: ObservableObject {
         print("☁️ AppState: Performing catch-up pull after subscribing")
         CloudSyncManager.shared.publishCurrentSnapshot()
 
-        // Fallback: Poll iCloud every 60 seconds in case notifications don't arrive
+        // Fallback: Poll iCloud once per minute in case notifications don't arrive.
+        // Normal cloud notifications and manual synchronization remain immediate.
         Timer.publish(every: 60, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -1999,10 +2215,21 @@ class AppState: ObservableObject {
                 }, receiveValue: { [weak self] feed in
                     // Apply read and favorite status from persistence
                     var processedFeed = feed
+                    let existingSummaries = self?.feeds
+                        .first(where: { $0.url == feed.url })?
+                        .articles
+                        .reduce(into: [String: String]()) { result, article in
+                            if let summary = article.summary, !summary.isEmpty {
+                                result[article.id] = summary
+                            }
+                        } ?? [:]
                     for i in 0..<processedFeed.articles.count {
                         let article = processedFeed.articles[i]
                         processedFeed.articles[i].isRead = self?.persistenceManager.isArticleRead(article) ?? false
                         processedFeed.articles[i].isFavorite = self?.persistenceManager.isArticleFavorite(article.id) ?? false
+                        if processedFeed.articles[i].summary == nil {
+                            processedFeed.articles[i].summary = existingSummaries[article.id]
+                        }
                     }
                     
                     // Defer to avoid modifying during view updates
@@ -2223,7 +2450,10 @@ class AppState: ObservableObject {
                     
                     // Force UI update by re-publishing the current selected Reddit post if it's from this feed
                     if let selectedPost = self.selectedRedditPost, selectedPost.subreddit == subscription.url {
-                        if let updatedPost = processedFeed.posts.first(where: { $0.id == selectedPost.id }) {
+                        if var updatedPost = processedFeed.posts.first(where: { $0.id == selectedPost.id }) {
+                            if updatedPost.summary == nil {
+                                updatedPost.summary = selectedPost.summary
+                            }
                             print("📱 AppState: Re-publishing selected post")
                             self.selectedRedditPost = updatedPost
                         } else {
@@ -2469,6 +2699,7 @@ class AppState: ObservableObject {
         }
         
         isLoading = true
+        beginRedditSummary(post)
         
         // Extract all comment texts recursively
         let commentTexts = comments.flatMap { extractAllCommentTexts(from: $0) }
@@ -2514,6 +2745,7 @@ class AppState: ObservableObject {
                             print("📱 AppState: Updated Reddit post summary for post ID: \(post.id)")
                         }
                     }
+                    self.finishRedditSummary(post)
                     self.isLoading = false
                 }
             }
@@ -2820,6 +3052,20 @@ class AppState: ObservableObject {
         return output
     }
 
+    func performPCCPlainTextRequestAsync(
+        prompt: String,
+        taskName: String = "Apple PCC",
+        isQA: Bool = false
+    ) async throws -> String {
+        let prosePrompt = prompt + "\n\nReturn only readable plain text or natural-language Markdown. Do not return JSON, a property list, or a code block."
+        let output = try await performPCCGatewayRequestAsync(
+            prompt: prosePrompt,
+            taskName: taskName,
+            isQA: isQA
+        )
+        return PCCDisplayTextFormatter.displayText(from: output)
+    }
+
     func performPCCGatewaySummaryPublic(
         prompt: String,
         taskName: String = "Apple PCC",
@@ -2829,7 +3075,7 @@ class AppState: ObservableObject {
         Task(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                let output = try await self.performPCCGatewayRequestAsync(prompt: prompt, taskName: taskName)
+                let output = try await self.performPCCPlainTextRequestAsync(prompt: prompt, taskName: taskName)
                 await MainActor.run {
                     self.isLoading = false
                     completion(output)
@@ -3252,6 +3498,7 @@ class AppState: ObservableObject {
         aggregateSummaryText = nil
         aggregateSummaryProviderName = nil
         aggregateSummarySourceFingerprint = nil
+        batchPodcastSession.invalidate()
         isWebAIHandoffMinimized = true
         showGlobalSummary = true
 
@@ -3411,6 +3658,7 @@ class AppState: ObservableObject {
 
     func requestWebSummary(for article: Article) {
         isLoading = true
+        beginArticleSummary(article)
         let sourceText = cleanedArticleContent(article)
         performWebAIRequest(
             title: "Article Summary",
@@ -3425,6 +3673,7 @@ class AppState: ObservableObject {
                 self.isLoading = false
             },
             onFailure: { [weak self] _ in
+                self?.finishArticleSummary(article)
                 self?.isLoading = false
             }
         )
@@ -3432,6 +3681,7 @@ class AppState: ObservableObject {
 
     func requestWebSummary(for post: RedditPost, comments: [RedditCommentModel] = []) {
         isLoading = true
+        beginRedditSummary(post)
         performWebAIRequest(
             title: "Reddit Summary",
             prompt: redditPostSummaryPrompt(post: post, comments: comments),
@@ -3443,6 +3693,7 @@ class AppState: ObservableObject {
                 self?.isLoading = false
             },
             onFailure: { [weak self] _ in
+                self?.finishRedditSummary(post)
                 self?.isLoading = false
             }
         )
@@ -3475,7 +3726,7 @@ class AppState: ObservableObject {
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 do {
-                    let answer = try await self.performPCCGatewayRequestAsync(
+                    let answer = try await self.performPCCPlainTextRequestAsync(
                         prompt: trimmed,
                         taskName: "Ask AI",
                         isQA: true
@@ -3614,7 +3865,7 @@ class AppState: ObservableObject {
         if article != nil || redditPost != nil {
             isLoading = true
         }
-        beginArticleSummary(article)
+        beginSummary(article: article, redditPost: redditPost)
 
         if settings.selectedSummaryProvider == .webAI {
             if let article = article {
@@ -3632,7 +3883,7 @@ class AppState: ObservableObject {
                         self.isLoading = false
                     },
                     onFailure: { [weak self] _ in
-                        self?.finishArticleSummary(article)
+                        self?.finishSummary(article: article, redditPost: redditPost)
                         self?.isLoading = false
                     }
                 )
@@ -3648,11 +3899,12 @@ class AppState: ObservableObject {
                         self?.isLoading = false
                     },
                     onFailure: { [weak self] _ in
+                        self?.finishSummary(article: article, redditPost: redditPost)
                         self?.isLoading = false
                     }
                 )
             } else {
-                finishArticleSummary(article)
+                finishSummary(article: article, redditPost: redditPost)
                 isLoading = false
             }
             return
@@ -3668,7 +3920,7 @@ class AppState: ObservableObject {
                 prompt = redditPostSummaryPrompt(post: post, comments: redditComments)
                 taskName = "Reddit Summary"
             } else {
-                finishArticleSummary(article)
+                finishSummary(article: article, redditPost: redditPost)
                 isLoading = false
                 return
             }
@@ -3695,7 +3947,7 @@ class AppState: ObservableObject {
                 prompt = redditPostSummaryPrompt(post: post, comments: redditComments)
                 taskName = "Reddit Summary"
             } else {
-                finishArticleSummary(article)
+                finishSummary(article: article, redditPost: redditPost)
                 isLoading = false
                 return
             }
@@ -3757,7 +4009,7 @@ class AppState: ObservableObject {
                 """
                 taskName = "Reddit Post Summary"
             } else {
-                finishArticleSummary(article)
+                finishSummary(article: article, redditPost: redditPost)
                 return
             }
 
@@ -3770,9 +4022,9 @@ class AppState: ObservableObject {
                 } else if let post = redditPost {
                     self?.updateRedditPostSummaryFromCloud(post, summary: summary)
                 }
-                self?.finishArticleSummary(article)
+                self?.finishSummary(article: article, redditPost: redditPost)
             }, onCancel: { [weak self] in
-                self?.finishArticleSummary(article)
+                self?.finishSummary(article: article, redditPost: redditPost)
             })
         } else if settings.selectedSummaryProvider == .mlxLocal || settings.selectedSummaryProvider == .coreAIMLXLocal {
             // Use MLX Local model
@@ -3808,7 +4060,7 @@ class AppState: ObservableObject {
                 \(commentsBlock)
                 """
             } else {
-                finishArticleSummary(article)
+                finishSummary(article: article, redditPost: redditPost)
                 return
             }
 
@@ -3818,7 +4070,7 @@ class AppState: ObservableObject {
                 } else if let post = redditPost {
                     self?.updateRedditPostSummaryFromCloud(post, summary: summary)
                 }
-                self?.finishArticleSummary(article)
+                self?.finishSummary(article: article, redditPost: redditPost)
             })
         } else {
             // Apple Cloud
@@ -3859,7 +4111,16 @@ class AppState: ObservableObject {
         
         print("📱 AppState: Launching Apple Cloud request for \(settings.selectedSummaryProvider.rawValue)")
         print("📱 AppState: Content length: \(content.count) characters")
-        launchCloudSummary(for: content)
+        launchCloudRequest(for: content, type: .summary) { [weak self] result in
+            guard let self else { return }
+            if let article {
+                self.updateArticleSummaryFromCloud(article, summary: result)
+            } else if let redditPost {
+                self.updateRedditPostSummaryFromCloud(redditPost, summary: result)
+            } else {
+                self.finishSummary(article: article, redditPost: redditPost)
+            }
+        }
     }
     
     func launchCloudSummary(for text: String) {
@@ -4692,6 +4953,7 @@ class AppState: ObservableObject {
     }
     
     func updateRedditPostSummaryFromCloud(_ post: RedditPost, summary: String) {
+        defer { finishRedditSummary(post) }
         let cleanedSummary = cleanMarkdownArtifactsForDisplay(summary)
         var updatedPost: RedditPost?
 
@@ -4800,6 +5062,7 @@ class AppState: ObservableObject {
     ) {
         let preserveExistingAggregateSummary = shouldPreserveAggregateSummary(for: context)
         resetAggregateSummaryState(preservingCurrentSummary: preserveExistingAggregateSummary)
+        batchPodcastSession.invalidate()
 
         globalSummaryArticles = articles
         globalSummaryPosts = []
@@ -4870,6 +5133,7 @@ class AppState: ObservableObject {
     ) {
         let preserveExistingAggregateSummary = shouldPreserveAggregateSummary(for: context)
         resetAggregateSummaryState(preservingCurrentSummary: preserveExistingAggregateSummary)
+        batchPodcastSession.invalidate()
 
         globalSummaryPosts = posts
         globalSummaryArticles = []
@@ -5000,9 +5264,13 @@ class AppState: ObservableObject {
 
             var summaries: [GlobalSummaryItem] = []
             var errorMessage: String?
+            var cachedCommentContexts: [(RedditPost, [String])] = []
 
             for (index, post) in posts.enumerated() {
                 let comments = await self.fetchTopCommentsForWebGlobalSummary(post: post, topComments: topComments)
+                cachedCommentContexts.append(
+                    (post, comments.map { "u/\($0.author): \($0.body)" })
+                )
 
                 do {
                     let rawSummary = try await self.performWebAIRequestAsync(
@@ -5030,6 +5298,7 @@ class AppState: ObservableObject {
 
             let result = GlobalSummaryResult(source: "reddit", summaries: summaries, error: errorMessage)
             await MainActor.run {
+                self.globalSummaryComments = cachedCommentContexts
                 self.handleSummaryResult(result)
             }
         }
@@ -5187,10 +5456,21 @@ class AppState: ObservableObject {
 
     private func hydrateRedditFeed(_ redditFeed: RedditFeed, sortOption: RedditService.SortOption) -> RedditFeed {
         var processedFeed = redditFeed
+        let existingSummaries = redditFeeds
+            .first(where: { $0.subreddit == redditFeed.subreddit })?
+            .posts
+            .reduce(into: [String: String]()) { result, post in
+                if let summary = post.summary, !summary.isEmpty {
+                    result[post.id] = summary
+                }
+            } ?? [:]
         for index in processedFeed.posts.indices {
             let post = processedFeed.posts[index]
             processedFeed.posts[index].isRead = persistenceManager.isRedditPostRead(post)
             processedFeed.posts[index].isFavorite = persistenceManager.isRedditPostFavorite(post.id)
+            if processedFeed.posts[index].summary == nil {
+                processedFeed.posts[index].summary = existingSummaries[post.id]
+            }
         }
 
         if sortOption == .new {
@@ -5263,6 +5543,7 @@ class AppState: ObservableObject {
         )
         let preserveExistingAggregateSummary = shouldPreserveAggregateSummary(for: context)
         resetAggregateSummaryState(preservingCurrentSummary: preserveExistingAggregateSummary)
+        batchPodcastSession.invalidate()
 
         globalSummaryPosts = []
         globalSummaryArticles = []
@@ -5371,34 +5652,37 @@ class AppState: ObservableObject {
     }
 
     private func buildAggregatePrompt(from result: GlobalSummaryResult) -> String {
-        let sourceLabel = result.source == "reddit" ? "Reddit threads" : "articles"
-        let isReddit = result.source == "reddit"
-        let dataItems = result.summaries.enumerated().map { idx, item in
-            "Item \(idx + 1): **\(item.subject)** — \(item.summary)"
+        let question = """
+        Identify and explain all significant themes discussed across this material. Group closely related points, preserve distinct topics, note agreements or disagreements where relevant, and conclude with the most important collective insights.
+        """
+
+        if result.source == "reddit", !globalSummaryPosts.isEmpty {
+            let currentPostIDs = Set(globalSummaryPosts.map(\.id))
+            let cachedPostIDs = Set(globalSummaryComments.map { $0.0.id })
+            let contexts = cachedPostIDs == currentPostIDs
+                ? globalSummaryComments
+                : globalSummaryPosts.map { ($0, []) }
+            return buildGlobalRedditQuestionPrompt(contexts: contexts, question: question)
+        }
+
+        if result.source == "articles", !globalSummaryArticles.isEmpty {
+            return buildGlobalArticlesQuestionPrompt(articles: globalSummaryArticles, question: question)
+        }
+
+        let savedSummaries = result.summaries.enumerated().map { index, item in
+            "Item \(index + 1): \(item.subject) - \(item.summary)"
         }.joined(separator: "\n")
 
-        let redditInstruction = isReddit ? "\n        - When working with Reddit content, inform of all topics being discussed." : ""
-
         return """
-        You have insight from multiple \(sourceLabel). Each entry includes its subject and summary (posts plus prevailing comment debate when available).
+        Use ONLY the saved material below to answer the question.
 
-        DATA:
-        \(dataItems)
+        SAVED MATERIAL:
+        \(savedSummaries)
 
-        ---
-        Task:
-        - Identify 2–4 cross-cutting themes that link both the post topics and how discussion evolved in the comments (agreements vs disagreements, new angles, sentiment shifts).
-        - For each theme, list which item numbers contribute and describe the shared perspective, highlighting consensus versus contention.
-        - Conclude with a paragraph summarizing the overall mood and debate trajectory across the set.\(redditInstruction)
+        QUESTION:
+        \(question)
 
-        Output format (plain text only, no Markdown symbols like #, *, _, or `):
-        Theme 1: [Theme Name]
-        Items X, Y: [Brief description capturing comment consensus/debate]
-
-        Theme 2: [Theme Name]
-        Items A, B: [Brief description capturing comment consensus/debate]
-
-        Final Overall Summary: One paragraph summarizing collective insights and tone.
+        If the material does not support a conclusion, say so explicitly. Respond in plain text only. Do not use Markdown symbols, headings, or code fences.
         """
     }
 
@@ -5453,10 +5737,18 @@ class AppState: ObservableObject {
                 } else if self.settings.selectedSummaryProvider == .applePCCGateway {
                     print("☁️ Aggregate: Using Apple PCC fm CLI for combined summary")
                     providerName = self.settings.selectedSummaryProvider.displayName
-                    summary = try await self.performPCCGatewayRequestAsync(
+                    summary = try await self.performPCCPlainTextRequestAsync(
                         prompt: prompt,
                         taskName: result.source == "reddit" ? "Combined Reddit Summary" : "Combined Article Summary"
                     )
+                } else if self.settings.selectedSummaryProvider == .appleCloud {
+                    print("☁️ Aggregate: Using Apple Cloud for combined summary")
+                    providerName = self.settings.selectedSummaryProvider.displayName
+                    summary = await withCheckedContinuation { continuation in
+                        self.launchCloudRequest(for: prompt, type: .summary) { result in
+                            continuation.resume(returning: result)
+                        }
+                    }
                 } else if self.settings.selectedSummaryProvider == .webAI {
                     print("🌐 Aggregate: Using \(self.settings.selectedWebAIProvider.displayName) for combined summary")
                     providerName = self.settings.selectedWebAIProvider.displayName
@@ -5548,6 +5840,7 @@ class AppState: ObservableObject {
         aggregateSummaryText = nil
         aggregateSummaryError = nil
         aggregateSummarySourceFingerprint = nil
+        batchPodcastSession.invalidate()
         launchAggregateSummary(from: result)
         aggregateSummarySourceFingerprint = sourceFingerprint
     }
@@ -6540,7 +6833,7 @@ class AppState: ObservableObject {
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 do {
-                    let answer = try await self.performPCCGatewayRequestAsync(prompt: prompt, taskName: taskName, isQA: isQA)
+                    let answer = try await self.performPCCPlainTextRequestAsync(prompt: prompt, taskName: taskName, isQA: isQA)
                     await MainActor.run {
                         self.isLoading = false
                         completion(answer)
@@ -6751,7 +7044,7 @@ class AppState: ObservableObject {
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 do {
-                    let answer = try await self.performPCCGatewayRequestAsync(
+                    let answer = try await self.performPCCPlainTextRequestAsync(
                         prompt: prompt,
                         taskName: "Article Q&A",
                         isQA: true
@@ -7003,7 +7296,7 @@ class AppState: ObservableObject {
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 do {
-                    let answer = try await self.performPCCGatewayRequestAsync(
+                    let answer = try await self.performPCCPlainTextRequestAsync(
                         prompt: prompt,
                         taskName: "Reddit Q&A",
                         isQA: true
@@ -7245,6 +7538,222 @@ class AppState: ObservableObject {
         
         completion("No summary data is available for Q&A at the moment. Please generate a summary first.")
     }
+
+    /// Uses only the already-saved small summaries and never downloads Reddit comments.
+    func askQuestionAboutSavedGlobalSummaries(
+        question: String,
+        useWebAI: Bool,
+        completion: @escaping (String) -> Void
+    ) {
+        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            completion("Please enter a question to ask about the summary overview.")
+            return
+        }
+        guard let data = globalSummaryJSON.data(using: .utf8),
+              let result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data),
+              !result.summaries.isEmpty else {
+            completion("No saved item summaries are available for this question.")
+            return
+        }
+
+        let sections = result.summaries.enumerated().map { index, item in
+            "Item \(index + 1):\nSubject: \(item.subject)\nSummary: \(item.summary)"
+        }.joined(separator: "\n\n")
+        let prompt = """
+        Answer the question using only the saved per-item summaries below. These are condensed summaries, not the full extracted Reddit comments, so clearly acknowledge when they do not contain enough detail.
+
+        SAVED ITEM SUMMARIES:
+        \(sections)
+
+        QUESTION:
+        \(trimmed)
+
+        Return plain text only. Do not use Markdown symbols, headings, bullets, or code fences.
+        """
+
+        if useWebAI {
+            executeWebGlobalQAPrompt(prompt: prompt, completion: completion)
+        } else {
+            executeGlobalQAPrompt(prompt: prompt, completion: completion)
+        }
+    }
+
+    /// Reuses the exact comments retained from the Reddit summary extraction. Large sources are
+    /// processed in 40,000-character chunks and consolidated into one answer.
+    func askQuestionAboutGlobalSummarySelection(
+        selectedText: String,
+        useWebAI: Bool,
+        completion: @escaping (String) -> Void
+    ) {
+        let selected = normalizedGlobalSelectionText(selectedText, limit: 8_000)
+        guard !selected.isEmpty else {
+            completion("Select some text first.")
+            return
+        }
+
+        let currentPostIDs = Set(globalSummaryPosts.map { $0.id })
+        let contexts = globalSummaryComments.filter { currentPostIDs.isEmpty || currentPostIDs.contains($0.0.id) }
+        guard !contexts.isEmpty else {
+            let fallbackPrompt = savedSummarySelectionPrompt(selectedText: selected)
+            guard !fallbackPrompt.isEmpty else {
+                completion("No saved source material is available for this selection.")
+                return
+            }
+            executeGlobalSelectionPrompt(fallbackPrompt, useWebAI: useWebAI, completion: completion)
+            return
+        }
+
+        let sections = contexts.enumerated().map { index, entry in
+            let post = entry.0
+            let comments = entry.1.isEmpty
+                ? "(No comments were captured for this post.)"
+                : entry.1.map { "- \($0)" }.joined(separator: "\n")
+            return """
+            Reddit Item \(index + 1):
+            Subreddit: r/\(post.subreddit)
+            Title: \(post.title)
+            Post:
+            \(normalizedGlobalSelectionText(post.content, limit: 2_000))
+            Extracted comments used for the summary:
+            \(comments)
+            """
+        }
+        let chunks = chunkedGlobalSelectionSources(sections, maxCharacters: 40_000)
+        guard !chunks.isEmpty else {
+            completion("No saved source material is available for this selection.")
+            return
+        }
+
+        if chunks.count == 1 {
+            let prompt = globalSelectionAnswerPrompt(selected: selected, source: chunks[0])
+            executeGlobalSelectionPrompt(prompt, useWebAI: useWebAI, completion: completion)
+            return
+        }
+
+        func processChunk(_ index: Int, evidence: [String]) {
+            guard index < chunks.count else {
+                let evidenceText = evidence.enumerated().map { "Chunk \($0.offset + 1):\n\($0.element)" }.joined(separator: "\n\n")
+                let finalPrompt = """
+                Produce the final answer about the selected text using only the evidence extracted from all source chunks below.
+
+                Selected text:
+                \(selected)
+
+                CHUNK EVIDENCE:
+                \(evidenceText)
+
+                If the evidence does not answer it, say so explicitly. Return plain text only, using short paragraphs and no Markdown symbols, headings, bullets, or code fences.
+                """
+                executeGlobalSelectionPrompt(finalPrompt, useWebAI: useWebAI, completion: completion)
+                return
+            }
+
+            let evidencePrompt = """
+            Inspect this source chunk for evidence that explains or adds relevant detail about the selected text. Do not invent facts and do not rely on outside knowledge.
+
+            Selected text:
+            \(selected)
+
+            SOURCE CHUNK \(index + 1) OF \(chunks.count):
+            \(chunks[index])
+
+            Return a compact plain-text evidence note of at most 250 words. If this chunk has no relevant evidence, return exactly: NO RELEVANT EVIDENCE
+            """
+            executeGlobalSelectionPrompt(evidencePrompt, useWebAI: useWebAI) { answer in
+                processChunk(index + 1, evidence: evidence + [answer])
+            }
+        }
+
+        processChunk(0, evidence: [])
+    }
+
+    private func savedSummarySelectionPrompt(selectedText: String) -> String {
+        guard let data = globalSummaryJSON.data(using: .utf8),
+              let result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data),
+              !result.summaries.isEmpty else { return "" }
+        let summaries = result.summaries.enumerated().map { index, item in
+            "Item \(index + 1): \(item.subject)\n\(item.summary)"
+        }.joined(separator: "\n\n")
+        return """
+        Explain what the saved summaries say about the selected text. Use only these summaries and say when they do not contain enough detail.
+
+        Selected text:
+        \(selectedText)
+
+        SAVED SUMMARIES:
+        \(summaries)
+
+        Return plain text only, with no Markdown symbols, headings, bullets, or code fences.
+        """
+    }
+
+    private func executeGlobalSelectionPrompt(
+        _ prompt: String,
+        useWebAI: Bool,
+        completion: @escaping (String) -> Void
+    ) {
+        if useWebAI {
+            executeWebGlobalQAPrompt(prompt: prompt, completion: completion)
+        } else {
+            executeGlobalQAPrompt(prompt: prompt, completion: completion)
+        }
+    }
+
+    private func globalSelectionAnswerPrompt(selected: String, source: String) -> String {
+        """
+        Answer what the saved Reddit posts and extracted comments say about the selected text. Use only the supplied source material.
+
+        Selected text:
+        \(selected)
+
+        SAVED SOURCE MATERIAL:
+        \(source)
+
+        If the source does not answer it, say so explicitly. Return plain text only, using short paragraphs and no Markdown symbols, headings, bullets, or code fences.
+        """
+    }
+
+    private func normalizedGlobalSelectionText(_ text: String, limit: Int) -> String {
+        let value = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.count <= limit ? value : String(value.prefix(limit))
+    }
+
+    private func chunkedGlobalSelectionSources(_ sections: [String], maxCharacters: Int) -> [String] {
+        var chunks: [String] = []
+        var current = ""
+
+        func appendCurrent() {
+            guard !current.isEmpty else { return }
+            chunks.append(current)
+            current = ""
+        }
+
+        for section in sections {
+            if section.count > maxCharacters {
+                appendCurrent()
+                var remaining = section[...]
+                while !remaining.isEmpty {
+                    let end = remaining.index(remaining.startIndex, offsetBy: min(maxCharacters, remaining.count))
+                    chunks.append(String(remaining[..<end]))
+                    remaining = remaining[end...]
+                }
+            } else if current.isEmpty {
+                current = section
+            } else if current.count + 2 + section.count <= maxCharacters {
+                current += "\n\n" + section
+            } else {
+                appendCurrent()
+                current = section
+            }
+        }
+        appendCurrent()
+        return chunks
+    }
     
     private func executeGlobalQAPrompt(prompt: String, completion: @escaping (String) -> Void) {
         let deliver: (String) -> Void = { [weak self] rawAnswer in
@@ -7263,7 +7772,7 @@ class AppState: ObservableObject {
         case .applePCCGateway:
             Task(priority: .userInitiated) {
                 do {
-                    let answer = try await self.performPCCGatewayRequestAsync(
+                    let answer = try await self.performPCCPlainTextRequestAsync(
                         prompt: prompt,
                         taskName: "Global Summary Q&A",
                         isQA: true

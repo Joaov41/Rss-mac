@@ -45,6 +45,83 @@ struct ConditionalEnhancedSwipeBack: ViewModifier {
 }
 #endif
 
+private struct RedditCommentsActionCapsule<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(spacing: 2) {
+            content
+        }
+        .modifier(RedditCommentsActionPillModifier())
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct RedditCommentsActionPillModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content
+            .padding(4)
+            .modifier(RedditCommentsGlassModifier())
+            .overlay {
+                Capsule(style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(colorScheme == .dark ? 0.38 : 0.34),
+                                Color.white.opacity(0.10),
+                                Color.black.opacity(0.12)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            }
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 10, x: 0, y: 5)
+    }
+}
+
+private struct RedditCommentsGlassModifier: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: Capsule(style: .continuous))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+                .overlay {
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
+                }
+        }
+    }
+}
+
+#if os(macOS)
+private struct RedditQAActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .frame(width: 32, height: 26)
+            .contentShape(Capsule(style: .continuous))
+            .background {
+                Capsule(style: .continuous)
+                    .fill(configuration.isPressed ? Color.white.opacity(0.16) : Color.clear)
+            }
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+#endif
+
 struct RedditDetailView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
@@ -77,6 +154,14 @@ struct RedditDetailView: View {
 
     private var shouldShowExplicitWebAIControls: Bool {
         appState.settings.selectedSummaryProvider != .webAI
+    }
+
+    private var qaAnswerButtonSpacing: CGFloat {
+        #if os(macOS)
+        return 1
+        #else
+        return 12
+        #endif
     }
     
     // Q&A states
@@ -292,7 +377,7 @@ struct RedditDetailView: View {
                 
                 Divider()
                 
-                if appState.isLoading && visiblePostSummary == nil {
+                if appState.isSummarizingRedditPost(post) && visiblePostSummary == nil {
                     VStack(spacing: 16) {
                         HStack {
                             Text("Summary")
@@ -313,7 +398,9 @@ struct RedditDetailView: View {
                         } else {
                             VStack(spacing: 8) {
                                 ProgressView()
-                                Text("Summarizing post...")
+                                Text(appState.isWaitingForAppleIntelligence
+                                     ? appState.appleIntelligenceWaitProgress
+                                     : "Summarizing post...")
                                     .foregroundColor(.secondary)
                                     .font(.caption)
                             }
@@ -322,25 +409,6 @@ struct RedditDetailView: View {
                             .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
                             .cornerRadius(10)
                         }
-                    }
-                    Divider()
-                } else if appState.isWaitingForAppleIntelligence && visiblePostSummary == nil {
-                    VStack(spacing: 16) {
-                        HStack {
-                            Text("Summary")
-                                .font(.headline)
-                            Spacer()
-                        }
-                        VStack(spacing: 8) {
-                            ProgressView()
-                            Text(appState.appleIntelligenceWaitProgress)
-                                .foregroundColor(.secondary)
-                                .font(.caption)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
-                        .cornerRadius(10)
                     }
                     Divider()
                 } else if let summary = visiblePostSummary,
@@ -490,9 +558,10 @@ struct RedditDetailView: View {
                             .aspectRatio(contentMode: .fit)
                             .cornerRadius(8)
                             .shadow(color: Color.black.opacity(0.2), radius: 4, x: 0, y: 2)
-                            .frame(maxHeight: 400)
+                            .frame(maxWidth: 600)
                     }
                     .buttonStyle(PlainButtonStyle())
+                    .frame(maxWidth: .infinity, alignment: .center)
                 }
                 
                 // Show additional images in a gallery if there are multiple
@@ -628,6 +697,26 @@ struct RedditDetailView: View {
                             }
                         }
                         if showCommentSummary {
+                            #if os(macOS)
+                            HStack {
+                                Spacer()
+                                SummaryTTSMiniPlayer(
+                                    isReddit: true,
+                                    playDisabled: isSynthesizingSpeechSummary || isSpeakingLocallySummary || summary.summary.isEmpty,
+                                    stopDisabled: !isSynthesizingSpeechSummary && !isSpeakingLocallySummary,
+                                    localDisabled: isSynthesizingSpeechSummary || summary.summary.isEmpty,
+                                    localIsActive: isSpeakingLocallySummary,
+                                    onPlay: { speakPostSummary(summary.summary) },
+                                    onStop: stopPostSummarySpeech,
+                                    onLocal: { speakPostSummaryLocally(summary.summary) },
+                                    playHelp: "Read aloud (Cloud)",
+                                    localHelp: "Read aloud (Local)"
+                                )
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.top, 4)
+                            #endif
+
                             // Directly render markdown content
                             if colorScheme == .dark {
                                 SelectableText(.init(summary.summary))
@@ -739,7 +828,11 @@ struct RedditDetailView: View {
                                             .font(.subheadline)
                                     }
                                     .accessibilityLabel("Ask")
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
+                                    #endif
                                     .disabled(questionText.isEmpty || isProcessingQuestion)
 
                                     if shouldShowExplicitWebAIControls {
@@ -750,7 +843,11 @@ struct RedditDetailView: View {
                                                 .font(.subheadline)
                                         }
                                         .accessibilityLabel(appState.settings.selectedWebAIProvider.displayName)
+                                        #if os(macOS)
+                                        .buttonStyle(RedditQAActionButtonStyle())
+                                        #else
                                         .buttonStyle(LiquidGlassButtonStyle())
+                                        #endif
                                         .disabled(questionText.isEmpty || isProcessingQuestion)
                                     }
                                     
@@ -766,10 +863,18 @@ struct RedditDetailView: View {
                                             .font(.subheadline)
                                     }
                                     .accessibilityLabel("Cancel")
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
-                                    
+                                    #endif
+                                    #if !os(macOS)
                                     Spacer()
+                                    #endif
                                 }
+                                #if os(macOS)
+                                .modifier(RedditCommentsActionPillModifier())
+                                #endif
                                 
                                 let qaStreamText = appState.mlxStreamingText
                                 if isProcessingQuestion && (appState.settings.selectedSummaryProvider == .mlxLocal || appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !qaStreamText.isEmpty {
@@ -807,7 +912,7 @@ struct RedditDetailView: View {
                                         .padding(.horizontal, 20)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                HStack(spacing: 12) {
+                                HStack(spacing: qaAnswerButtonSpacing) {
                                     // Cloud TTS button
                                     Button {
                                         speakAnswerQA(answerText)
@@ -815,7 +920,11 @@ struct RedditDetailView: View {
                                         Image(systemName: "speaker.wave.2")
                                             .font(.subheadline)
                                     }
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
+                                    #endif
                                     .ttsActiveGlow(isSynthesizingSpeechQA, color: .blue)
                                     .help("Read aloud (Cloud)")
                                     .disabled(isSynthesizingSpeechQA || isSpeakingLocallyQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
@@ -827,7 +936,11 @@ struct RedditDetailView: View {
                                         Image(systemName: "stop.fill")
                                             .font(.subheadline)
                                     }
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
+                                    #endif
                                     .help("Stop speech")
                                     
                                     // Local TTS button
@@ -837,7 +950,11 @@ struct RedditDetailView: View {
                                         Image(systemName: "speaker.wave.2.circle")
                                             .font(.subheadline)
                                     }
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
+                                    #endif
                                     .ttsActiveGlow(isSpeakingLocallyQA, color: .green)
                                     .help("Read aloud (Local)")
                                     .disabled(isSynthesizingSpeechQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
@@ -854,10 +971,17 @@ struct RedditDetailView: View {
                                         Image(systemName: "doc.on.doc")
                                             .font(.subheadline)
                                     }
+                                    #if os(macOS)
+                                    .buttonStyle(RedditQAActionButtonStyle())
+                                    #else
                                     .buttonStyle(LiquidGlassButtonStyle())
+                                    #endif
                                     .help("Copy answer")
                                     .disabled(answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
                                 }
+                                #if os(macOS)
+                                .modifier(RedditCommentsActionPillModifier())
+                                #endif
                                 .padding(.top, 5)
                                 
                                 // TTS status indicators
@@ -1022,7 +1146,9 @@ struct RedditDetailView: View {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2.weight(.semibold))
             }
-            .buttonStyle(LiquidGlassButtonStyle())
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .controlSize(.large)
             .padding(.trailing, 24)
             .padding(.bottom, 24)
             #endif
@@ -1160,25 +1286,31 @@ struct RedditDetailView: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
                 compactCommentSortMenu(for: post)
-                compactAnalysisButton
-                if shouldShowExplicitWebAIControls {
-                    compactWebActionsMenu(for: post)
+                RedditCommentsActionCapsule {
+                    compactAnalysisButton(grouped: true)
+                    if shouldShowExplicitWebAIControls {
+                        compactWebActionsMenu(for: post, grouped: true)
+                    }
+                    compactSummarizeButton(for: post, grouped: true)
+                    compactAskButton(grouped: true)
                 }
-                compactSummarizeButton(for: post)
-                compactAskButton
             }
 
             HStack(spacing: 6) {
                 compactCommentSortMenu(for: post)
-                compactSummarizeButton(for: post)
-                compactAskButton
-                compactOverflowMenu(for: post, includesSummary: false)
+                RedditCommentsActionCapsule {
+                    compactSummarizeButton(for: post, grouped: true)
+                    compactAskButton(grouped: true)
+                    compactOverflowMenu(for: post, includesSummary: false, grouped: true)
+                }
             }
 
             HStack(spacing: 6) {
                 compactCommentSortMenu(for: post)
-                compactAskButton
-                compactOverflowMenu(for: post, includesSummary: true)
+                RedditCommentsActionCapsule {
+                    compactAskButton(grouped: true)
+                    compactOverflowMenu(for: post, includesSummary: true, grouped: true)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1214,18 +1346,18 @@ struct RedditDetailView: View {
         .accessibilityLabel("Comment sort")
     }
 
-    private var compactAnalysisButton: some View {
+    private func compactAnalysisButton(grouped: Bool = false) -> some View {
         Button {
             analyticsProviderOverride = nil
             isShowingAnalytics = true
         } label: {
-            compactHeaderIcon(systemName: "chart.pie.fill")
+            compactHeaderIcon(systemName: "chart.pie.fill", grouped: grouped)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Deep Analysis")
     }
 
-    private func compactWebActionsMenu(for post: RedditPost) -> some View {
+    private func compactWebActionsMenu(for post: RedditPost, grouped: Bool = false) -> some View {
         Menu {
             Button {
                 summarizeComments(for: post, forceWebAI: true)
@@ -1240,37 +1372,40 @@ struct RedditDetailView: View {
                 Label("Deep Analysis", systemImage: "chart.pie.fill")
             }
         } label: {
-            compactHeaderIcon(systemName: "globe")
+            compactHeaderIcon(systemName: "globe", grouped: grouped)
         }
         .buttonStyle(.plain)
         .help("Send comment prompts to \(appState.settings.selectedWebAIProvider.displayName)")
     }
 
-    private func compactSummarizeButton(for post: RedditPost) -> some View {
+    private func compactSummarizeButton(for post: RedditPost, grouped: Bool = false) -> some View {
         Button {
             print("📱 Summarize button pressed - clearing summary and calling summarizeComments")
             commentSummary = nil
             summarizeComments(for: post)
         } label: {
-            compactHeaderIcon(systemName: "text.redaction")
+            compactHeaderIcon(systemName: "text.redaction", grouped: grouped)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Summarize")
         .disabled(isLoadingComments)
     }
 
-    private var compactAskButton: some View {
+    private func compactAskButton(grouped: Bool = false) -> some View {
         Button {
             showQAInterface.toggle()
         } label: {
-            compactHeaderIcon(systemName: showQAInterface ? "xmark.circle" : "questionmark.circle")
+            compactHeaderIcon(
+                systemName: showQAInterface ? "xmark.circle" : "questionmark.circle",
+                grouped: grouped
+            )
         }
         .buttonStyle(.plain)
         .accessibilityLabel(showQAInterface ? "Hide Q&A" : "Ask")
         .disabled(isLoadingComments)
     }
 
-    private func compactOverflowMenu(for post: RedditPost, includesSummary: Bool) -> some View {
+    private func compactOverflowMenu(for post: RedditPost, includesSummary: Bool, grouped: Bool = false) -> some View {
         Menu {
             Button {
                 analyticsProviderOverride = nil
@@ -1305,14 +1440,14 @@ struct RedditDetailView: View {
                 .disabled(isLoadingComments)
             }
         } label: {
-            compactHeaderIcon(systemName: "ellipsis")
+            compactHeaderIcon(systemName: "ellipsis", grouped: grouped)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("More comment actions")
     }
 
-    private func compactHeaderIcon(systemName: String) -> some View {
-        compactHeaderControl {
+    private func compactHeaderIcon(systemName: String, grouped: Bool = false) -> some View {
+        compactHeaderControl(grouped: grouped) {
             Image(systemName: systemName)
                 .font(.system(size: 19, weight: .semibold))
         }
@@ -1320,17 +1455,23 @@ struct RedditDetailView: View {
 
     private func compactHeaderControl<Content: View>(
         width: CGFloat = 42,
+        grouped: Bool = false,
         @ViewBuilder content: () -> Content
     ) -> some View {
         content()
             .foregroundStyle(.primary)
-            .frame(width: width, height: 42)
+            .frame(width: grouped ? 44 : width, height: grouped ? 36 : 42)
             .background {
-                Capsule(style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(colorScheme == .dark ? 0.42 : 0.28), lineWidth: 1)
+                if grouped {
+                    Capsule(style: .continuous)
+                        .fill(Color.clear)
+                } else {
+                    Capsule(style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            Capsule(style: .continuous)
+                                .stroke(Color.white.opacity(colorScheme == .dark ? 0.42 : 0.28), lineWidth: 1)
+                        }
                     }
             }
             .contentShape(Capsule(style: .continuous))
@@ -3973,39 +4114,18 @@ VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Spacer()
                 
-                // Cloud TTS button
-                Button {
-                    speakSummary()
-                } label: {
-                    Image(systemName: "speaker.wave.2")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSynthesizingSpeech, color: .blue)
-                .help("Read aloud (Cloud)")
-                .disabled(isSynthesizingSpeech || isSpeakingLocally)
-                
-                // Stop speech
-                Button {
-                    stopRedditSummarySpeech()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .help("Stop speech")
-                
-                // Local TTS button
-                Button {
-                    speakSummaryLocally()
-                } label: {
-                    Image(systemName: "speaker.wave.2.circle")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSpeakingLocally, color: .green)
-                .help("Read aloud (Local)")
-                .disabled(isSynthesizingSpeech)
+                SummaryTTSMiniPlayer(
+                    isReddit: true,
+                    playDisabled: isSynthesizingSpeech || isSpeakingLocally,
+                    stopDisabled: !isSynthesizingSpeech && !isSpeakingLocally,
+                    localDisabled: isSynthesizingSpeech,
+                    localIsActive: isSpeakingLocally,
+                    onPlay: speakSummary,
+                    onStop: stopRedditSummarySpeech,
+                    onLocal: speakSummaryLocally,
+                    playHelp: "Read aloud (Cloud)",
+                    localHelp: "Read aloud (Local)"
+                )
             }
             .padding(.horizontal, 20)
             .padding(.top, 16)
@@ -4714,39 +4834,18 @@ struct GlassySummary: View {
 VStack(alignment: .leading) {
             HStack(spacing: 12) {
                 Spacer()
-                // Cloud TTS button
-                Button {
-                    speakSummary()
-                } label: {
-                    Image(systemName: "speaker.wave.2")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSynthesizingSpeech, color: .blue)
-                .help("Read aloud (Cloud)")
-                .disabled(isSynthesizingSpeech || isSpeakingLocally)
-                
-                // Stop speech
-                Button {
-                    stopRedditSummarySpeech()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .help("Stop speech")
-                
-                // Local TTS button
-                Button {
-                    speakSummaryLocally()
-                } label: {
-                    Image(systemName: "speaker.wave.2.circle")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .ttsActiveGlow(isSpeakingLocally, color: .green)
-                .help("Read aloud (Local)")
-                .disabled(isSynthesizingSpeech)
+                SummaryTTSMiniPlayer(
+                    isReddit: true,
+                    playDisabled: isSynthesizingSpeech || isSpeakingLocally,
+                    stopDisabled: !isSynthesizingSpeech && !isSpeakingLocally,
+                    localDisabled: isSynthesizingSpeech,
+                    localIsActive: isSpeakingLocally,
+                    onPlay: speakSummary,
+                    onStop: stopRedditSummarySpeech,
+                    onLocal: speakSummaryLocally,
+                    playHelp: "Read aloud (Cloud)",
+                    localHelp: "Read aloud (Local)"
+                )
                 
                 // Copy button
                 Button {

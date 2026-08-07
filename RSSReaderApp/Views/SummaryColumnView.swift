@@ -75,18 +75,13 @@ struct SummaryColumnView: View {
                                 .padding()
                         }
                     } else {
-                        ProgressView("Generating summary...")
+                        ProgressView(
+                            appState.isWaitingForAppleIntelligence
+                                ? appState.appleIntelligenceWaitProgress
+                                : "Generating summary..."
+                        )
                             .padding()
                     }
-                } else if appState.isWaitingForAppleIntelligence {
-                    VStack(spacing: 8) {
-                        ProgressView()
-                        Text(appState.appleIntelligenceWaitProgress)
-                            .foregroundColor(.secondary)
-                            .font(.caption)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding()
                 } else if let summary = article.summary,
                           !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     VStack(alignment: .leading) {
