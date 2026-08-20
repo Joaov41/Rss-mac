@@ -131,12 +131,15 @@ struct RedditDetailView: View {
     @State private var selectedCommentSort: RedditService.CommentSortOption = .best
     @State private var commentSummary: CommentSummary?
     @State private var showCommentSummary = false
+    @State private var postSummaryWebAIProviderOverride: WebAIProvider?
+    @State private var commentSummaryWebAIProviderOverride: WebAIProvider?
     @State private var cancellables = Set<AnyCancellable>()
     @State private var showMoreCommentsButton = false
     @State private var hasMoreCommentsToLoad = false
     @State private var commentBanner: RedditStatusMessage? = nil
     @State private var commentLoadError: String? = nil
     @State private var commentLoadTask: Task<Void, Never>? = nil
+    @State private var commentSummaryScrollRequest = 0
     @State private var isProcessingQuestion = false
     @State private var previousQuestionText: String? = nil
     @State private var commentsSentToLLMCount: Int? = nil
@@ -151,9 +154,48 @@ struct RedditDetailView: View {
     // Default max number of comments to show
     private let maxDisplayComments = 50
     private let redditTopAnchor = "redditDetailTopAnchor"
+    private let redditPostSummaryAnchor = "redditPostSummaryAnchor"
+    private let redditCommentSummaryAnchor = "redditCommentSummaryAnchor"
 
     private var shouldShowExplicitWebAIControls: Bool {
         appState.settings.selectedSummaryProvider != .webAI
+    }
+
+    private var activeSummaryProviderName: String {
+        appState.settings.selectedSummaryProvider == .webAI
+            ? appState.settings.selectedWebAIProvider.displayName
+            : appState.settings.selectedSummaryProvider.displayName
+    }
+
+    private var activeSummaryProviderIcon: String {
+        switch appState.settings.selectedSummaryProvider {
+        case .gemini:
+            return "sparkles"
+        case .appleLocal:
+            return "cpu"
+        case .appleCloud:
+            return "cloud.fill"
+        case .applePCCGateway:
+            return "network"
+        case .mlxLocal, .coreAIMLXLocal:
+            return "memorychip"
+        case .webAI:
+            return "globe"
+        case .summarizeDaemon:
+            return "terminal"
+        }
+    }
+
+    private func summaryProviderBadge(webAIProviderOverride: WebAIProvider? = nil) -> some View {
+        let providerName = webAIProviderOverride?.displayName ?? activeSummaryProviderName
+        let providerIcon = webAIProviderOverride == nil ? activeSummaryProviderIcon : "globe"
+
+        return Label(providerName, systemImage: providerIcon)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .accessibilityLabel("Using \(providerName)")
     }
 
     private var qaAnswerButtonSpacing: CGFloat {
@@ -169,14 +211,17 @@ struct RedditDetailView: View {
     @State private var questionText = ""
     @State private var answerText = "Ask a question about this post or its comments..."
     @State private var answerParagraphs: [String]? = nil
+    @State private var markdownAnswerText: String?
     @State private var showSelectionAskAIResponse = false
     @State private var isSelectionAskAIInFlight = false
     @State private var selectionAskAIResponse: String?
+    @State private var selectionAskAIMarkdownResponse: String?
     @State private var selectionAskAIError: String?
     @State private var selectionAskAITask: Task<Void, Never>?
     
     // TTS state variables for Q&A
     @State private var isSynthesizingSpeechQA: Bool = false
+    @State private var isPreparingLocalTTSQA: Bool = false
     @State private var isSpeakingLocallyQA: Bool = false
     @State private var speechSynthesisErrorQA: String? = nil
     @State private var ttsCanceledQA: Bool = false
@@ -196,6 +241,7 @@ struct RedditDetailView: View {
 
     // TTS state variables for Post Summary
     @State private var isSynthesizingSpeechSummary: Bool = false
+    @State private var isPreparingLocalTTSSummary: Bool = false
     @State private var isSpeakingLocallySummary: Bool = false
     @State private var speechSynthesisErrorSummary: String? = nil
     @State private var ttsCanceledSummary: Bool = false
@@ -228,6 +274,14 @@ struct RedditDetailView: View {
         Text(verbatim: answerText)
     }
 
+    private func scrollToSummarySection(_ anchor: String, using proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.35)) {
+                proxy.scrollTo(anchor, anchor: UnitPoint(x: 0.5, y: 0.12))
+            }
+        }
+    }
+
     
     var body: some View {
         ScrollViewReader { proxy in
@@ -238,6 +292,9 @@ struct RedditDetailView: View {
                             // Load comments when view appears
                             self.loadComments(for: post)
                             answerParagraphs = nil
+                            markdownAnswerText = nil
+                            postSummaryWebAIProviderOverride = nil
+                            commentSummaryWebAIProviderOverride = nil
                             commentsSentToLLMCount = nil
                             print("📱 RedditDetailView: View appeared")
                         }
@@ -261,10 +318,13 @@ struct RedditDetailView: View {
                     self.comments = []
                     self.commentSummary = nil
                     self.showCommentSummary = false
+                    self.postSummaryWebAIProviderOverride = nil
+                    self.commentSummaryWebAIProviderOverride = nil
                     self.showQAInterface = false
                     self.questionText = ""
                     self.answerText = "Ask a question about this post or its comments..."
                     self.answerParagraphs = nil
+                    self.markdownAnswerText = nil
                     self.commentsSentToLLMCount = nil
                     
                     // Cancel previous requests
@@ -280,12 +340,26 @@ struct RedditDetailView: View {
                     }
                 }
             }
+            .onChange(of: appState.selectedRedditPost?.summary) { summary in
+                guard let summary,
+                      !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                scrollToSummarySection(redditPostSummaryAnchor, using: proxy)
+            }
+            .onChange(of: commentSummaryScrollRequest) { _ in
+                scrollToSummarySection(redditCommentSummaryAnchor, using: proxy)
+            }
+            .onChange(of: commentSummary?.summary) { summary in
+                guard let summary,
+                      !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                scrollToSummarySection(redditCommentSummaryAnchor, using: proxy)
+            }
         }
         .askAILoadingOverlay(isSelectionAskAIInFlight)
         .sheet(isPresented: $showSelectionAskAIResponse) {
             AskAIResponseSheet(
                 isLoading: isSelectionAskAIInFlight,
                 response: selectionAskAIResponse,
+                markdownResponse: selectionAskAIMarkdownResponse,
                 errorMessage: selectionAskAIError,
                 onClose: { showSelectionAskAIResponse = false },
                 onCopy: copySelectionAskAIResponse
@@ -374,14 +448,46 @@ struct RedditDetailView: View {
                 }
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+
+                RedditCommentsActionCapsule {
+                    Button {
+                        postSummaryWebAIProviderOverride = nil
+                        appState.requestSummary(for: nil, redditPost: post)
+                    } label: {
+                        compactHeaderIcon(systemName: "text.quote", grouped: true)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Summarize post")
+                    .accessibilityHint("Summarize the Reddit post without comments")
+                    .help("Summarize post only (without comments)")
+
+                    if shouldShowExplicitWebAIControls {
+                        Button {
+                            postSummaryWebAIProviderOverride = appState.settings.selectedWebAIProvider
+                            appState.requestWebSummary(for: post)
+                        } label: {
+                            compactHeaderIcon(systemName: "globe", grouped: true)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Summarize post with \(appState.settings.selectedWebAIProvider.displayName)")
+                        .accessibilityHint("Use \(appState.settings.selectedWebAIProvider.displayName) to summarize the Reddit post without comments")
+                        .help("Summarize post only with \(appState.settings.selectedWebAIProvider.displayName) (without comments)")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 
                 Divider()
+
+                Color.clear
+                    .frame(height: 0)
+                    .id(redditPostSummaryAnchor)
                 
                 if appState.isSummarizingRedditPost(post) && visiblePostSummary == nil {
                     VStack(spacing: 16) {
                         HStack {
                             Text("Summary")
                                 .font(.headline)
+                            summaryProviderBadge(webAIProviderOverride: postSummaryWebAIProviderOverride)
                             Spacer()
                         }
                         let summaryStreamText = appState.mlxStreamingText
@@ -417,6 +523,7 @@ struct RedditDetailView: View {
                         HStack {
                             Text("Summary")
                                 .font(.headline)
+                            summaryProviderBadge(webAIProviderOverride: postSummaryWebAIProviderOverride)
                             Spacer()
                             
                             // TTS Controls with LiquidGlassButtonStyle
@@ -459,7 +566,7 @@ struct RedditDetailView: View {
                         
                         // Directly render markdown content
                         if colorScheme == .dark {
-                            SelectableText(.init(summary))
+                            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
                                 .font(.body)
                                 .onAskAI { selection in
                                     askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -471,7 +578,7 @@ struct RedditDetailView: View {
                                 .background(Color.black)
                                 .cornerRadius(10)
                         } else {
-                            SelectableText(.init(summary))
+                            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
                                 .font(.body)
                                 .onAskAI { selection in
                                     askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -491,6 +598,15 @@ struct RedditDetailView: View {
                                     .scaleEffect(0.7)
                                     .padding(.trailing, 5)
                                 Text("Reading summary...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        } else if isPreparingLocalTTSSummary {
+                            HStack {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                    .padding(.trailing, 5)
+                                Text("Preparing local TTS...")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -645,11 +761,16 @@ struct RedditDetailView: View {
                                     }
                                 }
                 
+                Color.clear
+                    .frame(height: 0)
+                    .id(redditCommentSummaryAnchor)
+
                 if isLoadingComments && commentSummary == nil && !comments.isEmpty {
                     VStack(spacing: 16) {
                         HStack {
                             Text("Comment Summary")
                                 .font(.headline)
+                            summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                         }
                         VStack(spacing: 8) {
@@ -669,6 +790,7 @@ struct RedditDetailView: View {
                         HStack {
                             Text("Comment Summary")
                                 .font(.headline)
+                            summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                         }
                         VStack(spacing: 8) {
@@ -688,6 +810,7 @@ struct RedditDetailView: View {
                         HStack {
                             Text("Comment Summary")
                                 .font(.headline)
+                            summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                             Button(action: { 
                                 showCommentSummary.toggle()
@@ -702,10 +825,10 @@ struct RedditDetailView: View {
                                 Spacer()
                                 SummaryTTSMiniPlayer(
                                     isReddit: true,
-                                    playDisabled: isSynthesizingSpeechSummary || isSpeakingLocallySummary || summary.summary.isEmpty,
-                                    stopDisabled: !isSynthesizingSpeechSummary && !isSpeakingLocallySummary,
+                                    playDisabled: isSynthesizingSpeechSummary || isPreparingLocalTTSSummary || isSpeakingLocallySummary || summary.summary.isEmpty,
+                                    stopDisabled: !isSynthesizingSpeechSummary && !isPreparingLocalTTSSummary && !isSpeakingLocallySummary,
                                     localDisabled: isSynthesizingSpeechSummary || summary.summary.isEmpty,
-                                    localIsActive: isSpeakingLocallySummary,
+                                    localIsActive: isPreparingLocalTTSSummary || isSpeakingLocallySummary,
                                     onPlay: { speakPostSummary(summary.summary) },
                                     onStop: stopPostSummarySpeech,
                                     onLocal: { speakPostSummaryLocally(summary.summary) },
@@ -719,7 +842,7 @@ struct RedditDetailView: View {
 
                             // Directly render markdown content
                             if colorScheme == .dark {
-                                SelectableText(.init(summary.summary))
+                                SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
                                     .font(.body)
                                     .onAskAI { selection in
                                         askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -731,7 +854,7 @@ struct RedditDetailView: View {
                                     .background(Color.black)
                                     .cornerRadius(10)
                             } else {
-                                SelectableText(.init(summary.summary))
+                                SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
                                     .font(.body)
                                     .onAskAI { selection in
                                         askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -885,7 +1008,11 @@ struct RedditDetailView: View {
                                         .padding(.horizontal, 20)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 } else if let paragraphs = answerParagraphs, !paragraphs.isEmpty {
-                                    SelectableText(paragraphs.joined(separator: "\n\n"))
+                                    SelectableText(
+                                        paragraphs.joined(separator: "\n\n"),
+                                        markdownText: paragraphs.joined(separator: "\n\n"),
+                                        normalizesMarkdownParagraphs: false
+                                    )
                                         .font(.body)
                                         .foregroundColor(.primary)
                                         .onAskAI { selection in
@@ -899,7 +1026,11 @@ struct RedditDetailView: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 } else {
                                     // Fallback to markdown rendering if JSON decoding fails
-                                    SelectableText(answerText)
+                                    SelectableText(
+                                        answerText,
+                                        markdownText: markdownAnswerText ?? normalizeConversationalAIReplyMarkdown(answerText),
+                                        normalizesMarkdownParagraphs: markdownAnswerText != nil
+                                    )
                                         .font(.body)
                                         .foregroundColor(.primary)
                                         .onAskAI { selection in
@@ -927,7 +1058,7 @@ struct RedditDetailView: View {
                                     #endif
                                     .ttsActiveGlow(isSynthesizingSpeechQA, color: .blue)
                                     .help("Read aloud (Cloud)")
-                                    .disabled(isSynthesizingSpeechQA || isSpeakingLocallyQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
+                                    .disabled(isSynthesizingSpeechQA || isPreparingLocalTTSQA || isSpeakingLocallyQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
                                     
                                     // Stop speech
                                     Button {
@@ -955,7 +1086,7 @@ struct RedditDetailView: View {
                                     #else
                                     .buttonStyle(LiquidGlassButtonStyle())
                                     #endif
-                                    .ttsActiveGlow(isSpeakingLocallyQA, color: .green)
+                                    .ttsActiveGlow(isPreparingLocalTTSQA || isSpeakingLocallyQA, color: .green)
                                     .help("Read aloud (Local)")
                                     .disabled(isSynthesizingSpeechQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
                                     
@@ -991,6 +1122,16 @@ struct RedditDetailView: View {
                                             .scaleEffect(0.7)
                                             .padding(.trailing, 5)
                                         Text("Reading answer...")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.top, 4)
+                                } else if isPreparingLocalTTSQA {
+                                    HStack {
+                                        ProgressView()
+                                            .scaleEffect(0.7)
+                                            .padding(.trailing, 5)
+                                        Text("Preparing local TTS...")
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
@@ -1203,7 +1344,9 @@ struct RedditDetailView: View {
                     #if os(iOS)
                     .presentationDetents([.large])
                     .presentationCornerRadius(40) // Balanced radius to prevent clipping
-                    .presentationBackground(.ultraThinMaterial) // Ultra translucent background
+                    .presentationBackground {
+                        AskAIPresentationBackground()
+                    }
                     .presentationBackgroundInteraction(.enabled)
                     #endif
             } else {
@@ -1623,7 +1766,10 @@ struct RedditDetailView: View {
     }
     
     private func summarizeComments(for post: RedditPost, forceWebAI: Bool = false) {
+        commentSummaryWebAIProviderOverride = forceWebAI ? appState.settings.selectedWebAIProvider : nil
         guard !comments.isEmpty else { return }
+
+        commentSummaryScrollRequest &+= 1
         
         print("⚙️ RedditDetailView: Summarizing \(comments.count) comments for post ID: \(post.id)")
         
@@ -1853,6 +1999,7 @@ struct RedditDetailView: View {
 
     private func summarizePost(post: RedditPost, proxy: ScrollViewProxy) {
         let currentComments = comments
+        scrollToSummarySection(redditPostSummaryAnchor, using: proxy)
         appState.requestSummary(for: nil, redditPost: post, redditComments: currentComments)
     }
 
@@ -1871,6 +2018,7 @@ struct RedditDetailView: View {
         // Set loading state
         isProcessingQuestion = true
         answerParagraphs = nil
+        markdownAnswerText = nil
         answerText = "Thinking..."
         let currentComments = self.comments
         self.commentsSentToLLMCount = currentComments.count
@@ -1928,11 +2076,13 @@ Each item ≤ 2–3 sentences.
 
         isProcessingQuestion = true
         answerParagraphs = nil
+        markdownAnswerText = nil
         answerText = "Thinking..."
         let currentComments = self.comments
         self.commentsSentToLLMCount = currentComments.count
 
         appState.askWebQuestionAboutRedditPost(post: post, comments: currentComments, question: questionText) { answer in
+            self.markdownAnswerText = answer
             self.answerText = formatAskAIResponseForDisplay(answer)
             self.isProcessingQuestion = false
             self.previousQuestionText = self.questionText
@@ -1947,6 +2097,7 @@ Each item ≤ 2–3 sentences.
         selectionAskAITask?.cancel()
         isSelectionAskAIInFlight = true
         selectionAskAIResponse = nil
+        selectionAskAIMarkdownResponse = nil
         selectionAskAIError = nil
         showSelectionAskAIResponse = true
 
@@ -1970,7 +2121,9 @@ Each item ≤ 2–3 sentences.
                 }
             }
 
+            let isWeb = if case .web = action { true } else { false }
             await MainActor.run {
+                self.selectionAskAIMarkdownResponse = isWeb ? answer : nil
                 self.selectionAskAIResponse = formatAskAIResponseForDisplay(answer)
                 self.isSelectionAskAIInFlight = false
             }
@@ -1990,6 +2143,7 @@ Each item ≤ 2–3 sentences.
     
    private func decodeParagraphArray(from text: String) -> [String]? {
        var payload = text.trimmingCharacters(in: .whitespacesAndNewlines)
+       payload = payload.replacingOccurrences(of: "\u{FEFF}", with: "")
 
        if payload.hasPrefix("```json") {
            payload = String(payload.dropFirst(7))
@@ -2001,17 +2155,63 @@ Each item ≤ 2–3 sentences.
            payload = String(payload.dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines)
        }
 
+       // Some providers wrap an otherwise valid JSON array with a short label
+       // or invisible prefix. Decode only the outermost array in that case.
+       if let openingBracket = payload.firstIndex(of: "["),
+          let closingBracket = payload.lastIndex(of: "]"),
+          openingBracket <= closingBracket {
+           payload = String(payload[openingBracket...closingBracket])
+       }
+
+       func cleanedParagraphs(_ values: [String]) -> [String]? {
+           let paragraphs = values.compactMap { value -> String? in
+               let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+               guard !trimmed.isEmpty else { return nil }
+               return fixMissingSentenceSpacing(in: trimmed)
+           }
+           return paragraphs.isEmpty ? nil : paragraphs
+       }
+
        guard let data = payload.data(using: .utf8) else { return nil }
        do {
            let raw = try JSONSerialization.jsonObject(with: data, options: [])
            guard let array = raw as? [Any] else { return nil }
-           let paragraphs = array.compactMap { element -> String? in
-               guard let paragraph = element as? String else { return nil }
-               let trimmed = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
-               return trimmed.isEmpty ? nil : trimmed
-           }
-           return paragraphs.isEmpty ? nil : paragraphs
+           return cleanedParagraphs(array.compactMap { $0 as? String })
        } catch {
+           // A few models emit a visually correct array with a minor JSON
+           // defect. Recover its quoted string elements so the UI never shows
+           // raw brackets and quotes to the user.
+           var recovered: [String] = []
+           var current = ""
+           var isInsideString = false
+           var isEscaping = false
+
+           for character in payload {
+               if isEscaping {
+                   switch character {
+                   case "n": current.append("\n")
+                   case "r": current.append("\r")
+                   case "t": current.append("\t")
+                   default: current.append(character)
+                   }
+                   isEscaping = false
+               } else if character == "\\" && isInsideString {
+                   isEscaping = true
+               } else if character == "\"" {
+                   if isInsideString {
+                       recovered.append(current)
+                       current = ""
+                   }
+                   isInsideString.toggle()
+               } else if isInsideString {
+                   current.append(character)
+               }
+           }
+
+           if let paragraphs = cleanedParagraphs(recovered) {
+               return paragraphs
+           }
+
            print("⚠️ RedditDetailView: Failed to decode paragraph array - \(error.localizedDescription)")
            return nil
        }
@@ -2042,6 +2242,7 @@ Each item ≤ 2–3 sentences.
         #endif
         nextAudioChunkQA = nil
         isSynthesizingSpeechQA = false
+        isPreparingLocalTTSQA = false
         isSpeakingLocallyQA = false
     }
 
@@ -2357,10 +2558,11 @@ Each item ≤ 2–3 sentences.
                 speechSynthesisErrorQA = "MLX TTS is not available. Add the MLXAudio package and model access."
                 return
             }
-            if isSpeakingLocallyQA {
+            if isPreparingLocalTTSQA || isSpeakingLocallyQA {
                 localTTSTaskQA?.cancel()
                 localTTSTaskQA = nil
                 audioPlayerQA?.stop()
+                isPreparingLocalTTSQA = false
                 isSpeakingLocallyQA = false
                 return
             }
@@ -2369,7 +2571,8 @@ Each item ≤ 2–3 sentences.
                 return
             }
             audioPlayerQA?.stop()
-            isSpeakingLocallyQA = true
+            isPreparingLocalTTSQA = true
+            isSpeakingLocallyQA = false
             isSynthesizingSpeechQA = false
             startKokoroPlaybackRedditQA(
                 text: text,
@@ -2379,12 +2582,18 @@ Each item ≤ 2–3 sentences.
                 soundDelegate: soundDelegateQA,
                 taskStore: &localTTSTaskQA,
                 onCompleted: {
+                    isPreparingLocalTTSQA = false
                     isSpeakingLocallyQA = false
                     localTTSTaskQA = nil
                 },
                 onError: { message in
                     speechSynthesisErrorQA = message
+                    isPreparingLocalTTSQA = false
                     isSpeakingLocallyQA = false
+                },
+                onPlaybackStarted: {
+                    isPreparingLocalTTSQA = false
+                    isSpeakingLocallyQA = true
                 }
             )
             return
@@ -2838,6 +3047,7 @@ Each item ≤ 2–3 sentences.
         #endif
         nextAudioChunkSummary = nil
         isSynthesizingSpeechSummary = false
+        isPreparingLocalTTSSummary = false
         isSpeakingLocallySummary = false
     }
     
@@ -3064,10 +3274,11 @@ Each item ≤ 2–3 sentences.
                 speechSynthesisErrorSummary = "MLX TTS is not available. Add the MLXAudio package and model access."
                 return
             }
-            if isSpeakingLocallySummary {
+            if isPreparingLocalTTSSummary || isSpeakingLocallySummary {
                 localTTSTaskSummary?.cancel()
                 localTTSTaskSummary = nil
                 audioPlayerSummary?.stop()
+                isPreparingLocalTTSSummary = false
                 isSpeakingLocallySummary = false
                 return
             }
@@ -3076,7 +3287,8 @@ Each item ≤ 2–3 sentences.
                 return
             }
             audioPlayerSummary?.stop()
-            isSpeakingLocallySummary = true
+            isPreparingLocalTTSSummary = true
+            isSpeakingLocallySummary = false
             isSynthesizingSpeechSummary = false
             startKokoroPlaybackRedditQA(
                 text: text,
@@ -3086,12 +3298,18 @@ Each item ≤ 2–3 sentences.
                 soundDelegate: soundDelegateSummary,
                 taskStore: &localTTSTaskSummary,
                 onCompleted: {
+                    isPreparingLocalTTSSummary = false
                     isSpeakingLocallySummary = false
                     localTTSTaskSummary = nil
                 },
                 onError: { message in
                     speechSynthesisErrorSummary = message
+                    isPreparingLocalTTSSummary = false
                     isSpeakingLocallySummary = false
+                },
+                onPlaybackStarted: {
+                    isPreparingLocalTTSSummary = false
+                    isSpeakingLocallySummary = true
                 }
             )
             return
@@ -3134,7 +3352,8 @@ Each item ≤ 2–3 sentences.
         soundDelegate: SoundDelegate,
         taskStore: inout Task<Void, Never>?,
         onCompleted: @escaping () -> Void,
-        onError: @escaping (String) -> Void
+        onError: @escaping (String) -> Void,
+        onPlaybackStarted: (() -> Void)? = nil
     ) {
         _ = soundDelegate
         taskStore?.cancel()
@@ -3203,6 +3422,7 @@ Each item ≤ 2–3 sentences.
                             onError("Failed to start audio playback.")
                             throw NSError(domain: "KokoroPlayback", code: -1)
                         }
+                        onPlaybackStarted?()
                         return player.duration
                         #endif
                     }
@@ -3211,12 +3431,15 @@ Each item ≤ 2–3 sentences.
                 enum KokoroPlaybackError: Error { case timeout }
 
                 func synthesizeWithTimeout(_ text: String) async throws -> Data {
-                    try await withThrowingTaskGroup(of: Data.self) { group in
+                    let timeoutNanoseconds: UInt64 = KokoroTTSService.shared.isModelReady
+                        ? 20_000_000_000
+                        : 120_000_000_000
+                    return try await withThrowingTaskGroup(of: Data.self) { group in
                         group.addTask {
                             try await KokoroTTSService.shared.synthesize(text: text, voice: voice, speed: Float(speed))
                         }
                         group.addTask {
-                            try await Task.sleep(nanoseconds: 20_000_000_000)
+                            try await Task.sleep(nanoseconds: timeoutNanoseconds)
                             throw KokoroPlaybackError.timeout
                         }
                         let result = try await group.next()!
@@ -3251,8 +3474,12 @@ Each item ≤ 2–3 sentences.
                     let message: String
                     if let kokoroError = error as? KokoroTTSServiceError, kokoroError == .notAvailable {
                         message = "MLX TTS is not available. Add the MLXAudio package and model access."
+                    } else if KokoroTTSService.shared.isModelLoading {
+                        message = "Local TTS is still preparing its model. Keep the app open, then try again."
+                    } else if !KokoroTTSService.shared.isModelReady {
+                        message = "Local TTS could not finish preparing its model. Please try again."
                     } else if String(describing: error).contains("timeout") {
-                        message = "Kokoro is still loading models. Please wait a moment and try again."
+                        message = "MLX TTS timed out while preparing audio. Please try again."
                     } else {
                         message = "Kokoro TTS failed: \(error.localizedDescription)"
                     }
@@ -3270,7 +3497,8 @@ Each item ≤ 2–3 sentences.
         soundDelegate: SoundDelegate,
         taskStore: inout Task<Void, Never>?,
         onCompleted: @escaping () -> Void,
-        onError: @escaping (String) -> Void
+        onError: @escaping (String) -> Void,
+        onPlaybackStarted: (() -> Void)? = nil
     ) {
         _ = soundDelegate
         taskStore?.cancel()
@@ -3339,6 +3567,7 @@ Each item ≤ 2–3 sentences.
                             onError("Failed to start audio playback.")
                             throw NSError(domain: "KokoroPlayback", code: -1)
                         }
+                        onPlaybackStarted?()
                         return player.duration
                         #endif
                     }
@@ -3347,12 +3576,15 @@ Each item ≤ 2–3 sentences.
                 enum KokoroPlaybackError: Error { case timeout }
 
                 func synthesizeWithTimeout(_ text: String) async throws -> Data {
-                    try await withThrowingTaskGroup(of: Data.self) { group in
+                    let timeoutNanoseconds: UInt64 = KokoroTTSService.shared.isModelReady
+                        ? 20_000_000_000
+                        : 120_000_000_000
+                    return try await withThrowingTaskGroup(of: Data.self) { group in
                         group.addTask {
                             try await KokoroTTSService.shared.synthesize(text: text, voice: voice, speed: Float(speed))
                         }
                         group.addTask {
-                            try await Task.sleep(nanoseconds: 20_000_000_000)
+                            try await Task.sleep(nanoseconds: timeoutNanoseconds)
                             throw KokoroPlaybackError.timeout
                         }
                         let result = try await group.next()!
@@ -3387,8 +3619,12 @@ Each item ≤ 2–3 sentences.
                     let message: String
                     if let kokoroError = error as? KokoroTTSServiceError, kokoroError == .notAvailable {
                         message = "MLX TTS is not available. Add the MLXAudio package and model access."
+                    } else if KokoroTTSService.shared.isModelLoading {
+                        message = "Local TTS is still preparing its model. Keep the app open, then try again."
+                    } else if !KokoroTTSService.shared.isModelReady {
+                        message = "Local TTS could not finish preparing its model. Please try again."
                     } else if String(describing: error).contains("timeout") {
-                        message = "Kokoro is still loading models. Please wait a moment and try again."
+                        message = "MLX TTS timed out while preparing audio. Please try again."
                     } else {
                         message = "Kokoro TTS failed: \(error.localizedDescription)"
                     }
@@ -3550,8 +3786,28 @@ struct CommentAnalyticsViewIntegrated: View {
                 .padding(.horizontal, 20)
             }
         }
-        .background(.ultraThinMaterial)
-        .modifier(AdaptiveGlassModifier(cornerRadius: 40))
+        #if os(iOS)
+        .background(AskAIPresentationBackground())
+        #elseif os(macOS)
+        .glassEffect(
+            .regular.tint(Color(red: 0.30, green: 0.46, blue: 0.64).opacity(0.26)),
+            in: .rect(cornerRadius: 32)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.28),
+                            Color.white.opacity(0.08)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.8
+                )
+        }
+        #endif
         .onAppear {
             Task {
                 await generateAnalytics()
@@ -4091,6 +4347,7 @@ struct GlassyCommentSummary: View {
     @EnvironmentObject var appState: AppState
     // TTS state variables
     @State private var isSynthesizingSpeech: Bool = false
+    @State private var isPreparingLocalTTS: Bool = false
     @State private var isSpeakingLocally: Bool = false
     @State private var speechSynthesisError: String? = nil
     @State private var ttsCanceled: Bool = false
@@ -4116,10 +4373,10 @@ VStack(alignment: .leading, spacing: 14) {
                 
                 SummaryTTSMiniPlayer(
                     isReddit: true,
-                    playDisabled: isSynthesizingSpeech || isSpeakingLocally,
-                    stopDisabled: !isSynthesizingSpeech && !isSpeakingLocally,
+                    playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally,
+                    stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
                     localDisabled: isSynthesizingSpeech,
-                    localIsActive: isSpeakingLocally,
+                    localIsActive: isPreparingLocalTTS || isSpeakingLocally,
                     onPlay: speakSummary,
                     onStop: stopRedditSummarySpeech,
                     onLocal: speakSummaryLocally,
@@ -4130,7 +4387,7 @@ VStack(alignment: .leading, spacing: 14) {
             .padding(.horizontal, 20)
             .padding(.top, 16)
             
-            SelectableText(.init(summary.summary))
+            SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
                 .font(.body)
                 .foregroundColor(.primary)
                 .onAskAI(onAskAI)
@@ -4146,6 +4403,16 @@ VStack(alignment: .leading, spacing: 14) {
                         .scaleEffect(0.7)
                         .padding(.trailing, 5)
                     Text("Reading summary...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 20)
+            } else if isPreparingLocalTTS {
+                HStack {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                        .padding(.trailing, 5)
+                    Text("Preparing local TTS...")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -4331,6 +4598,7 @@ VStack(alignment: .leading, spacing: 14) {
         #endif
         nextAudioChunk = nil
         isSynthesizingSpeech = false
+        isPreparingLocalTTS = false
         isSpeakingLocally = false
     }
 
@@ -4409,6 +4677,7 @@ VStack(alignment: .leading, spacing: 14) {
         #endif
         nextAudioChunk = nil
         isSynthesizingSpeech = false
+        isPreparingLocalTTS = false
         isSpeakingLocally = false
     }
 
@@ -4586,10 +4855,11 @@ VStack(alignment: .leading, spacing: 14) {
                 speechSynthesisError = "MLX TTS is not available. Add the MLXAudio package and model access."
                 return
             }
-            if isSpeakingLocally {
+            if isPreparingLocalTTS || isSpeakingLocally {
                 localTTSTask?.cancel()
                 localTTSTask = nil
                 audioPlayer?.stop()
+                isPreparingLocalTTS = false
                 isSpeakingLocally = false
                 return
             }
@@ -4598,7 +4868,8 @@ VStack(alignment: .leading, spacing: 14) {
                 return
             }
             audioPlayer?.stop()
-            isSpeakingLocally = true
+            isPreparingLocalTTS = true
+            isSpeakingLocally = false
             isSynthesizingSpeech = false
             startKokoroPlaybackGlassy(
                 text: summary.summary,
@@ -4608,12 +4879,18 @@ VStack(alignment: .leading, spacing: 14) {
                 soundDelegate: soundDelegate,
                 taskStore: &localTTSTask,
                 onCompleted: {
+                    isPreparingLocalTTS = false
                     isSpeakingLocally = false
                     localTTSTask = nil
                 },
                 onError: { message in
                     speechSynthesisError = message
+                    isPreparingLocalTTS = false
                     isSpeakingLocally = false
+                },
+                onPlaybackStarted: {
+                    isPreparingLocalTTS = false
+                    isSpeakingLocally = true
                 }
             )
             return
@@ -4658,7 +4935,8 @@ VStack(alignment: .leading, spacing: 14) {
         soundDelegate: SoundDelegate,
         taskStore: inout Task<Void, Never>?,
         onCompleted: @escaping () -> Void,
-        onError: @escaping (String) -> Void
+        onError: @escaping (String) -> Void,
+        onPlaybackStarted: (() -> Void)? = nil
     ) {
         _ = soundDelegate
         taskStore?.cancel()
@@ -4730,6 +5008,7 @@ VStack(alignment: .leading, spacing: 14) {
                             onError("Failed to start audio playback.")
                             throw NSError(domain: "KokoroPlayback", code: -1)
                         }
+                        onPlaybackStarted?()
                         return player.duration
                         #endif
                     }
@@ -4738,7 +5017,10 @@ VStack(alignment: .leading, spacing: 14) {
                 enum KokoroPlaybackError: Error { case timeout }
 
                 func synthesizeWithTimeout(_ text: String) async throws -> Data {
-                    try await withThrowingTaskGroup(of: Data.self) { group in
+                    let timeoutNanoseconds: UInt64 = KokoroTTSService.shared.isModelReady
+                        ? 20_000_000_000
+                        : 120_000_000_000
+                    return try await withThrowingTaskGroup(of: Data.self) { group in
                         group.addTask {
                             try await KokoroTTSService.shared.synthesize(
                                 text: text,
@@ -4747,7 +5029,7 @@ VStack(alignment: .leading, spacing: 14) {
                             )
                         }
                         group.addTask {
-                            try await Task.sleep(nanoseconds: 20_000_000_000)
+                            try await Task.sleep(nanoseconds: timeoutNanoseconds)
                             throw KokoroPlaybackError.timeout
                         }
                         let result = try await group.next()!
@@ -4792,8 +5074,12 @@ VStack(alignment: .leading, spacing: 14) {
                     let message: String
                     if let kokoroError = error as? KokoroTTSServiceError, kokoroError == .notAvailable {
                         message = "MLX TTS is not available. Add the MLXAudio package and model access."
+                    } else if KokoroTTSService.shared.isModelLoading {
+                        message = "Local TTS is still preparing its model. Keep the app open, then try again."
+                    } else if !KokoroTTSService.shared.isModelReady {
+                        message = "Local TTS could not finish preparing its model. Please try again."
                     } else if String(describing: error).contains("timeout") {
-                        message = "Kokoro is still loading models. Please wait a moment and try again."
+                        message = "MLX TTS timed out while preparing audio. Please try again."
                     } else {
                         message = "Kokoro TTS failed: \(error.localizedDescription)"
                     }
@@ -4813,6 +5099,7 @@ struct GlassySummary: View {
 
     // TTS state variables
     @State private var isSynthesizingSpeech: Bool = false
+    @State private var isPreparingLocalTTS: Bool = false
     @State private var isSpeakingLocally: Bool = false
     @State private var speechSynthesisError: String? = nil
     @State private var ttsCanceled: Bool = false
@@ -4836,10 +5123,10 @@ VStack(alignment: .leading) {
                 Spacer()
                 SummaryTTSMiniPlayer(
                     isReddit: true,
-                    playDisabled: isSynthesizingSpeech || isSpeakingLocally,
-                    stopDisabled: !isSynthesizingSpeech && !isSpeakingLocally,
+                    playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally,
+                    stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
                     localDisabled: isSynthesizingSpeech,
-                    localIsActive: isSpeakingLocally,
+                    localIsActive: isPreparingLocalTTS || isSpeakingLocally,
                     onPlay: speakSummary,
                     onStop: stopRedditSummarySpeech,
                     onLocal: speakSummaryLocally,
@@ -4860,7 +5147,7 @@ VStack(alignment: .leading) {
             .padding(.horizontal, 20)
             .padding(.top, 16)
             
-            SelectableText(.init(summary))
+            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
                 .font(.body)
                 .foregroundColor(.primary)
                 .onAskAI(onAskAI)
@@ -4881,6 +5168,16 @@ VStack(alignment: .leading) {
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 16)
+            } else if isPreparingLocalTTS {
+                HStack {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                        .padding(.trailing, 5)
+                    Text("Preparing local TTS...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 20)
             } else if isSpeakingLocally {
                 HStack {
                     ProgressView()
@@ -5272,10 +5569,11 @@ VStack(alignment: .leading) {
                 speechSynthesisError = "MLX TTS is not available. Add the MLXAudio package and model access."
                 return
             }
-            if isSpeakingLocally {
+            if isPreparingLocalTTS || isSpeakingLocally {
                 localTTSTask?.cancel()
                 localTTSTask = nil
                 audioPlayer?.stop()
+                isPreparingLocalTTS = false
                 isSpeakingLocally = false
                 return
             }
@@ -5284,7 +5582,8 @@ VStack(alignment: .leading) {
                 return
             }
             audioPlayer?.stop()
-            isSpeakingLocally = true
+            isPreparingLocalTTS = true
+            isSpeakingLocally = false
             isSynthesizingSpeech = false
             startKokoroPlaybackGlassy(
                 text: summary,
@@ -5294,12 +5593,18 @@ VStack(alignment: .leading) {
                 soundDelegate: soundDelegate,
                 taskStore: &localTTSTask,
                 onCompleted: {
+                    isPreparingLocalTTS = false
                     isSpeakingLocally = false
                     localTTSTask = nil
                 },
                 onError: { message in
                     speechSynthesisError = message
+                    isPreparingLocalTTS = false
                     isSpeakingLocally = false
+                },
+                onPlaybackStarted: {
+                    isPreparingLocalTTS = false
+                    isSpeakingLocally = true
                 }
             )
             return
@@ -5353,7 +5658,8 @@ VStack(alignment: .leading) {
         soundDelegate: SoundDelegate,
         taskStore: inout Task<Void, Never>?,
         onCompleted: @escaping () -> Void,
-        onError: @escaping (String) -> Void
+        onError: @escaping (String) -> Void,
+        onPlaybackStarted: (() -> Void)? = nil
     ) {
         _ = soundDelegate
         taskStore?.cancel()
@@ -5425,6 +5731,7 @@ VStack(alignment: .leading) {
                             onError("Failed to start audio playback.")
                             throw NSError(domain: "KokoroPlayback", code: -1)
                         }
+                        onPlaybackStarted?()
                         return player.duration
                         #endif
                     }
@@ -5433,7 +5740,10 @@ VStack(alignment: .leading) {
                 enum KokoroPlaybackError: Error { case timeout }
 
                 func synthesizeWithTimeout(_ text: String) async throws -> Data {
-                    try await withThrowingTaskGroup(of: Data.self) { group in
+                    let timeoutNanoseconds: UInt64 = KokoroTTSService.shared.isModelReady
+                        ? 20_000_000_000
+                        : 120_000_000_000
+                    return try await withThrowingTaskGroup(of: Data.self) { group in
                         group.addTask {
                             try await KokoroTTSService.shared.synthesize(
                                 text: text,
@@ -5442,7 +5752,7 @@ VStack(alignment: .leading) {
                             )
                         }
                         group.addTask {
-                            try await Task.sleep(nanoseconds: 20_000_000_000)
+                            try await Task.sleep(nanoseconds: timeoutNanoseconds)
                             throw KokoroPlaybackError.timeout
                         }
                         let result = try await group.next()!
@@ -5487,8 +5797,12 @@ VStack(alignment: .leading) {
                     let message: String
                     if let kokoroError = error as? KokoroTTSServiceError, kokoroError == .notAvailable {
                         message = "MLX TTS is not available. Add the MLXAudio package and model access."
+                    } else if KokoroTTSService.shared.isModelLoading {
+                        message = "Local TTS is still preparing its model. Keep the app open, then try again."
+                    } else if !KokoroTTSService.shared.isModelReady {
+                        message = "Local TTS could not finish preparing its model. Please try again."
                     } else if String(describing: error).contains("timeout") {
-                        message = "Kokoro is still loading models. Please wait a moment and try again."
+                        message = "MLX TTS timed out while preparing audio. Please try again."
                     } else {
                         message = "Kokoro TTS failed: \(error.localizedDescription)"
                     }

@@ -34,6 +34,9 @@ struct AppSettings: Codable {
     var kokoroVoice: String = KokoroVoice.defaultVoice.rawValue
     var kokoroSpeed: Double = 1.0
     var kokoroPrecacheEnabled: Bool = false
+    /// Opt-in so existing RSS and Reddit installations keep their current UI
+    /// and refresh behavior until YouTube is explicitly enabled.
+    var youtubeSupportEnabled: Bool = false
 
     // Reddit OAuth fields
     var redditClientId: String = ""
@@ -186,6 +189,7 @@ struct AppSettings: Codable {
         case kokoroVoice
         case kokoroSpeed
         case kokoroPrecacheEnabled
+        case youtubeSupportEnabled
         case redditClientId
         case redditAccessToken
         case redditRefreshToken
@@ -229,6 +233,7 @@ struct AppSettings: Codable {
         kokoroVoice = try container.decodeIfPresent(String.self, forKey: .kokoroVoice) ?? KokoroVoice.defaultVoice.rawValue
         kokoroSpeed = try container.decodeIfPresent(Double.self, forKey: .kokoroSpeed) ?? 1.0
         kokoroPrecacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .kokoroPrecacheEnabled) ?? false
+        youtubeSupportEnabled = try container.decodeIfPresent(Bool.self, forKey: .youtubeSupportEnabled) ?? false
         redditClientId = try container.decodeIfPresent(String.self, forKey: .redditClientId) ?? ""
         redditAccessToken = try container.decodeIfPresent(String.self, forKey: .redditAccessToken) ?? ""
         redditRefreshToken = try container.decodeIfPresent(String.self, forKey: .redditRefreshToken) ?? ""
@@ -432,6 +437,29 @@ extension Subscription {
     var canonicalKey: String {
         "\(type.rawValue)|\(Subscription.canonicalURL(url, type: type))"
     }
+
+    /// YouTube channels remain ordinary RSS subscriptions for persistence and
+    /// cloud-sync compatibility with older builds.
+    var isYouTubeChannel: Bool {
+        youtubeChannelID != nil
+    }
+
+    var youtubeChannelID: String? {
+        guard type == .rss,
+              let components = URLComponents(string: url),
+              let host = components.host?.lowercased(),
+              host == "youtube.com" || host == "www.youtube.com",
+              components.path == "/feeds/videos.xml" else {
+            return nil
+        }
+
+        let value = components.queryItems?
+            .first(where: { $0.name == "channel_id" })?
+            .value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
 }
 
 // MARK: - Feed
@@ -496,6 +524,40 @@ struct Article: Identifiable {
         self.isFavorite = isFavorite
         self.summary = summary
     }
+}
+
+extension Article {
+    var youtubeVideoID: String? {
+        if id.hasPrefix("youtube:") {
+            let value = String(id.dropFirst("youtube:".count))
+            return value.isEmpty ? nil : value
+        }
+
+        guard let url, let host = url.host?.lowercased() else { return nil }
+        if host == "youtu.be" {
+            let value = url.pathComponents.dropFirst().first ?? ""
+            return value.isEmpty ? nil : value
+        }
+        guard host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com" else {
+            return nil
+        }
+        if url.path == "/watch" {
+            let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "v" })?
+                .value ?? ""
+            return value.isEmpty ? nil : value
+        }
+        let components = url.pathComponents.filter { $0 != "/" }
+        if let marker = components.firstIndex(where: { ["shorts", "live", "embed"].contains($0.lowercased()) }),
+           components.indices.contains(marker + 1) {
+            let value = components[marker + 1]
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    var isYouTubeVideo: Bool { youtubeVideoID != nil }
 }
 
 // MARK: - Reddit Feed

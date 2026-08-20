@@ -6,16 +6,73 @@ import AVFoundation
 import AppKit
 #endif
 
+#if os(macOS)
+private let macSettingsGlassTint = Color(red: 0.30, green: 0.46, blue: 0.64).opacity(0.16)
+
+@available(macOS 26.0, *)
+private struct MacSettingsGlassButtonStyle: ButtonStyle {
+    let prominent: Bool
+    let tintColor: Color?
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.body)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .glassEffect(
+                .regular.tint(
+                    tintColor ?? (prominent ? Color.accentColor.opacity(0.42) : macSettingsGlassTint)
+                ),
+                in: .capsule
+            )
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+private struct MacSettingsSelectorSurface: ViewModifier {
+    let isSelected: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .font(.body.weight(.semibold))
+            .foregroundStyle(isSelected ? Color.white : Color.primary)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 9)
+            .background {
+                Capsule()
+                    .fill(
+                        isSelected
+                            ? Color.accentColor.opacity(0.78)
+                            : Color(red: 0.30, green: 0.38, blue: 0.48).opacity(0.34)
+                    )
+            }
+            .overlay {
+                Capsule()
+                    .stroke(Color.black.opacity(0.38), lineWidth: 1)
+            }
+            .contentShape(Capsule())
+    }
+}
+
+private struct MacSettingsSelectorButtonStyle: ButtonStyle {
+    let isSelected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .modifier(MacSettingsSelectorSurface(isSelected: isSelected))
+            .opacity(configuration.isPressed ? 0.76 : 1)
+            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+#endif
+
 private extension View {
     @ViewBuilder
-    func settingsGlassButtonStyle(prominent: Bool = false) -> some View {
+    func settingsGlassButtonStyle(prominent: Bool = false, tintColor: Color? = nil) -> some View {
         #if os(macOS)
         if #available(macOS 26.0, *) {
-            if prominent {
-                self.buttonStyle(.glassProminent)
-            } else {
-                self.buttonStyle(.glass)
-            }
+            self.buttonStyle(MacSettingsGlassButtonStyle(prominent: prominent, tintColor: tintColor))
         } else if prominent {
             self.buttonStyle(.borderedProminent)
         } else {
@@ -27,6 +84,23 @@ private extension View {
         } else {
             self.buttonStyle(.bordered)
         }
+        #endif
+    }
+
+    @ViewBuilder
+    func settingsGlassPanel() -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            self
+                .glassEffect(
+                    .regular.tint(macSettingsGlassTint),
+                    in: .rect(cornerRadius: 40)
+                )
+        } else {
+            self.modifier(AdaptiveGlassModifier(cornerRadius: 40))
+        }
+        #else
+        self.modifier(AdaptiveGlassModifier(cornerRadius: 40))
         #endif
     }
 }
@@ -134,9 +208,13 @@ struct SettingsView: View {
     }
 
     private var settingsBackground: Color {
+        #if os(macOS)
+        return .clear
+        #else
         effectiveSettingsColorScheme == .dark
             ? Color(red: 0.05, green: 0.05, blue: 0.1)
             : AppColors.background
+        #endif
     }
 
     private func launchWebAILogin(_ provider: WebAIProvider) {
@@ -145,6 +223,69 @@ struct SettingsView: View {
             appState.openWebAILoginSession(for: provider)
         }
     }
+
+    private func summaryProviderDidChange(_ newValue: AppSettings.SummaryProvider) {
+        appState.mlxLastThroughput = ""
+        appState.mlxLastQAThroughput = ""
+        var newSettings = appState.settings
+        newSettings.selectedSummaryProvider = newValue
+        appState.updateSettings(newSettings)
+
+        if newValue != .mlxLocal && newValue != .coreAIMLXLocal {
+            Task {
+                await LiteRTLocalService.shared.unloadAllModels()
+                await MLXLocalService.shared.unloadAllModels()
+            }
+        } else {
+            Task { await appState.warmUpMLXIfNeeded() }
+        }
+    }
+
+    #if os(macOS)
+    private var macAppearanceSelector: some View {
+        HStack(spacing: 8) {
+            Button("System") { appearanceMode = 0 }
+                .buttonStyle(MacSettingsSelectorButtonStyle(isSelected: appearanceMode == 0))
+            Button("Light") { appearanceMode = 1 }
+                .buttonStyle(MacSettingsSelectorButtonStyle(isSelected: appearanceMode == 1))
+            Button("Dark") { appearanceMode = 2 }
+                .buttonStyle(MacSettingsSelectorButtonStyle(isSelected: appearanceMode == 2))
+        }
+    }
+
+    private var macSummaryProviderSelector: some View {
+        Menu {
+            ForEach(AppSettings.SummaryProvider.allCases, id: \.self) { provider in
+                Button(provider.displayName) {
+                    appState.settings.selectedSummaryProvider = provider
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Text(appState.settings.selectedSummaryProvider.displayName)
+                Image(systemName: "chevron.up.chevron.down")
+            }
+            .modifier(MacSettingsSelectorSurface(isSelected: false))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private var macWebAISelector: some View {
+        HStack(spacing: 8) {
+            ForEach(WebAIProvider.allCases) { provider in
+                Button(provider.displayName) {
+                    var newSettings = appState.settings
+                    newSettings.selectedWebAIProvider = provider
+                    appState.updateSettings(newSettings)
+                }
+                .buttonStyle(MacSettingsSelectorButtonStyle(
+                    isSelected: appState.settings.selectedWebAIProvider == provider
+                ))
+            }
+        }
+    }
+    #endif
     
     var body: some View {
         settingsNavigationContainer {
@@ -154,6 +295,10 @@ struct SettingsView: View {
                 
                 Form {
                     Section("Appearance") {
+                        #if os(macOS)
+                        macAppearanceSelector
+                            .padding(.vertical, 4)
+                        #else
                         Picker("Theme", selection: $appearanceMode) {
                             Label("System", systemImage: "circle.lefthalf.filled").tag(0)
                             Label("Light", systemImage: "sun.max.fill").tag(1)
@@ -161,9 +306,17 @@ struct SettingsView: View {
                         }
                         .pickerStyle(SegmentedPickerStyle())
                         .padding(.vertical, 4)
+                        #endif
                     }
                     
                     Section("Summary Provider") {
+                        #if os(macOS)
+                        macSummaryProviderSelector
+                            .padding(.vertical, 4)
+                            .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
+                                summaryProviderDidChange(newValue)
+                            }
+                        #else
                         Picker("Summary Source", selection: $appState.settings.selectedSummaryProvider) {
                             ForEach(AppSettings.SummaryProvider.allCases, id: \.self) { provider in
                                 Text(provider.displayName)
@@ -173,30 +326,19 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
                         .padding(.vertical, 4)
                         .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
-                            // Clear stale throughput labels immediately on provider switch
-                            appState.mlxLastThroughput = ""
-                            appState.mlxLastQAThroughput = ""
-                            var newSettings = appState.settings
-                            newSettings.selectedSummaryProvider = newValue
-                            appState.updateSettings(newSettings)
-
-                            if newValue != .mlxLocal && newValue != .coreAIMLXLocal {
-                                // Offload local models when switching to a different provider
-                                Task {
-                                    await LiteRTLocalService.shared.unloadAllModels()
-                                    await MLXLocalService.shared.unloadAllModels()
-                                }
-                            } else {
-                                // Preload and warm up when switching to a local model
-                                Task { await appState.warmUpMLXIfNeeded() }
-                            }
+                            summaryProviderDidChange(newValue)
                         }
+                        #endif
                         
                     Text(summaryProviderDescription)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .padding(.top, 4)
 
+                        #if os(macOS)
+                        macWebAISelector
+                            .padding(.top, 6)
+                        #else
                         Picker("Web AI Destination", selection: Binding(
                             get: { appState.settings.selectedWebAIProvider },
                             set: { newValue in
@@ -211,6 +353,7 @@ struct SettingsView: View {
                         }
                         .pickerStyle(.segmented)
                         .padding(.top, 6)
+                        #endif
 
                         Text(
                             appState.settings.selectedSummaryProvider == .webAI
@@ -262,13 +405,33 @@ struct SettingsView: View {
                             coreAIMLXSettingsView
                         }
 
+                        #if os(iOS)
                         if appState.settings.selectedSummaryProvider == .summarizeDaemon {
                             summarizeSettingsView
                         }
+                        #endif
 
                         if appState.settings.selectedSummaryProvider == .applePCCGateway {
                             pccGatewaySettingsView
                         }
+                }
+
+                Section("YouTube") {
+                    Toggle("YouTube Support", isOn: Binding(
+                        get: { appState.settings.youtubeSupportEnabled },
+                        set: { enabled in
+                            var newSettings = appState.settings
+                            newSettings.youtubeSupportEnabled = enabled
+                            appState.updateSettings(newSettings)
+                            if enabled {
+                                appState.refreshAllFeeds()
+                            }
+                        }
+                    ))
+
+                    Text("When enabled, search for public YouTube channels by name, subscribe through their public video feeds, play videos in the app, and use available captions for transcript-grounded summaries and Q&A. When disabled, the existing RSS and Reddit interface remains unchanged.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 Section("Cloud Sync") {
@@ -555,7 +718,7 @@ struct SettingsView: View {
                                     Text("Pre-cache MLX TTS")
                                 }
                             }
-                            .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                            .settingsGlassButtonStyle(prominent: true)
                             .disabled(isKokoroPrewarming || !KokoroTTSService.shared.isAvailable)
 
                             if kokoroPrecacheEnabled {
@@ -571,7 +734,7 @@ struct SettingsView: View {
                                     newSettings.kokoroPrecacheEnabled = false
                                     appState.updateSettings(newSettings)
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle())
+                                .settingsGlassButtonStyle()
                             }
 
                             if let status = kokoroPrewarmStatus {
@@ -661,7 +824,7 @@ struct SettingsView: View {
                             }
                         }
                         .disabled(isImporting || isExporting)
-                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .blue.opacity(0.3)))
+                        .settingsGlassButtonStyle(tintColor: .blue.opacity(0.3))
                         
                         Button(action: {
                             exportOPML()
@@ -678,7 +841,7 @@ struct SettingsView: View {
                             }
                         }
                         .disabled(isExporting || appState.subscriptions.isEmpty || isImporting)
-                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .green.opacity(0.3)))
+                        .settingsGlassButtonStyle(tintColor: .green.opacity(0.3))
                     }
 
                     Section("Cache Management") {
@@ -939,12 +1102,12 @@ struct SettingsView: View {
                         Button("Clear All Data") {
                             // Clear data action
                         }
-                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .red.opacity(0.3)))
+                        .settingsGlassButtonStyle(tintColor: .red.opacity(0.3))
 
                         Button("Reset to Defaults") {
                             // Reset action
                         }
-                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .orange.opacity(0.3)))
+                        .settingsGlassButtonStyle(tintColor: .orange.opacity(0.3))
                     }
                 }
                 .scrollContentBackground(.hidden) // Hide default form background
@@ -1042,7 +1205,7 @@ struct SettingsView: View {
         }
         .preferredColorScheme(settingsPreferredColorScheme)
         .environment(\.colorScheme, effectiveSettingsColorScheme)
-        .modifier(AdaptiveGlassModifier(cornerRadius: 40))
+        .settingsGlassPanel()
     }
 
     @ViewBuilder
@@ -1355,7 +1518,11 @@ struct SettingsView: View {
         case .webAI:
             return "Uses the selected web AI destination as the live summary provider and captures replies back into the app"
         case .summarizeDaemon:
+            #if os(macOS)
+            return "Uses the Summarize client directly with Codex gpt-5.5 on fast tier, low reasoning, and low verbosity"
+            #else
             return "Uses the local Summarize daemon with Codex gpt-5.5 on fast tier, low reasoning, and low verbosity"
+            #endif
         }
     }
 
@@ -1493,6 +1660,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var summarizeSettingsView: some View {
         VStack(alignment: .leading, spacing: 10) {
+            #if os(iOS)
             Text("Summarize Bridge")
                 .font(.subheadline)
                 .fontWeight(.semibold)
@@ -1541,7 +1709,11 @@ struct SettingsView: View {
             .autocorrectionDisabled()
             #endif
 
-            #if os(macOS)
+            #elseif os(macOS)
+            Text("Summarize Daemon")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+
             SecureField("Daemon token (Mac)", text: Binding(
                 get: { appState.settings.summarizeDaemonToken },
                 set: { appState.setSummarizeDaemonToken($0) }
@@ -1550,10 +1722,6 @@ struct SettingsView: View {
                 cornerRadius: 12,
                 tintColor: .indigo.opacity(0.3)
             ))
-
-            Text("The gateway config should use \(RSSSummarizeGatewayConfig.codexModel) with fast service tier, low reasoning, and low verbosity. The in-app model label is \(appState.settings.summarizeDaemonModel).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             #endif
 
             Button {
@@ -1675,7 +1843,7 @@ struct SettingsView: View {
                     Text("Download LiteRT Model")
                 }
             }
-            .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .blue.opacity(0.3)))
+            .settingsGlassButtonStyle(tintColor: .blue.opacity(0.3))
             .disabled(isLoadingMLXModel)
 
             if let progress = mlxDownloadProgress {
@@ -1775,7 +1943,7 @@ struct SettingsView: View {
                     Text("Download CoreAI MLX Model")
                 }
             }
-            .buttonStyle(AdaptiveLiquidGlassButtonStyle(tintColor: .blue.opacity(0.3)))
+            .settingsGlassButtonStyle(tintColor: .blue.opacity(0.3))
             .disabled(isLoadingMLXModel)
 
             if let progress = mlxDownloadProgress {

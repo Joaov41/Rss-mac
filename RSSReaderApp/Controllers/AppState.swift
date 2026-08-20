@@ -1204,6 +1204,7 @@ class AppState: ObservableObject {
     @Published var redditFeeds: [RedditFeed] = []
     @Published var selectedFeed: Feed?
     @Published var selectedRedditFeed: RedditFeed?
+    @Published private(set) var youtubeStatusMessages: [String: String] = [:]
     
     // Navigation state properties
     @Published var selectedArticle: Article?
@@ -1440,6 +1441,7 @@ class AppState: ObservableObject {
         let responseFormat: WebAIResponseFormat
         let onSuccess: (String) -> Void
         let onFailure: (String) -> Void
+        var automaticRetryCount: Int
     }
 
     private var pendingWebAIRequests: [UUID: PendingWebAIRequest] = [:]
@@ -1524,6 +1526,7 @@ class AppState: ObservableObject {
     private var globalSummaryArticles: [Article] = []
     private var globalSummaryPosts: [RedditPost] = []
     private var globalSummaryComments: [(RedditPost, [String])] = [] // Cached comments for Q&A
+    private var hasDeferredFeedRefreshForGlobalSummary = false
     // Global Q&A character limits (per item, not total count)
     // No limit on number of items - sends all articles/posts from the summary
 
@@ -1533,6 +1536,16 @@ class AppState: ObservableObject {
         globalSummaryJSON = ""
         globalSummaryComments = []
         batchPodcastSession.invalidate()
+        resumeDeferredFeedRefreshAfterGlobalSummary()
+    }
+
+    /// Keeps feed mutations from moving the open overall-summary reader.
+    /// Any number of refresh requests made while it is open collapse into one
+    /// refresh as soon as the reader is minimized or dismissed.
+    func resumeDeferredFeedRefreshAfterGlobalSummary() {
+        guard !showGlobalSummary, hasDeferredFeedRefreshForGlobalSummary else { return }
+        hasDeferredFeedRefreshForGlobalSummary = false
+        refreshAllFeeds()
     }
 
     func presentBatchPodcast() {
@@ -1701,6 +1714,8 @@ class AppState: ObservableObject {
 
     // MARK: - Services
     private let feedService: FeedService
+    private let youtubeService: YouTubeService
+    private var youtubeQuestionHistory: [String: [String]] = [:]
     let redditService: RedditService
 
     // Changed from "private var" to "internal var" so we can call it in RedditDetailView
@@ -1736,7 +1751,8 @@ class AppState: ObservableObject {
     init(feedService: FeedService? = nil,
          redditService: RedditService? = nil,
          summaryService: SummaryService? = nil,
-         persistenceManager: PersistenceManager? = nil) {
+         persistenceManager: PersistenceManager? = nil,
+         youtubeService: YouTubeService? = nil) {
         
         // 1. Initialize persistenceManager
         self.persistenceManager = persistenceManager ?? .shared
@@ -1765,6 +1781,7 @@ class AppState: ObservableObject {
 
         // 4. Initialize the other services
         self.feedService = feedService ?? FeedService()
+        self.youtubeService = youtubeService ?? .shared
         self.redditService = redditService ?? RedditService(oauthManager: self.redditOAuthManager)
 
         // 5. Initialize the shared CommentSummaryService with the same summaryService
@@ -1867,15 +1884,6 @@ class AppState: ObservableObject {
             .autoconnect()
             .sink { [weak self] _ in
                 self?.refreshAllFeeds()
-            }
-            .store(in: &cancellables)
-
-        // Clear all caches every 10 minutes to prevent stale cache issues
-        Timer.publish(every: 600, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                print("🔄 Auto-clearing caches (10-minute interval)")
-                self?.clearAllCaches()
             }
             .store(in: &cancellables)
     }
@@ -2200,7 +2208,68 @@ class AppState: ObservableObject {
     }
 
     // MARK: - Feed Management
+    private func fetchArticleFeed(for subscription: Subscription) -> AnyPublisher<Feed, Never> {
+        guard settings.youtubeSupportEnabled, subscription.isYouTubeChannel else {
+            return feedService.fetchFeed(url: subscription.url)
+        }
+
+        return Deferred { [weak self] in
+            Future<Feed, Error> { promise in
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        promise(.failure(YouTubeSupportError.channelUnavailable))
+                        return
+                    }
+                    do {
+                        let feed = try await self.youtubeService.fetchChannelFeed(urlString: subscription.url)
+                        self.youtubeStatusMessages[subscription.url] = nil
+                        promise(.success(feed))
+                    } catch {
+                        self.youtubeStatusMessages[subscription.url] = error.localizedDescription
+                        promise(.failure(error))
+                    }
+                }
+            }
+        }
+        .catch { _ in Empty<Feed, Never>() }
+        .eraseToAnyPublisher()
+    }
+
+    func searchYouTubeChannels(_ query: String) async throws -> [YouTubeChannelSearchResult] {
+        guard settings.youtubeSupportEnabled else { return [] }
+        return try await youtubeService.searchChannels(query: query)
+    }
+
+    func addYouTubeSubscription(_ channel: YouTubeChannelSearchResult) async throws {
+        guard settings.youtubeSupportEnabled else { return }
+        let subscription = Subscription(title: channel.title, url: channel.feedURL, type: .rss)
+        guard !subscriptions.contains(where: { $0.canonicalKey == subscription.canonicalKey }) else {
+            throw NSError(
+                domain: "YouTube",
+                code: 409,
+                userInfo: [NSLocalizedDescriptionKey: "You are already subscribed to this YouTube channel."]
+            )
+        }
+
+        var feed = try await youtubeService.fetchChannelFeed(urlString: channel.feedURL)
+        for index in feed.articles.indices {
+            feed.articles[index].isRead = persistenceManager.isArticleRead(feed.articles[index])
+            feed.articles[index].isFavorite = persistenceManager.isArticleFavorite(feed.articles[index].id)
+        }
+        subscriptions.append(subscription)
+        persistenceManager.saveSubscriptions(subscriptions)
+        feeds.removeAll { $0.url == channel.feedURL }
+        feeds.append(feed)
+        youtubeStatusMessages[channel.feedURL] = nil
+        scheduleUnreadCacheRebuild()
+    }
+
     func refreshAllFeeds() {
+        guard !showGlobalSummary else {
+            hasDeferredFeedRefreshForGlobalSummary = true
+            return
+        }
+
         isLoading = true
         isRefreshingFeeds = true
         let group = DispatchGroup()
@@ -2208,7 +2277,7 @@ class AppState: ObservableObject {
         // Refresh RSS feeds
         for subscription in subscriptions where subscription.type == .rss {
             group.enter()
-                feedService.fetchFeed(url: subscription.url)
+                fetchArticleFeed(for: subscription)
                     .receive(on: RunLoop.main)
                     .sink(receiveCompletion: { _ in
                     group.leave()
@@ -2513,7 +2582,7 @@ class AppState: ObservableObject {
 
         // Fetch the new feed
         if type == .rss {
-            feedService.fetchFeed(url: url)
+            fetchArticleFeed(for: subscription)
                 .receive(on: RunLoop.main)
                 .sink(receiveCompletion: { _ in },
                       receiveValue: { [weak self] feed in
@@ -2825,7 +2894,8 @@ class AppState: ObservableObject {
             prompt: trimmed,
             responseFormat: responseFormat,
             onSuccess: onSuccess,
-            onFailure: onFailure
+            onFailure: onFailure,
+            automaticRetryCount: 0
         )
         if activeWebAIHandoffRequest == nil && !isWebAIBatchHandoffInProgress {
             isWebAIHandoffMinimized = request.shouldStartMinimized
@@ -2846,6 +2916,47 @@ class AppState: ObservableObject {
             normalized.contains("couldn't load content") ||
             normalized.contains("unable to load content") ||
             (normalized.contains("something went wrong") && normalized.contains("1096"))
+    }
+
+    private func isRecoverableWebAIRequestFailure(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return normalized.contains("content failed to load") ||
+            normalized.contains("could not load") ||
+            normalized.contains("couldn't load") ||
+            normalized.contains("unable to load") ||
+            normalized.contains("message box") ||
+            normalized.contains("composer") ||
+            normalized.contains("automatic response capture") ||
+            normalized.contains("web process terminated") ||
+            normalized.contains("something went wrong")
+    }
+
+    private func retryWebAIRequestIfPossible(
+        failedRequest: WebAIHandoffRequest,
+        pending: inout PendingWebAIRequest,
+        message: String
+    ) -> Bool {
+        guard failedRequest.shouldAutoCapture,
+              pending.automaticRetryCount == 0,
+              isRecoverableWebAIRequestFailure(message) else {
+            return false
+        }
+
+        let retryRequest = WebAIHandoffRequest(
+            provider: failedRequest.provider,
+            title: failedRequest.title,
+            prompt: failedRequest.prompt,
+            responseFormat: failedRequest.responseFormat,
+            shouldAutoCapture: true,
+            shouldStartMinimized: failedRequest.shouldStartMinimized
+        )
+
+        pending.automaticRetryCount += 1
+        pendingWebAIRequests[retryRequest.id] = pending
+        isWebAIHandoffMinimized = retryRequest.shouldStartMinimized
+        activeWebAIHandoffRequest = retryRequest
+        showWebAIStatus("\(failedRequest.provider.displayName) is retrying with a fresh page.")
+        return true
     }
 
     private func normalizedWebAIComparisonText(_ text: String) -> String {
@@ -2890,7 +3001,10 @@ class AppState: ObservableObject {
     }
 
     func handleCapturedWebAIResponse(requestID: UUID, response: String) {
-        guard let pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+        guard var pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+        let completedRequest = activeWebAIHandoffRequest?.id == requestID
+            ? activeWebAIHandoffRequest
+            : nil
 
         if activeWebAIHandoffRequest?.id == requestID {
             activeWebAIHandoffRequest = nil
@@ -2903,7 +3017,16 @@ class AppState: ObservableObject {
         }
 
         guard !isWebAIContentLoadFailureResponse(cleaned) else {
-            pending.onFailure("\(settings.selectedWebAIProvider.displayName) could not load the response. Try again.")
+            let message = "\(pending.provider.displayName) content failed to load."
+            if let failedRequest = completedRequest,
+               retryWebAIRequestIfPossible(
+                   failedRequest: failedRequest,
+                   pending: &pending,
+                   message: message
+               ) {
+                return
+            }
+            pending.onFailure(message)
             return
         }
 
@@ -2918,7 +3041,17 @@ class AppState: ObservableObject {
     }
 
     func handleWebAIRequestFailure(requestID: UUID, message: String, dismissPanel: Bool = false) {
-        guard let pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+        guard var pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+
+        if let failedRequest = activeWebAIHandoffRequest,
+           failedRequest.id == requestID,
+           retryWebAIRequestIfPossible(
+               failedRequest: failedRequest,
+               pending: &pending,
+               message: message
+           ) {
+            return
+        }
 
         if activeWebAIHandoffRequest?.id == requestID {
             isWebAIHandoffMinimized = false
@@ -3859,9 +3992,184 @@ class AppState: ObservableObject {
 
         return words.prefix(maxWords).joined(separator: " ")
     }
+
+    private func generateYouTubeText(prompt: String, title: String) async throws -> String {
+        if settings.selectedSummaryProvider == .webAI {
+            return try await performWebAIRequestAsync(
+                title: title,
+                prompt: prompt,
+                responseFormat: .plainText
+            )
+        }
+        return try await generateBatchPodcastText(
+            prompt: prompt,
+            title: title,
+            provider: settings.selectedSummaryProvider
+        )
+    }
+
+    private func requestYouTubeSummary(for article: Article) {
+        guard let videoID = article.youtubeVideoID else {
+            finishSummary(article: article, redditPost: nil)
+            isLoading = false
+            return
+        }
+
+        youtubeStatusMessages[videoID] = "Retrieving the video transcript…"
+        Task(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let transcript = try await self.youtubeService.transcript(videoID: videoID)
+                let chunks = YouTubeTranscriptProcessor.chunks(from: transcript)
+                guard !chunks.isEmpty else { throw YouTubeSupportError.transcriptUnavailable }
+
+                var notes: [String] = []
+                notes.reserveCapacity(chunks.count)
+                for (offset, chunk) in chunks.enumerated() {
+                    self.youtubeStatusMessages[videoID] = "Analyzing transcript section \(offset + 1) of \(chunks.count)…"
+                    let prompt = """
+                    You are preparing grounded notes for a summary of the YouTube video “\(article.title)”.
+
+                    Use ONLY the timestamped transcript excerpt below. Capture the speaker's claims, reasoning, examples, and conclusions. Preserve the timestamp label for every important point. Do not use the title or description as evidence and do not add outside knowledge.
+
+                    TRANSCRIPT EXCERPT
+                    \(chunk.timestampLabel) \(chunk.text)
+
+                    Return concise plain-text notes.
+                    """
+                    notes.append(try await self.generateYouTubeText(
+                        prompt: prompt,
+                        title: "YouTube Transcript \(offset + 1)/\(chunks.count)"
+                    ))
+                }
+
+                var reducedNotes = notes
+                while reducedNotes.joined(separator: "\n\n").count > 14_000, reducedNotes.count > 1 {
+                    var next: [String] = []
+                    for groupStart in stride(from: 0, to: reducedNotes.count, by: 4) {
+                        let group = Array(reducedNotes[groupStart..<min(groupStart + 4, reducedNotes.count)])
+                        let prompt = """
+                        Condense these transcript-grounded notes without dropping distinct claims, examples, conclusions, or timestamp references. Use only the notes supplied.
+
+                        \(group.joined(separator: "\n\n"))
+                        """
+                        next.append(try await self.generateYouTubeText(
+                            prompt: prompt,
+                            title: "YouTube Summary Reduction"
+                        ))
+                    }
+                    reducedNotes = next
+                }
+
+                self.youtubeStatusMessages[videoID] = "Writing the grounded video summary…"
+                let finalPrompt = """
+                Write a clear summary of the actual spoken content of the YouTube video “\(article.title)” using ONLY the transcript-grounded notes below.
+
+                Requirements:
+                - Explain the main argument or subject, key supporting points, important examples, and conclusions.
+                - Do not treat the video title, description, comments, or outside knowledge as evidence.
+                - Retain useful timestamp references in square brackets.
+                - If the transcript itself is ambiguous, say so rather than guessing.
+                - Return readable plain text, not JSON.
+
+                TRANSCRIPT-GROUNDED NOTES
+                \(reducedNotes.joined(separator: "\n\n"))
+                """
+                let summary = try await self.generateYouTubeText(
+                    prompt: finalPrompt,
+                    title: "YouTube Video Summary"
+                )
+                self.youtubeStatusMessages[videoID] = nil
+                self.updateArticleSummaryFromCloud(article, summary: summary)
+                self.isLoading = false
+            } catch {
+                self.youtubeStatusMessages[videoID] = error.localizedDescription
+                self.finishSummary(article: article, redditPost: nil)
+                self.isLoading = false
+            }
+        }
+    }
+
+    private func askQuestionAboutYouTubeVideo(
+        article: Article,
+        question: String,
+        completion: @escaping (String) -> Void
+    ) {
+        guard let videoID = article.youtubeVideoID else {
+            completion(YouTubeSupportError.videoUnavailable.localizedDescription)
+            return
+        }
+        let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuestion.isEmpty else {
+            completion("Enter a question about the video.")
+            return
+        }
+
+        isLoading = true
+        youtubeStatusMessages[videoID] = "Finding relevant transcript sections…"
+        Task(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let transcript = try await self.youtubeService.transcript(videoID: videoID)
+                let allChunks = YouTubeTranscriptProcessor.chunks(from: transcript)
+                let earlierQuestions = self.youtubeQuestionHistory[videoID, default: []].suffix(2)
+                let retrievalQuery = ([trimmedQuestion] + Array(earlierQuestions)).joined(separator: " ")
+                let evidenceChunks = YouTubeTranscriptProcessor.relevantChunks(for: retrievalQuery, in: allChunks)
+                guard !evidenceChunks.isEmpty else { throw YouTubeSupportError.transcriptUnavailable }
+
+                let conversationContext = earlierQuestions.isEmpty
+                    ? "No earlier questions."
+                    : earlierQuestions.enumerated()
+                        .map { "Earlier question \($0.offset + 1): \($0.element)" }
+                        .joined(separator: "\n")
+                let prompt = """
+                Answer the user's question about the YouTube video “\(article.title)” using ONLY the timestamped transcript evidence below.
+
+                Rules:
+                - Do not use the video title, description, comments, or outside knowledge as evidence.
+                - Cite supporting timestamps in square brackets.
+                - If the evidence does not support an answer, reply exactly: “I couldn't find that in the available video transcript.”
+                - Earlier questions are supplied only to understand follow-up wording; they are not evidence.
+                - Return plain text, not JSON.
+
+                \(conversationContext)
+
+                TRANSCRIPT EVIDENCE
+                \(YouTubeTranscriptProcessor.evidenceText(evidenceChunks))
+
+                USER QUESTION
+                \(trimmedQuestion)
+                """
+                self.youtubeStatusMessages[videoID] = "Answering from the transcript…"
+                let answer = try await self.generateYouTubeText(
+                    prompt: prompt,
+                    title: "YouTube Video Q&A"
+                )
+                var history = self.youtubeQuestionHistory[videoID, default: []]
+                history.append(trimmedQuestion)
+                self.youtubeQuestionHistory[videoID] = Array(history.suffix(8))
+                self.youtubeStatusMessages[videoID] = nil
+                self.isLoading = false
+                completion(answer)
+            } catch {
+                self.youtubeStatusMessages[videoID] = error.localizedDescription
+                self.isLoading = false
+                completion(error.localizedDescription)
+            }
+        }
+    }
     
     // MARK: - Unified Summary Request Handler
     func requestSummary(for article: Article? = nil, redditPost: RedditPost? = nil, redditComments: [RedditCommentModel] = []) {
+        if let article,
+           settings.youtubeSupportEnabled,
+           article.isYouTubeVideo {
+            isLoading = true
+            beginSummary(article: article, redditPost: nil)
+            requestYouTubeSummary(for: article)
+            return
+        }
+
         if article != nil || redditPost != nil {
             isLoading = true
         }
@@ -6033,14 +6341,6 @@ class AppState: ObservableObject {
         }
         #endif
 
-        #if canImport(WebKit)
-        group.enter()
-        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: Date(timeIntervalSince1970: 0)) {
-            print("🗑️ AppState: Cleared WebKit website data")
-            group.leave()
-        }
-        #endif
-
         clearTemporaryDirectory()
 
         group.notify(queue: .main) {
@@ -6600,32 +6900,39 @@ class AppState: ObservableObject {
     
     // MARK: - Mark All as Read
     func markAllUnreadAsRead() {
-        var markedAny = false
-        // Mark all unread RSS articles as read
-        for feedIndex in 0..<feeds.count {
-            for articleIndex in 0..<feeds[feedIndex].articles.count {
-                if !feeds[feedIndex].articles[articleIndex].isRead {
-                    feeds[feedIndex].articles[articleIndex].isRead = true
-                    persistenceManager.markArticleAsRead(feeds[feedIndex].articles[articleIndex])
-                    markedAny = true
+        var updatedFeeds = feeds
+        var articlesToPersist: [Article] = []
+        for feedIndex in updatedFeeds.indices {
+            for articleIndex in updatedFeeds[feedIndex].articles.indices {
+                if !updatedFeeds[feedIndex].articles[articleIndex].isRead {
+                    updatedFeeds[feedIndex].articles[articleIndex].isRead = true
+                    articlesToPersist.append(updatedFeeds[feedIndex].articles[articleIndex])
                 }
             }
         }
-        
-        // Mark all unread Reddit posts as read
-        for feedIndex in 0..<redditFeeds.count {
-            for postIndex in 0..<redditFeeds[feedIndex].posts.count {
-                if !redditFeeds[feedIndex].posts[postIndex].isRead {
-                    redditFeeds[feedIndex].posts[postIndex].isRead = true
-                    persistenceManager.markRedditPostAsRead(redditFeeds[feedIndex].posts[postIndex])
-                    markedAny = true
+
+        var updatedRedditFeeds = redditFeeds
+        var postsToPersist: [RedditPost] = []
+        for feedIndex in updatedRedditFeeds.indices {
+            for postIndex in updatedRedditFeeds[feedIndex].posts.indices {
+                if !updatedRedditFeeds[feedIndex].posts[postIndex].isRead {
+                    updatedRedditFeeds[feedIndex].posts[postIndex].isRead = true
+                    postsToPersist.append(updatedRedditFeeds[feedIndex].posts[postIndex])
                 }
             }
         }
-        
-        // Log action
-        print("📱 AppState: Marked all unread items as read")
-        if markedAny {
+
+        if !articlesToPersist.isEmpty {
+            feeds = updatedFeeds
+            persistenceManager.markArticlesAsRead(articlesToPersist)
+        }
+        if !postsToPersist.isEmpty {
+            redditFeeds = updatedRedditFeeds
+            persistenceManager.markRedditPostsAsRead(postsToPersist)
+        }
+
+        print("📱 AppState: Marked \(articlesToPersist.count) articles and \(postsToPersist.count) Reddit posts as read")
+        if !articlesToPersist.isEmpty || !postsToPersist.isEmpty {
             scheduleUnreadCacheRebuild()
         }
     }
@@ -6633,22 +6940,19 @@ class AppState: ObservableObject {
     func markAllArticlesAsRead(for feedURL: String) {
         guard let feedIndex = feeds.firstIndex(where: { $0.url == feedURL }) else { return }
 
-        var markedCount = 0
-        for articleIndex in 0..<feeds[feedIndex].articles.count {
-            if !feeds[feedIndex].articles[articleIndex].isRead {
-                feeds[feedIndex].articles[articleIndex].isRead = true
-                persistenceManager.markArticleAsRead(feeds[feedIndex].articles[articleIndex])
-                markedCount += 1
+        var updatedFeed = feeds[feedIndex]
+        var articlesToPersist: [Article] = []
+        for articleIndex in updatedFeed.articles.indices {
+            if !updatedFeed.articles[articleIndex].isRead {
+                updatedFeed.articles[articleIndex].isRead = true
+                articlesToPersist.append(updatedFeed.articles[articleIndex])
             }
         }
 
-        if markedCount > 0 {
-            print("📱 AppState: Marked \(markedCount) articles as read for feed \(feedURL)")
-
-            // Force SwiftUI to detect the change by reassigning the array
-            // This ensures the subscription list badge updates immediately
-            let updatedFeeds = feeds
-            feeds = updatedFeeds
+        if !articlesToPersist.isEmpty {
+            feeds[feedIndex] = updatedFeed
+            persistenceManager.markArticlesAsRead(articlesToPersist)
+            print("📱 AppState: Marked \(articlesToPersist.count) articles as read for feed \(feedURL)")
             scheduleUnreadCacheRebuild()
         }
     }
@@ -6656,22 +6960,19 @@ class AppState: ObservableObject {
     func markAllRedditPostsAsRead(for subreddit: String) {
         guard let feedIndex = redditFeeds.firstIndex(where: { $0.subreddit == subreddit }) else { return }
 
-        var markedCount = 0
-        for postIndex in 0..<redditFeeds[feedIndex].posts.count {
-            if !redditFeeds[feedIndex].posts[postIndex].isRead {
-                redditFeeds[feedIndex].posts[postIndex].isRead = true
-                persistenceManager.markRedditPostAsRead(redditFeeds[feedIndex].posts[postIndex])
-                markedCount += 1
+        var updatedFeed = redditFeeds[feedIndex]
+        var postsToPersist: [RedditPost] = []
+        for postIndex in updatedFeed.posts.indices {
+            if !updatedFeed.posts[postIndex].isRead {
+                updatedFeed.posts[postIndex].isRead = true
+                postsToPersist.append(updatedFeed.posts[postIndex])
             }
         }
 
-        if markedCount > 0 {
-            print("📱 AppState: Marked \(markedCount) Reddit posts as read for r/\(subreddit)")
-
-            // Force SwiftUI to detect the change by reassigning the array
-            // This ensures the subscription list badge updates immediately
-            let updatedFeeds = redditFeeds
-            redditFeeds = updatedFeeds
+        if !postsToPersist.isEmpty {
+            redditFeeds[feedIndex] = updatedFeed
+            persistenceManager.markRedditPostsAsRead(postsToPersist)
+            print("📱 AppState: Marked \(postsToPersist.count) Reddit posts as read for r/\(subreddit)")
             scheduleUnreadCacheRebuild()
         }
     }
@@ -6997,6 +7298,15 @@ class AppState: ObservableObject {
                 return
             }
             completion(self.cleanAndFormatQATextForDisplay(answer))
+        }
+
+        if settings.youtubeSupportEnabled, article.isYouTubeVideo {
+            askQuestionAboutYouTubeVideo(
+                article: article,
+                question: question,
+                completion: cleanedCompletion
+            )
+            return
         }
 
         if settings.selectedSummaryProvider == .webAI {

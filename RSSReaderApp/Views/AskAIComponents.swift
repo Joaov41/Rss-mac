@@ -11,6 +11,131 @@ enum AskAISelectionAction {
     case web
 }
 
+private let conversationalMarkdownParagraphMarker = "\u{E000}"
+private let conversationalMarkdownParagraphSeparator = "\n\n\(conversationalMarkdownParagraphMarker)\n\n"
+
+/// Preserve Markdown block syntax while making provider-supplied prose line
+/// breaks visible in the native macOS text view.
+func normalizeAIReplyMarkdown(_ input: String) -> String {
+    let normalizedNewlines = input
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+    let lines = normalizedNewlines.components(separatedBy: "\n")
+    guard lines.count > 1 else { return normalizedNewlines }
+
+    func matches(_ line: String, _ pattern: String) -> Bool {
+        line.range(of: pattern, options: .regularExpression) != nil
+    }
+    func isFence(_ line: String) -> Bool {
+        matches(line, #"^\s{0,3}(?:```|~~~)"#)
+    }
+    func isBlockSyntax(at index: Int) -> Bool {
+        let line = lines[index]
+        if matches(line, #"^\s*(?:[-+*]|\d+[.)])\s+|^\s*>|^\s{0,3}#{1,6}(?:\s|$)"#) {
+            return true
+        }
+        if matches(line, #"^\s{0,3}(?:\*\s*){3,}$|^\s{0,3}(?:-\s*){3,}$|^\s{0,3}(?:_\s*){3,}$"#) {
+            return true
+        }
+        guard line.contains("|") else { return false }
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if matches(trimmed, #"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$"#) {
+            return true
+        }
+        let previous = index > 0 ? lines[index - 1].trimmingCharacters(in: .whitespaces) : ""
+        let next = index + 1 < lines.count ? lines[index + 1].trimmingCharacters(in: .whitespaces) : ""
+        return previous.contains("|") && next.contains("|")
+    }
+
+    var result: [String] = []
+    result.reserveCapacity(lines.count * 2)
+    var insideFence = false
+
+    for index in lines.indices {
+        let line = lines[index]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if isFence(line) {
+            result.append(line)
+            insideFence.toggle()
+        } else if insideFence || trimmed.isEmpty || result.last?.isEmpty == true || index == lines.startIndex {
+            result.append(line)
+        } else {
+            let previousIndex = index - 1
+            let hasExplicitHardBreak = lines[previousIndex].hasSuffix("\\") || lines[previousIndex].hasSuffix("  ")
+            if !isBlockSyntax(at: previousIndex) && !isBlockSyntax(at: index) && !hasExplicitHardBreak {
+                result.append("")
+            }
+            result.append(line)
+        }
+    }
+    return result.joined(separator: "\n")
+}
+
+/// Recover paragraph boundaries from dense conversational provider output.
+func normalizeConversationalAIReplyMarkdown(_ input: String) -> String {
+    let normalized = normalizeAIReplyMarkdown(input)
+    let value = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return normalized }
+
+    // This helper is intentionally used at both the feature boundary and the
+    // shared selectable Markdown renderer. Do not expand paragraph markers a
+    // second time, or each rendering pass multiplies the blank-line spacing.
+    if value.contains(conversationalMarkdownParagraphMarker) {
+        return normalized
+    }
+
+    if value.contains("\n") {
+        let boundaries = value.replacingOccurrences(
+            of: #"\n[ \t]*\n+"#, with: "\n\n", options: .regularExpression
+        )
+        return boundaries.replacingOccurrences(of: "\n\n", with: conversationalMarkdownParagraphSeparator)
+    }
+
+    let startsWithBlockSyntax = value.range(
+        of: #"^(?:\s{0,3}#{1,6}(?:\s|$)|\s*(?:[-+*]|\d+[.)])\s+|\s*>|\s*\|)"#,
+        options: .regularExpression
+    ) != nil
+    guard !startsWithBlockSyntax, !value.contains("`"), !value.contains("~~~"), !value.contains("|") else {
+        return normalized
+    }
+
+    let recoveredValue = value.replacingOccurrences(
+        of: #"([.!?])([\"'”’]?[A-Z][a-z])"#,
+        with: "$1 $2",
+        options: .regularExpression
+    )
+
+    var sentences: [String] = []
+    recoveredValue.enumerateSubstrings(
+        in: recoveredValue.startIndex..<recoveredValue.endIndex,
+        options: .bySentences
+    ) { substring, _, _, _ in
+        if let sentence = substring?.trimmingCharacters(in: .whitespacesAndNewlines), !sentence.isEmpty {
+            sentences.append(sentence)
+        }
+    }
+    guard sentences.count > 1 else { return recoveredValue }
+    if sentences.count == 2, recoveredValue.count < 600 { return recoveredValue }
+    if sentences.count >= 3, recoveredValue.count < 260 { return recoveredValue }
+
+    let desiredParagraphs = max(2, Int(ceil(Double(recoveredValue.count) / 420.0)))
+    let maximumParagraphs = max(2, sentences.count / 2)
+    let paragraphCount = min(desiredParagraphs, min(maximumParagraphs, sentences.count))
+    guard paragraphCount > 1 else { return recoveredValue }
+
+    var paragraphs: [String] = []
+    var sentenceIndex = 0
+    for paragraphIndex in 0..<paragraphCount {
+        let remainingSentences = sentences.count - sentenceIndex
+        let remainingParagraphs = paragraphCount - paragraphIndex
+        let count = Int(ceil(Double(remainingSentences) / Double(remainingParagraphs)))
+        let endIndex = min(sentenceIndex + count, sentences.count)
+        paragraphs.append(sentences[sentenceIndex..<endIndex].joined(separator: " "))
+        sentenceIndex = endIndex
+    }
+    return paragraphs.joined(separator: conversationalMarkdownParagraphSeparator)
+}
+
 private func splitDenseAskAISingleSentence(_ text: String) -> [String] {
     func cleanedParts(from marked: String) -> [String] {
         marked
@@ -116,6 +241,7 @@ private let macAskAIPanelTint = Color(red: 0.30, green: 0.46, blue: 0.64).opacit
 struct AskAIResponseSheet: View {
     let isLoading: Bool
     let response: String?
+    var markdownResponse: String? = nil
     let errorMessage: String?
     let onClose: () -> Void
     let onCopy: () -> Void
@@ -123,6 +249,7 @@ struct AskAIResponseSheet: View {
     @EnvironmentObject private var appState: AppState
     @State private var isAskingFollowUp = false
     @State private var followUpResponse: String?
+    @State private var followUpMarkdownResponse: String?
     @State private var showFollowUpSheet = false
 
     var body: some View {
@@ -132,6 +259,7 @@ struct AskAIResponseSheet: View {
                 AskAIResponseSheet(
                     isLoading: false,
                     response: followUpResponse,
+                    markdownResponse: followUpMarkdownResponse,
                     errorMessage: nil,
                     onClose: {
                         showFollowUpSheet = false
@@ -240,7 +368,11 @@ struct AskAIResponseSheet: View {
 
             if let response {
                 ScrollView {
-                    SelectableText(formatAskAIResponseForDisplay(response))
+                    SelectableText(
+                        formatAskAIResponseForDisplay(response),
+                        markdownText: markdownResponse ?? normalizeConversationalAIReplyMarkdown(formatAskAIResponseForDisplay(response)),
+                        normalizesMarkdownParagraphs: markdownResponse != nil
+                    )
                         .font(.body)
                         .onAskAI {
                             askFollowUp(selectedText: $0, currentAnswer: response, useWebAI: false)
@@ -307,10 +439,12 @@ struct AskAIResponseSheet: View {
         """
 
         followUpResponse = nil
+        followUpMarkdownResponse = nil
         isAskingFollowUp = true
 
         let completion: (String) -> Void = { answer in
             DispatchQueue.main.async {
+                followUpMarkdownResponse = useWebAI ? answer : nil
                 followUpResponse = formatAskAIResponseForDisplay(answer)
                 isAskingFollowUp = false
                 showFollowUpSheet = true
@@ -400,6 +534,8 @@ extension EnvironmentValues {
 // MARK: - SelectableText
 struct SelectableText: View {
     let text: String
+    var markdownText: String? = nil
+    var normalizesMarkdownParagraphs: Bool = true
     var font: Font = .body
     var fontWeight: Font.Weight? = nil
     var foregroundColor: Color = .primary
@@ -418,12 +554,19 @@ struct SelectableText: View {
     @Environment(\.askAISelectionHandler) private var askAISelectionHandler
     @Environment(\.askAIWebSelectionHandler) private var askAIWebSelectionHandler
 
-    init(_ text: String) {
+    init(
+        _ text: String,
+        markdownText: String? = nil,
+        normalizesMarkdownParagraphs: Bool = true
+    ) {
         self.text = text
+        self.markdownText = markdownText
+        self.normalizesMarkdownParagraphs = normalizesMarkdownParagraphs
     }
 
     init(_ attributedString: AttributedString) {
         self.text = String(attributedString.characters)
+        self.markdownText = nil
     }
 
     var body: some View {
@@ -445,6 +588,8 @@ struct SelectableText: View {
         #elseif os(macOS)
         MacSelectableTextRepresentable(
             text: text,
+            markdownText: markdownText,
+            normalizesMarkdownParagraphs: normalizesMarkdownParagraphs,
             font: font,
             fontWeight: fontWeight,
             foregroundColor: foregroundColor,
@@ -778,6 +923,7 @@ final class AskAISelectableTextView: NSTextView {
     var onAskAIWeb: ((String) -> Void)?
     fileprivate var renderSignature: Int = 0
     fileprivate var lastRenderedText: String = ""
+    fileprivate var lastRenderedMarkdownText: String?
 
     override var intrinsicContentSize: NSSize {
         guard let textContainer, let layoutManager else {
@@ -831,6 +977,8 @@ final class AskAISelectableTextView: NSTextView {
 
 struct MacSelectableTextRepresentable: NSViewRepresentable {
     let text: String
+    let markdownText: String?
+    let normalizesMarkdownParagraphs: Bool
     let font: Font
     let fontWeight: Font.Weight?
     let foregroundColor: Color
@@ -869,7 +1017,7 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         let textView = AskAISelectableTextView()
         textView.isEditable = false
         textView.isSelectable = true
-        textView.isRichText = false
+        textView.isRichText = true
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
@@ -995,6 +1143,15 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
 
         var hasher = Hasher()
         hasher.combine(text)
+        let normalizedMarkdown = markdownText
+            .map { value in
+                normalizesMarkdownParagraphs
+                    ? normalizeConversationalAIReplyMarkdown(value)
+                    : value
+            }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        hasher.combine(normalizedMarkdown ?? "")
+        hasher.combine(normalizesMarkdownParagraphs)
         hasher.combine(fontKey)
         hasher.combine(weightKey)
         hasher.combine(finalFont.pointSize)
@@ -1008,8 +1165,32 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         hasher.combine(summaryReferenceCount)
         let signature = hasher.finalize()
 
-        if nsView.lastRenderedText != text || nsView.renderSignature != signature {
-            let attributedText = NSMutableAttributedString(string: text, attributes: attributes)
+        if nsView.lastRenderedText != text
+            || nsView.lastRenderedMarkdownText != normalizedMarkdown
+            || nsView.renderSignature != signature {
+            let attributedText: NSMutableAttributedString
+            if let normalizedMarkdown, !normalizedMarkdown.isEmpty,
+               let parsed = try? AttributedString(
+                   markdown: normalizedMarkdown,
+                   options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+               ) {
+                attributedText = NSMutableAttributedString(attributedString: NSAttributedString(parsed))
+                attributedText.mutableString.replaceOccurrences(
+                    of: conversationalMarkdownParagraphMarker,
+                    with: "\n\n",
+                    range: NSRange(location: 0, length: attributedText.length)
+                )
+                applyBaseAttributes(to: attributedText, fallbackAttributes: attributes)
+            } else {
+                attributedText = NSMutableAttributedString(string: text, attributes: attributes)
+            }
+            if underline, attributedText.length > 0 {
+                attributedText.addAttribute(
+                    .underlineStyle,
+                    value: NSUnderlineStyle.single.rawValue,
+                    range: NSRange(location: 0, length: attributedText.length)
+                )
+            }
             applySummaryReferenceLinks(
                 to: attributedText,
                 text: text,
@@ -1026,8 +1207,24 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             }
 
             nsView.lastRenderedText = text
+            nsView.lastRenderedMarkdownText = normalizedMarkdown
             nsView.renderSignature = signature
             nsView.invalidateIntrinsicContentSize()
+        }
+    }
+
+    private func applyBaseAttributes(
+        to attributedText: NSMutableAttributedString,
+        fallbackAttributes: [NSAttributedString.Key: Any]
+    ) {
+        let fullRange = NSRange(location: 0, length: attributedText.length)
+        guard fullRange.length > 0 else { return }
+        attributedText.enumerateAttributes(in: fullRange) { current, range, _ in
+            var additions: [NSAttributedString.Key: Any] = [:]
+            if current[.font] == nil { additions[.font] = fallbackAttributes[.font] }
+            if current[.foregroundColor] == nil { additions[.foregroundColor] = fallbackAttributes[.foregroundColor] }
+            if current[.paragraphStyle] == nil { additions[.paragraphStyle] = fallbackAttributes[.paragraphStyle] }
+            if !additions.isEmpty { attributedText.addAttributes(additions, range: range) }
         }
     }
 
@@ -1038,28 +1235,41 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         baseFont: NSFont
     ) {
         guard maximumReference > 0, !text.isEmpty else { return }
-        let phrasePattern = #"\b(?:post|posts|article|articles|item|items)\s+\d+(?:\s*(?:,|\band\b|&)\s*(?:(?:post|posts|article|articles|item|items)\s+)?\d+)*"#
+        let referenceToken = #"(?:#\s*)?(?:\[\s*)?\d+(?:\s*\])?"#
+        let phrasePattern = #"\b(?:post|posts|article|articles|item|items)\s+\#(referenceToken)(?:\s*(?:,|\band\b|&)\s*(?:(?:post|posts|article|articles|item|items)\s+)?\#(referenceToken))*"#
         guard let phraseRegex = try? NSRegularExpression(pattern: phrasePattern, options: [.caseInsensitive]),
-              let numberRegex = try? NSRegularExpression(pattern: #"\d+"#) else { return }
+              let numberRegex = try? NSRegularExpression(pattern: #"\d+"#),
+              let bracketRegex = try? NSRegularExpression(pattern: #"[\[\(]\s*#?(\d+)\s*[\]\)]"#) else { return }
 
         let source = text as NSString
         let sourceRange = NSRange(location: 0, length: source.length)
+        func applyReferenceLink(numberRange: NSRange) {
+            guard NSMaxRange(numberRange) <= attributedText.length else { return }
+            let number = Int(source.substring(with: numberRange)) ?? 0
+            guard (1...maximumReference).contains(number),
+                  let destination = URL(string: "rssreader-summary://item/\(number)") else { return }
+            attributedText.addAttributes(
+                [
+                    .link: destination,
+                    .foregroundColor: NSColor.linkColor,
+                    .backgroundColor: NSColor.linkColor.withAlphaComponent(0.16),
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
+                ],
+                range: numberRange
+            )
+        }
+
         for phraseMatch in phraseRegex.matches(in: text, range: sourceRange) {
             for numberMatch in numberRegex.matches(in: text, range: phraseMatch.range) {
-                let number = Int(source.substring(with: numberMatch.range)) ?? 0
-                guard (1...maximumReference).contains(number),
-                      let destination = URL(string: "rssreader-summary://item/\(number)") else { continue }
-                attributedText.addAttributes(
-                    [
-                        .link: destination,
-                        .foregroundColor: NSColor.linkColor,
-                        .backgroundColor: NSColor.linkColor.withAlphaComponent(0.16),
-                        .underlineStyle: NSUnderlineStyle.single.rawValue,
-                        .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
-                    ],
-                    range: numberMatch.range
-                )
+                applyReferenceLink(numberRange: numberMatch.range)
             }
+        }
+
+        for bracketMatch in bracketRegex.matches(in: text, range: sourceRange) {
+            let numberRange = bracketMatch.range(at: 1)
+            guard numberRange.location != NSNotFound else { continue }
+            applyReferenceLink(numberRange: numberRange)
         }
     }
 }
