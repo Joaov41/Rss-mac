@@ -1108,7 +1108,7 @@ struct AppColors {
 
     static func feedListCardFill(for colorScheme: ColorScheme) -> Color {
         if colorScheme == .dark {
-            return Color(red: 0.075, green: 0.105, blue: 0.150).opacity(0.82)
+            return Color(red: 0.125, green: 0.172, blue: 0.243).opacity(0.85)
         }
         return systemGray6
     }
