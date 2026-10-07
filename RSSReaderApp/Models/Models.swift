@@ -81,7 +81,7 @@ struct AppSettings: Codable {
         }
 
         /// Providers kept in code but not offered in Settings.
-        static let hiddenCases: Set<SummaryProvider> = []
+        static let hiddenCases: Set<SummaryProvider> = [.summarizeDaemon, .applePCCGateway]
 
         /// Providers offered in pickers; ChatGPT Plan only in builds installed from Xcode.
         static var selectableCases: [SummaryProvider] {

@@ -71,7 +71,10 @@ extension CloudKitSyncManager {
 @main struct Probe {
     static func main() throws {
         let legacy = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"selectedSummaryProvider":"Apple PCC Gateway","refreshInterval":60}"#.utf8))
-        precondition(legacy.selectedSummaryProvider == .applePCCGateway)
+        // Hidden providers (Codex/Summarize, PCC) fall back to Apple Cloud.
+        precondition(legacy.selectedSummaryProvider == .appleCloud)
+        precondition(!AppSettings.SummaryProvider.selectableCases.contains(.applePCCGateway))
+        precondition(!AppSettings.SummaryProvider.selectableCases.contains(.summarizeDaemon))
         precondition(legacy.openAICompatibleBaseURL.isEmpty)
         precondition(legacy.openAICompatibleMaxTokens == AppSettings.defaultOpenAICompatibleMaxTokens)
         precondition(legacy.redditGrantedScopes.isEmpty)
