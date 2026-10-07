@@ -54,10 +54,15 @@ struct AppSettings: Codable {
         case appleLocal = "Apple Local"
         case appleCloud = "Apple Cloud"
         case applePCCGateway = "Apple PCC Gateway"
-        case mlxLocal = "MLX Local"
         case coreAIMLXLocal = "CoreAI MLX Local"
         case webAI = "Web AI"
         case summarizeDaemon = "Codex / Summarize"
+
+        /// Legacy "MLX Local" values now resolve to CoreAI MLX Local.
+        init(from decoder: Decoder) throws {
+            let rawValue = try decoder.singleValueContainer().decode(String.self)
+            self = SummaryProvider(rawValue: rawValue) ?? .coreAIMLXLocal
+        }
 
         var displayName: String {
             switch self {
@@ -67,8 +72,6 @@ struct AppSettings: Codable {
                 #else
                 return self.rawValue
                 #endif
-            case .mlxLocal:
-                return "LiteRT Local"
             case .coreAIMLXLocal:
                 return "CoreAI MLX Local"
             default:
@@ -77,8 +80,8 @@ struct AppSettings: Codable {
         }
     }
 
-    // LiteRT Local settings. The setting key keeps the old MLX name for migration.
-    var mlxModelID: String = LiteRTLocalService.defaultModelRepo
+    // MLX Local settings. Keep the old setting keys for migration.
+    var mlxModelID: String = CoreAIMLXLocalService.defaultModelRepo
     var mlxMaxOutputTokens: Int = 256
     var mlxMaxContextTokens: Int = 0
 
@@ -127,9 +130,12 @@ struct AppSettings: Codable {
         return model.isEmpty ? defaultPCCGatewayModel : model
     }
 
-    static func normalizedLiteRTContextTokens(_ rawValue: Int) -> Int {
+    static let localMLXDefaultContextTokens = 2_048
+    static let localMLXContextTokenCap = 8_192
+
+    static func normalizedMLXContextTokens(_ rawValue: Int) -> Int {
         guard rawValue > 0 else { return 0 }
-        return min(max(LiteRTLocalService.defaultContextTokens, rawValue), LiteRTLocalService.maxContextTokens)
+        return min(max(localMLXDefaultContextTokens, rawValue), localMLXContextTokenCap)
     }
 
     static func normalizedCoreAIMLXContextTokens(_ rawValue: Int) -> Int {
@@ -137,9 +143,9 @@ struct AppSettings: Codable {
         return min(max(CoreAIMLXLocalService.defaultContextTokens, rawValue), CoreAIMLXLocalService.maxContextTokens)
     }
 
-    static func effectiveLiteRTContextTokens(_ rawValue: Int) -> Int {
-        let normalized = normalizedLiteRTContextTokens(rawValue)
-        return normalized > 0 ? normalized : LiteRTLocalService.defaultContextTokens
+    static func effectiveMLXContextTokens(_ rawValue: Int) -> Int {
+        let normalized = normalizedMLXContextTokens(rawValue)
+        return normalized > 0 ? normalized : localMLXDefaultContextTokens
     }
 
     static func effectiveCoreAIMLXContextTokens(_ rawValue: Int) -> Int {
@@ -147,8 +153,8 @@ struct AppSettings: Codable {
         return normalized > 0 ? normalized : CoreAIMLXLocalService.defaultContextTokens
     }
 
-    static func normalizedLiteRTOutputTokens(_ rawValue: Int, contextTokens: Int) -> Int {
-        normalizedLocalOutputTokens(rawValue, contextTokens: contextTokens, hardCap: 1024)
+    static func normalizedMLXOutputTokens(_ rawValue: Int, contextTokens: Int) -> Int {
+        normalizedLocalOutputTokens(rawValue, contextTokens: contextTokens, hardCap: 4096)
     }
 
     static func normalizedCoreAIMLXOutputTokens(_ rawValue: Int, contextTokens: Int) -> Int {
@@ -239,11 +245,11 @@ struct AppSettings: Codable {
         redditRefreshToken = try container.decodeIfPresent(String.self, forKey: .redditRefreshToken) ?? ""
         redditTokenExpiry = try container.decodeIfPresent(Date.self, forKey: .redditTokenExpiry)
         redditUsername = try container.decodeIfPresent(String.self, forKey: .redditUsername) ?? ""
-        mlxModelID = LiteRTLocalService.normalizedModelID(try container.decodeIfPresent(String.self, forKey: .mlxModelID) ?? LiteRTLocalService.defaultModelRepo)
-        mlxMaxContextTokens = AppSettings.normalizedLiteRTContextTokens(try container.decodeIfPresent(Int.self, forKey: .mlxMaxContextTokens) ?? 0)
-        mlxMaxOutputTokens = AppSettings.normalizedLiteRTOutputTokens(
+        mlxModelID = CoreAIMLXLocalService.normalizedModelID(try container.decodeIfPresent(String.self, forKey: .mlxModelID) ?? CoreAIMLXLocalService.defaultModelRepo)
+        mlxMaxContextTokens = AppSettings.normalizedMLXContextTokens(try container.decodeIfPresent(Int.self, forKey: .mlxMaxContextTokens) ?? 0)
+        mlxMaxOutputTokens = AppSettings.normalizedMLXOutputTokens(
             try container.decodeIfPresent(Int.self, forKey: .mlxMaxOutputTokens) ?? 256,
-            contextTokens: AppSettings.effectiveLiteRTContextTokens(mlxMaxContextTokens)
+            contextTokens: AppSettings.effectiveMLXContextTokens(mlxMaxContextTokens)
         )
         coreAIMLXModelID = CoreAIMLXLocalService.normalizedModelID(try container.decodeIfPresent(String.self, forKey: .coreAIMLXModelID) ?? CoreAIMLXLocalService.defaultModelRepo)
         coreAIMLXMaxContextTokens = AppSettings.normalizedCoreAIMLXContextTokens(try container.decodeIfPresent(Int.self, forKey: .coreAIMLXMaxContextTokens) ?? 0)
@@ -375,22 +381,30 @@ enum SubscriptionType: String, Codable {
     case rss, reddit
 }
 
+/// Optional semantic content kind. Kept separate from SubscriptionType so
+/// older macOS/iOS builds can decode the same subscription payload.
+enum SubscriptionContentKind: String, Codable {
+    case podcast
+}
+
 struct Subscription: Identifiable, Codable, Equatable {
     let id: UUID
     let title: String
     let url: String
     let type: SubscriptionType
+    let contentKind: SubscriptionContentKind?
 
-    init(id: UUID = UUID(), title: String, url: String, type: SubscriptionType) {
+    init(id: UUID = UUID(), title: String, url: String, type: SubscriptionType, contentKind: SubscriptionContentKind? = nil) {
         self.id = id
         self.title = title
         self.url = url
         self.type = type
+        self.contentKind = contentKind
     }
 
     static func == (lhs: Subscription, rhs: Subscription) -> Bool {
         // Treat subscriptions with the same URL and type as identical across devices
-        return lhs.url == rhs.url && lhs.type == rhs.type
+        return lhs.url == rhs.url && lhs.type == rhs.type && lhs.title == rhs.title && lhs.contentKind == rhs.contentKind
     }
 }
 
@@ -437,6 +451,8 @@ extension Subscription {
     var canonicalKey: String {
         "\(type.rawValue)|\(Subscription.canonicalURL(url, type: type))"
     }
+
+    var isPodcast: Bool { type == .rss && contentKind == .podcast }
 
     /// YouTube channels remain ordinary RSS subscriptions for persistence and
     /// cloud-sync compatibility with older builds.
@@ -493,6 +509,10 @@ struct Article: Identifiable {
     let feedTitle: String
     let feedURL: String
     let imageURL: URL?
+    let podcastAudioURL: URL?
+    let podcastAudioMIMEType: String?
+    let podcastDuration: TimeInterval?
+    let podcastLanguageCode: String?
     var isRead: Bool
     var isFavorite: Bool
     var summary: String?
@@ -508,6 +528,10 @@ struct Article: Identifiable {
          feedTitle: String,
          feedURL: String,
          imageURL: URL? = nil,
+         podcastAudioURL: URL? = nil,
+         podcastAudioMIMEType: String? = nil,
+         podcastDuration: TimeInterval? = nil,
+         podcastLanguageCode: String? = nil,
          isRead: Bool = false,
          isFavorite: Bool = false,
          summary: String? = nil) {
@@ -520,6 +544,10 @@ struct Article: Identifiable {
         self.feedTitle = feedTitle
         self.feedURL = feedURL
         self.imageURL = imageURL
+        self.podcastAudioURL = podcastAudioURL
+        self.podcastAudioMIMEType = podcastAudioMIMEType
+        self.podcastDuration = podcastDuration
+        self.podcastLanguageCode = podcastLanguageCode
         self.isRead = isRead
         self.isFavorite = isFavorite
         self.summary = summary
@@ -527,6 +555,7 @@ struct Article: Identifiable {
 }
 
 extension Article {
+    var isPodcastEpisode: Bool { podcastAudioURL != nil }
     var youtubeVideoID: String? {
         if id.hasPrefix("youtube:") {
             let value = String(id.dropFirst("youtube:".count))

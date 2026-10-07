@@ -112,7 +112,7 @@ struct GlobalSummaryResultView: View {
                 if let aggregateText = appState.aggregateSummaryText {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Image(systemName: "sparkles")
+                            Image(systemName: "text.quote")
                                 .foregroundColor(.blue)
                             Text("Overall Summary")
                                 .font(.headline)
@@ -294,7 +294,7 @@ struct GlobalSummaryResultView: View {
                     Button {
                         appState.generateCombinedGlobalSummary()
                     } label: {
-                        Label("Overall...", systemImage: "sparkles")
+                        Label("Overall...", systemImage: "text.quote")
                     }
                     .buttonStyle(LiquidGlassButtonStyle())
                     .disabled(appState.isLoading || appState.isGeneratingAggregateSummary)
@@ -307,37 +307,19 @@ struct GlobalSummaryResultView: View {
                     .buttonStyle(LiquidGlassButtonStyle())
                     .disabled(appState.isLoading || appState.lastGlobalSummaryContext == nil)
 
-                    // Cloud TTS button
-                    Button {
-                        speakOverviewCloudTTS()
-                    } label: {
-                        Image(systemName: "speaker.wave.2")
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle())
-                    .ttsActiveGlow(isSynthesizingSpeech, color: .blue)
-                    .help("Read aloud (Cloud TTS)")
-                    .disabled(isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally || !hasSummaryContent)
-
-                    // Local TTS button
-                    Button {
-                        speakOverviewLocally()
-                    } label: {
-                        Image(systemName: "speaker.wave.2.circle")
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle())
-                    .ttsActiveGlow(isPreparingLocalTTS || isSpeakingLocally, color: .green)
-                    .help("Read aloud (Local TTS / MLX)")
-                    .disabled(isSynthesizingSpeech || !hasSummaryContent)
-
-                    // Stop button
-                    Button {
-                        stopOverviewSpeech()
-                    } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle())
-                    .help("Stop speech")
-                    .disabled(!isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally)
+                    // Shared read-aloud control: ▶ cloud (OpenAI), 🔊 local engine from Settings, ■ while speaking.
+                    SummaryTTSMiniPlayer(
+                        isReddit: false,
+                        playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally || !hasSummaryContent,
+                        stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
+                        localDisabled: isSynthesizingSpeech || !hasSummaryContent,
+                        localIsActive: isPreparingLocalTTS || isSpeakingLocally,
+                        onPlay: { speakOverviewCloudTTS() },
+                        onStop: { stopOverviewSpeech() },
+                        onLocal: { speakOverviewLocally() },
+                        playHelp: "Read aloud (Cloud)",
+                        localHelp: "Read aloud (Local)"
+                    )
                     
                     // Q&A Toggle Button
                     Button {
@@ -828,7 +810,7 @@ struct GlobalSummaryResultView: View {
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in
                     onCompleted()
@@ -839,7 +821,7 @@ struct GlobalSummaryResultView: View {
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }

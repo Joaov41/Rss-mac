@@ -9,9 +9,15 @@
 import SwiftUI
 import WebKit
 
+struct YouTubeSeekRequest: Equatable {
+    let id = UUID()
+    let seconds: TimeInterval
+}
+
 #if os(iOS)
 struct YouTubePlayerView: UIViewRepresentable {
     let videoID: String
+    var seekRequest: YouTubeSeekRequest? = nil
     var onError: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(onError: onError) }
@@ -34,6 +40,11 @@ struct YouTubePlayerView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.onError = onError
+        if let seekRequest, seekRequest.id != context.coordinator.lastSeekID {
+            context.coordinator.lastSeekID = seekRequest.id
+            let seconds = max(0, seekRequest.seconds)
+            webView.evaluateJavaScript("if (window.player && player.seekTo) { player.seekTo(\(seconds), true); player.playVideo(); }")
+        }
         guard context.coordinator.loadedVideoID != videoID else { return }
         context.coordinator.loadedVideoID = videoID
         load(videoID: videoID, into: webView)
@@ -78,6 +89,7 @@ struct YouTubePlayerView: UIViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         var onError: (String) -> Void
         var loadedVideoID: String?
+        var lastSeekID: UUID?
 
         init(onError: @escaping (String) -> Void) { self.onError = onError }
 
@@ -114,6 +126,7 @@ private final class YouTubeScrollForwardingWebView: WKWebView {
 
 struct YouTubePlayerView: NSViewRepresentable {
     let videoID: String
+    var seekRequest: YouTubeSeekRequest? = nil
     var onError: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(onError: onError) }
@@ -133,6 +146,11 @@ struct YouTubePlayerView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.onError = onError
+        if let seekRequest, seekRequest.id != context.coordinator.lastSeekID {
+            context.coordinator.lastSeekID = seekRequest.id
+            let seconds = max(0, seekRequest.seconds)
+            webView.evaluateJavaScript("if (window.player && player.seekTo) { player.seekTo(\(seconds), true); player.playVideo(); }")
+        }
         guard context.coordinator.loadedVideoID != videoID else { return }
         context.coordinator.loadedVideoID = videoID
         load(videoID: videoID, into: webView)
@@ -177,6 +195,7 @@ struct YouTubePlayerView: NSViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         var onError: (String) -> Void
         var loadedVideoID: String?
+        var lastSeekID: UUID?
 
         init(onError: @escaping (String) -> Void) { self.onError = onError }
 

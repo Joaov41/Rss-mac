@@ -48,6 +48,7 @@ struct SummaryColumnView: View {
     @State private var selectionAskAIMarkdownResponse: String?
     @State private var selectionAskAIError: String?
     @State private var selectionAskAITask: Task<Void, Never>?
+    @State private var selectionAskAIOrigin: AskAISelectionOrigin?
 
     private var shouldShowExplicitWebAIControls: Bool {
         appState.settings.selectedSummaryProvider != .webAI
@@ -68,7 +69,7 @@ struct SummaryColumnView: View {
                 
                 if appState.isSummarizingArticle(article) {
                     let streamText = appState.mlxStreamingText
-                    if (appState.settings.selectedSummaryProvider == .mlxLocal || appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !streamText.isEmpty {
+                    if (appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !streamText.isEmpty {
                         ScrollView {
                             Text(streamText)
                                 .font(.body)
@@ -114,42 +115,25 @@ struct SummaryColumnView: View {
                                 Button {
                                     appState.requestWebSummary(for: article)
                                 } label: {
-                                    Label(appState.settings.selectedWebAIProvider.displayName, systemImage: "globe")
+                                    Label(appState.settings.selectedWebAIProvider.displayName, systemImage: "quote.bubble")
                                 }
                                 .buttonStyle(LiquidGlassButtonStyle())
                                 .help("Generate article summary with \(appState.settings.selectedWebAIProvider.displayName)")
                             }
                             
-                            // Cloud TTS button
-                            Button {
-                                speakSummary()
-                            } label: {
-                                Label("Cloud TTS", systemImage: "speaker.wave.2")
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                            .ttsActiveGlow(isSynthesizingSpeech, color: .blue)
-                            .help("Read aloud (Cloud)")
-                            .disabled(isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally)
-                            
-                            // Stop button
-                            Button {
-                                stopSummarySpeech()
-                            } label: {
-                                Label("Stop", systemImage: "stop.fill")
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                            .help("Stop speech")
-                            
-                            // Local TTS button
-                            Button {
-                                speakSummaryLocally(summary)
-                            } label: {
-                                Label("Local TTS", systemImage: "speaker.wave.2.circle")
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                            .ttsActiveGlow(isPreparingLocalTTS || isSpeakingLocally, color: .green)
-                            .help("Read aloud (Local)")
-                            .disabled(isSynthesizingSpeech)
+                            // Shared read-aloud control: ▶ cloud (OpenAI), 🔊 local engine from Settings, ■ while speaking.
+                            SummaryTTSMiniPlayer(
+                                isReddit: false,
+                                playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally || summary.isEmpty,
+                                stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
+                                localDisabled: isSynthesizingSpeech || summary.isEmpty,
+                                localIsActive: isPreparingLocalTTS || isSpeakingLocally,
+                                onPlay: { speakSummary() },
+                                onStop: { stopSummarySpeech() },
+                                onLocal: { speakSummaryLocally(summary) },
+                                playHelp: "Read aloud (Cloud)",
+                                localHelp: "Read aloud (Local)"
+                            )
 
 
                             
@@ -229,7 +213,7 @@ struct SummaryColumnView: View {
 
                         // Throughput badge for on-device providers
                         let _colProvider = appState.settings.selectedSummaryProvider
-                        if (_colProvider == .mlxLocal || _colProvider == .coreAIMLXLocal || _colProvider == .appleLocal || _colProvider == .applePCCGateway || _colProvider == .summarizeDaemon),
+                        if (_colProvider == .coreAIMLXLocal || _colProvider == .appleLocal || _colProvider == .applePCCGateway || _colProvider == .summarizeDaemon),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -317,6 +301,7 @@ struct SummaryColumnView: View {
                 isLoading: isSelectionAskAIInFlight,
                 response: selectionAskAIResponse,
                 markdownResponse: selectionAskAIMarkdownResponse,
+                selectionOrigin: selectionAskAIOrigin,
                 errorMessage: selectionAskAIError,
                 onClose: { showSelectionAskAIResponse = false },
                 onCopy: copySelectionAskAIResponse
@@ -737,7 +722,7 @@ struct SummaryColumnView: View {
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in
                     onCompleted()
@@ -748,7 +733,7 @@ struct SummaryColumnView: View {
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }
@@ -887,7 +872,11 @@ struct SummaryColumnView: View {
         appState.requestSummary(for: article)
     }
 
-    private func askAIFromSummaryColumnSelection(_ selection: String, article: Article, action: AskAISelectionAction) {
+    private func askAIFromSummaryColumnSelection(
+        _ selection: String,
+        article: Article,
+        action: AskAISelectionAction
+    ) {
         let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -898,10 +887,17 @@ struct SummaryColumnView: View {
         selectionAskAIError = nil
         showSelectionAskAIResponse = true
 
+        let source = appState.articleSelectionSourceContext(for: article)
+        let origin = AskAISelectionOrigin(
+            sourceLabel: source.label,
+            sourceText: source.text
+        )
         let prompt = appState.articleQAPrompt(
             article: article,
             question: "What is said about \(trimmed)?"
         )
+        guard !prompt.isEmpty else { return }
+        selectionAskAIOrigin = origin
 
         selectionAskAITask = Task {
             let answer = await withCheckedContinuation { continuation in
@@ -939,17 +935,17 @@ struct SummaryColumnView: View {
     private var summaryProviderIcon: String {
         switch appState.settings.selectedSummaryProvider {
         case .gemini:
-            return "sparkles"
+            return "text.quote"
         case .appleLocal:
             return "cpu"
         case .appleCloud:
             return "cloud.fill"
         case .applePCCGateway:
             return "bolt.horizontal.cloud.fill"
-        case .mlxLocal, .coreAIMLXLocal:
+        case .coreAIMLXLocal:
             return "memorychip"
         case .webAI:
-            return "globe"
+            return "quote.bubble"
         case .summarizeDaemon:
             return "terminal"
         }
@@ -965,7 +961,7 @@ struct SummaryColumnView: View {
             return .blue.opacity(0.1)
         case .applePCCGateway:
             return .cyan.opacity(0.14)
-        case .mlxLocal, .coreAIMLXLocal:
+        case .coreAIMLXLocal:
             return .orange.opacity(0.1)
         case .webAI:
             return .teal.opacity(0.14)

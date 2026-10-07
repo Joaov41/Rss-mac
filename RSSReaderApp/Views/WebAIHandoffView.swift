@@ -382,7 +382,7 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 HStack(spacing: 12) {
-                    Image(systemName: "globe")
+                    Image(systemName: "quote.bubble")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.secondary)
 
@@ -484,7 +484,7 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
 
         return VStack(spacing: 0) {
             HStack(spacing: 14) {
-                Image(systemName: "globe")
+                Image(systemName: "quote.bubble")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(.secondary)
 
@@ -574,7 +574,7 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                     ProgressView()
                         .controlSize(.small)
                 } else {
-                    Image(systemName: "globe")
+                    Image(systemName: "quote.bubble")
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(request.title)
@@ -715,7 +715,7 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 HStack(spacing: 12) {
-                    Image(systemName: "globe")
+                    Image(systemName: "quote.bubble")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.secondary)
 
@@ -820,7 +820,7 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
                     ProgressView()
                         .controlSize(.small)
                 } else {
-                    Image(systemName: "globe")
+                    Image(systemName: "quote.bubble")
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(request.title)
@@ -1539,10 +1539,27 @@ private extension WebAIHandoffRepresentable {
             captureFinished = true
             cancelPendingInjection()
             resetFallbackExtractionState()
+            let cleaned = Self.strippingProviderBanners(from: response)
             DispatchQueue.main.async {
                 self.parent.fallbackMessage = nil
-                self.parent.onResponseCaptured(response)
+                self.parent.onResponseCaptured(cleaned)
             }
+        }
+
+        /// ChatGPT sometimes renders plan/usage notices next to the reply; the scraper
+        /// picks them up as part of the answer. Drop those sentences.
+        static func strippingProviderBanners(from response: String) -> String {
+            let patterns = [
+                #"(?i)files, images, and data analysis are unavailable[^\n]*?(?:more access\.?|$)"#,
+                #"(?i)you'?ve (?:hit|reached) (?:the|your) (?:free plan )?limit[^\n]*"#,
+                #"(?i)continue chatting with text only,? or upgrade for more access\.?"#,
+                #"(?i)chatgpt can make mistakes\.[^\n]*"#
+            ]
+            var text = response
+            for pattern in patterns {
+                text = text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+            }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
         private func deliverCaptureFailure(_ message: String) {

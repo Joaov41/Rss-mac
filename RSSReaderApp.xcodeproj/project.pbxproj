@@ -45,10 +45,8 @@
 		C5ASK0022F00000500000001 /* AskAIComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5ASK0002F00000500000001 /* AskAIComponents.swift */; };
 		C5INFO022F00000300000001 /* InfographicView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5INFO002F00000300000001 /* InfographicView.swift */; };
 		C6KOK0022F00000400000001 /* KokoroTTSService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6KOK0002F00000400000001 /* KokoroTTSService.swift */; };
-		MACLLM0100010001000101 /* LiteRTLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = MACLLM0100010001000104 /* LiteRTLocalService.swift */; };
 		MACLLM0100010001000102 /* CoreAIMLXLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = MACLLM0100010001000105 /* CoreAIMLXLocalService.swift */; };
 		MACLLM0100010001000103 /* LocalLLMCompatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = MACLLM0100010001000106 /* LocalLLMCompatibility.swift */; };
-		MACLLM0100010001000111 /* LiteRTFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = MACLLM0100010001000112 /* LiteRTFoundation */; };
 		READABILITY0001000102 /* Readability.js in Resources */ = {isa = PBXBuildFile; fileRef = READABILITY0001000100 /* Readability.js */; };
 		PODMOD022F00000100000001 /* BatchPodcastModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000001 /* BatchPodcastModels.swift */; };
 		PODMOD022F00000100000002 /* BatchPodcastContextBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000002 /* BatchPodcastContextBuilder.swift */; };
@@ -56,6 +54,14 @@
 		PODMOD022F00000100000004 /* BatchPodcastSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000004 /* BatchPodcastSession.swift */; };
 		PODMOD022F00000100000005 /* MLXPodcastPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000005 /* MLXPodcastPlaybackController.swift */; };
 		PODMOD022F00000100000006 /* BatchPodcastView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PODMOD002F00000100000006 /* BatchPodcastView.swift */; };
+		D8A100032F50000100AAA001 /* YouTubeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A100012F50000100AAA001 /* YouTubeService.swift */; };
+		D8A100042F50000100AAA001 /* YouTubePlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A100022F50000100AAA001 /* YouTubePlayerView.swift */; };
+		RLPOD0022F00000100000001 /* PodcastDiscoveryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000001 /* PodcastDiscoveryService.swift */; };
+		RLPOD0022F00000100000002 /* PodcastEpisodeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000002 /* PodcastEpisodeService.swift */; };
+		RLPOD0022F00000100000003 /* PodcastGeminiTextService.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000003 /* PodcastGeminiTextService.swift */; };
+		RLPOD0022F00000100000004 /* PodcastBackgroundTaskManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000004 /* PodcastBackgroundTaskManager.swift */; };
+		RLPOD0022F00000100000005 /* PodcastEpisodePlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000005 /* PodcastEpisodePlayerView.swift */; };
+		RLPOD0022F00000100000006 /* PodcastSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLPOD0002F00000100000006 /* PodcastSearchView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -94,7 +100,6 @@
 		C5ASK0002F00000500000001 /* AskAIComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIComponents.swift; sourceTree = "<group>"; };
 		C5INFO002F00000300000001 /* InfographicView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InfographicView.swift; sourceTree = "<group>"; };
 		C6KOK0002F00000400000001 /* KokoroTTSService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KokoroTTSService.swift; sourceTree = "<group>"; };
-		MACLLM0100010001000104 /* LiteRTLocalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiteRTLocalService.swift; sourceTree = "<group>"; };
 		MACLLM0100010001000105 /* CoreAIMLXLocalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreAIMLXLocalService.swift; sourceTree = "<group>"; };
 		MACLLM0100010001000106 /* LocalLLMCompatibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalLLMCompatibility.swift; sourceTree = "<group>"; };
 		READABILITY0001000100 /* Readability.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = Readability.js; sourceTree = "<group>"; };
@@ -104,6 +109,14 @@
 		PODMOD002F00000100000004 /* BatchPodcastSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastSession.swift; sourceTree = "<group>"; };
 		PODMOD002F00000100000005 /* MLXPodcastPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MLXPodcastPlaybackController.swift; sourceTree = "<group>"; };
 		PODMOD002F00000100000006 /* BatchPodcastView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchPodcastView.swift; sourceTree = "<group>"; };
+		D8A100012F50000100AAA001 /* YouTubeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeService.swift; sourceTree = "<group>"; };
+		D8A100022F50000100AAA001 /* YouTubePlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubePlayerView.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000001 /* PodcastDiscoveryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastDiscoveryService.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000002 /* PodcastEpisodeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastEpisodeService.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000003 /* PodcastGeminiTextService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastGeminiTextService.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000004 /* PodcastBackgroundTaskManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastBackgroundTaskManager.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000005 /* PodcastEpisodePlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastEpisodePlayerView.swift; sourceTree = "<group>"; };
+		RLPOD0002F00000100000006 /* PodcastSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastSearchView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -117,7 +130,6 @@
 					C187DB882E83023600F58FC6 /* Kingfisher in Frameworks */,
 					C148C40F2D8AD72A00E006A0 /* FeedKit in Frameworks */,
 					C1DBF94A2EF32E9700A9D95E /* MLXLMCommon in Frameworks */,
-					MACLLM0100010001000111 /* LiteRTFoundation in Frameworks */,
 					C1DBF94B2EF32E9700A9D95E /* MLXVLM in Frameworks */,
 					C187DB862E83023300F58FC6 /* SwiftSoup in Frameworks */,
 				);
@@ -175,6 +187,7 @@
 		A1B2C3D4E5F6A7B8C9D0E22B /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				D8A100022F50000100AAA001 /* YouTubePlayerView.swift */,
 				C1DA2C662D8B1E7900A9D660 /* SettingsView.swift */,
 				C1DA2C632D8B1C6400A9D660 /* MainSplitView.swift */,
 				C1DA2C602D8B1AA200A9D660 /* SummaryColumnView.swift */,
@@ -186,6 +199,8 @@
 				C5INFO002F00000300000001 /* InfographicView.swift */,
 				C5ASK0002F00000500000001 /* AskAIComponents.swift */,
 				C2AAA0032E83024000F58FC6 /* iOS26GlassEffects.swift */,
+				RLPOD0002F00000100000005 /* PodcastEpisodePlayerView.swift */,
+				RLPOD0002F00000100000006 /* PodcastSearchView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -201,6 +216,7 @@
 		A1B2C3D4E5F6A7B8C9D0E22D /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				D8A100012F50000100AAA001 /* YouTubeService.swift */,
 				C11778132E8DCEDD00EDB44E /* RedditOAuthManager.swift */,
 				A1B2C3D4E5F6A7B8C9D0E209 /* FeedService.swift */,
 				A1B2C3D4E5F6A7B8C9D0E20C /* RedditService.swift */,
@@ -209,12 +225,15 @@
 				A1B2C3D4E5F6A7B8C9D0E212 /* CommentSummaryService.swift */,
 				C3CLOUD002F00000100000001 /* CloudSyncManager.swift */,
 				C4MLX0002F00000200000001 /* MLXLocalService.swift */,
-				MACLLM0100010001000104 /* LiteRTLocalService.swift */,
 				MACLLM0100010001000105 /* CoreAIMLXLocalService.swift */,
 				MACLLM0100010001000106 /* LocalLLMCompatibility.swift */,
 				C4MLX0002F00000200000002 /* MLXJSONRepairUtils.swift */,
 				C6KOK0002F00000400000001 /* KokoroTTSService.swift */,
 				A1B2C3D4E5F6A7B8C9D0E215 /* PersistenceManager.swift */,
+				RLPOD0002F00000100000001 /* PodcastDiscoveryService.swift */,
+				RLPOD0002F00000100000002 /* PodcastEpisodeService.swift */,
+				RLPOD0002F00000100000003 /* PodcastGeminiTextService.swift */,
+				RLPOD0002F00000100000004 /* PodcastBackgroundTaskManager.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -282,7 +301,6 @@
 					C1DBF94C2EF32E9700A9D95E /* MLXVLM */,
 					D1A100032F40000100AAA001 /* MLXAudioCore */,
 					D1A100042F40000100AAA001 /* MLXAudioTTS */,
-					MACLLM0100010001000112 /* LiteRTFoundation */,
 				);
 			productName = RSSReaderApp;
 			productReference = A1B2C3D4E5F6A7B8C9D0E221 /* RSSReaderApp.app */;
@@ -318,7 +336,6 @@
 					C10CDDAD2D8E00EC0099A59A /* XCRemoteSwiftPackageReference "Kingfisher" */,
 					C1DBF9442EF32E9700A9D95E /* XCLocalSwiftPackageReference "mlx-swift-lm" */,
 					D1A100052F40000100AAA001 /* XCLocalSwiftPackageReference "mlx-audio-swift" */,
-					MACLLM0100010001000114 /* XCLocalSwiftPackageReference "swift-litert-lm local gemma fast us ethi sone" */,
 				);
 			productRefGroup = A1B2C3D4E5F6A7B8C9D0E229 /* Products */;
 			projectDirPath = "";
@@ -347,6 +364,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D8A100032F50000100AAA001 /* YouTubeService.swift in Sources */,
+				D8A100042F50000100AAA001 /* YouTubePlayerView.swift in Sources */,
 				A1B2C3D4E5F6A7B8C9D0E1F7 /* ContentView.swift in Sources */,
 				A1B2C3D4E5F6A7B8C9D0E201 /* Models.swift in Sources */,
 				C1DA2C682D8B1E7C00A9D660 /* SettingsView.swift in Sources */,
@@ -356,7 +375,6 @@
 				A1B2C3D4E5F6A7B8C9D0E20A /* FeedService.swift in Sources */,
 				C3CLOUD022F00000100000001 /* CloudSyncManager.swift in Sources */,
 				C4MLX0022F00000200000001 /* MLXLocalService.swift in Sources */,
-				MACLLM0100010001000101 /* LiteRTLocalService.swift in Sources */,
 				MACLLM0100010001000102 /* CoreAIMLXLocalService.swift in Sources */,
 				MACLLM0100010001000103 /* LocalLLMCompatibility.swift in Sources */,
 				C4MLX0042F00000200000002 /* MLXJSONRepairUtils.swift in Sources */,
@@ -384,6 +402,12 @@
 				PODMOD022F00000100000004 /* BatchPodcastSession.swift in Sources */,
 				PODMOD022F00000100000005 /* MLXPodcastPlaybackController.swift in Sources */,
 				PODMOD022F00000100000006 /* BatchPodcastView.swift in Sources */,
+				RLPOD0022F00000100000001 /* PodcastDiscoveryService.swift in Sources */,
+				RLPOD0022F00000100000002 /* PodcastEpisodeService.swift in Sources */,
+				RLPOD0022F00000100000003 /* PodcastGeminiTextService.swift in Sources */,
+				RLPOD0022F00000100000004 /* PodcastBackgroundTaskManager.swift in Sources */,
+				RLPOD0022F00000100000005 /* PodcastEpisodePlayerView.swift in Sources */,
+				RLPOD0022F00000100000006 /* PodcastSearchView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -642,10 +666,6 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = "Packages/mlx-audio-swift";
 		};
-		MACLLM0100010001000114 /* XCLocalSwiftPackageReference "swift-litert-lm local gemma fast us ethi sone" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "Packages/swift-litert-lm local gemma fast us ethi sone";
-		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -688,11 +708,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D1A100052F40000100AAA001 /* XCLocalSwiftPackageReference "mlx-audio-swift" */;
 			productName = MLXAudioTTS;
-		};
-		MACLLM0100010001000112 /* LiteRTFoundation */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = MACLLM0100010001000114 /* XCLocalSwiftPackageReference "swift-litert-lm local gemma fast us ethi sone" */;
-			productName = LiteRTFoundation;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

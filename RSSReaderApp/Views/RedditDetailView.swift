@@ -88,6 +88,22 @@ private struct RedditCommentsActionPillModifier: ViewModifier {
     }
 }
 
+private struct RedditCommentsChromeLabeledButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .padding(.horizontal, 12)
+            .frame(minHeight: 36)
+            .contentShape(Capsule(style: .continuous))
+            .background {
+                Capsule(style: .continuous)
+                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : 0))
+            }
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 private struct RedditCommentsGlassModifier: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -144,6 +160,8 @@ struct RedditDetailView: View {
     @State private var previousQuestionText: String? = nil
     @State private var commentsSentToLLMCount: Int? = nil
     @State private var isShowingAnalytics = false // State for analytics sheet
+    /// Reader pane width; narrow (half-screen) panes step the body text down one size.
+    @State private var redditPaneWidth: CGFloat = 0
     @State private var analyticsProviderOverride: AppSettings.SummaryProvider? = nil
     @State private var selectedImageURL: URL? = nil
     
@@ -170,17 +188,17 @@ struct RedditDetailView: View {
     private var activeSummaryProviderIcon: String {
         switch appState.settings.selectedSummaryProvider {
         case .gemini:
-            return "sparkles"
+            return "text.quote"
         case .appleLocal:
             return "cpu"
         case .appleCloud:
             return "cloud.fill"
         case .applePCCGateway:
             return "network"
-        case .mlxLocal, .coreAIMLXLocal:
+        case .coreAIMLXLocal:
             return "memorychip"
         case .webAI:
-            return "globe"
+            return "quote.bubble"
         case .summarizeDaemon:
             return "terminal"
         }
@@ -188,7 +206,7 @@ struct RedditDetailView: View {
 
     private func summaryProviderBadge(webAIProviderOverride: WebAIProvider? = nil) -> some View {
         let providerName = webAIProviderOverride?.displayName ?? activeSummaryProviderName
-        let providerIcon = webAIProviderOverride == nil ? activeSummaryProviderIcon : "globe"
+        let providerIcon = webAIProviderOverride == nil ? activeSummaryProviderIcon : "quote.bubble"
 
         return Label(providerName, systemImage: providerIcon)
             .font(.caption2)
@@ -218,6 +236,7 @@ struct RedditDetailView: View {
     @State private var selectionAskAIMarkdownResponse: String?
     @State private var selectionAskAIError: String?
     @State private var selectionAskAITask: Task<Void, Never>?
+    @State private var selectionAskAIOrigin: AskAISelectionOrigin?
     
     // TTS state variables for Q&A
     @State private var isSynthesizingSpeechQA: Bool = false
@@ -309,6 +328,21 @@ struct RedditDetailView: View {
                     EmptyView()
                 }
             }
+            #if os(macOS)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        withAnimation(.easeInOut) {
+                            proxy.scrollTo(redditTopAnchor, anchor: .top)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up")
+                    }
+                    .accessibilityLabel("Scroll to top")
+                    .help("Scroll to top")
+                }
+            }
+            #endif
             .onChange(of: appState.selectedRedditPost?.id) { newPostId in
                 // Reload comments when selectedRedditPost changes
                 if let newPostId = newPostId, let post = appState.selectedRedditPost {
@@ -360,6 +394,7 @@ struct RedditDetailView: View {
                 isLoading: isSelectionAskAIInFlight,
                 response: selectionAskAIResponse,
                 markdownResponse: selectionAskAIMarkdownResponse,
+                selectionOrigin: selectionAskAIOrigin,
                 errorMessage: selectionAskAIError,
                 onClose: { showSelectionAskAIResponse = false },
                 onCopy: copySelectionAskAIResponse
@@ -391,82 +426,110 @@ struct RedditDetailView: View {
         }
     }
     
-    private func postDetailView(for post: RedditPost, proxy: ScrollViewProxy) -> some View {
-        let visiblePostSummary = post.summary
-        return ZStack {
-            // Reddit gets a true black base in dark mode.
-            if colorScheme == .dark {
-                Color.black
-                    .ignoresSafeArea()
-            } else {
-                AppColors.redditBackground(for: colorScheme)
-                    .ignoresSafeArea()
-            }
-            
-            // Material overlay for glass effect
-            if colorScheme == .dark {
-                Color.black
-                    .ignoresSafeArea()
-            } else {
-                Color.clear
-                    .background(.regularMaterial)
-                    .ignoresSafeArea()
-            }
-            
+    /// Reddit lists the same picture at several preview sizes (different hosts/query
+    /// strings). Compare by file name so a single-image post doesn't show copies of itself.
+    private func distinctAdditionalImages(for post: RedditPost) -> [URL] {
+        func imageKey(_ url: URL) -> String { url.lastPathComponent.lowercased() }
+        var seen = Set<String>()
+        if let main = post.bestImageURL { seen.insert(imageKey(main)) }
+        return post.allImageURLs.filter { seen.insert(imageKey($0)).inserted }
+    }
+
+    @ViewBuilder
+    private func redditSingleColumn(for post: RedditPost, proxy: ScrollViewProxy) -> some View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    redditPostMainContent(for: post, proxy: proxy)
+                    redditCommentsContent(for: post, proxy: proxy)
+                }
+            #if os(macOS)
+            // Fill the pane: posts mix text, galleries and comment threads.
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 40)
+            .padding(.top, 28)
+            .padding(.bottom, 40)
+            #else
+            .padding()
+            #endif
+            #if os(iOS)
+            // Add top padding for navigation overlay - balanced for iPhone and iPad
+            .padding(.top, UIDevice.current.userInterfaceIdiom == .phone ? 120 : 180)
+            #endif
+            // No extra top padding needed on macOS since there's no overlay navigation
+            #if os(iOS)
+            // Apply enhanced swipe back only for iPad
+            .modifier(ConditionalEnhancedSwipeBack(isEnabled: UIDevice.current.userInterfaceIdiom != .phone, appState: appState))
+            #else
+            .enhancedSwipeBack {
+                appState.navigateBack()
+            }
+            #endif
+            }
+    }
+
+    @ViewBuilder
+    private func redditPostMainContent(for post: RedditPost, proxy: ScrollViewProxy) -> some View {
+        let visiblePostSummary = post.summary
                     Color.clear
                         .frame(height: 0)
                         .id(redditTopAnchor)
+                    HStack(spacing: 6) {
+                        Text("r/\(post.subreddit)")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.primary)
+                        Text("·")
+                        Text("u/\(post.author)")
+                        Text("·")
+                        Text(post.publishDate.formatted(date: .abbreviated, time: .shortened))
+                    }
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
                     Button {
                         openPostLink(post)
                     } label: {
                         Text(post.title)
-                            .font(.largeTitle)
-                            .fontWeight(.bold)
+                            .font(.system(size: redditPaneWidth > 0 && redditPaneWidth < 760 ? 24 : 28, weight: .bold))
+                            .tracking(-0.3)
                             .foregroundColor(.primary)
                             .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .buttonStyle(PlainButtonStyle())
-                    
-                    HStack {
-                        Text("r/\(post.subreddit)")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(post.publishDate, style: .date)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    Text("Posted by u/\(post.author)")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                
-                HStack {
-                    Label("\(post.score)", systemImage: "arrow.up")
-                    Label("\(post.commentCount) comments", systemImage: "bubble.right")
+                    .help("Open on Reddit")
+
+                HStack(spacing: 14) {
+                    Label(post.score.formatted(.number.notation(.compactName)), systemImage: "arrow.up")
+                    Label("\(post.commentCount) comments", systemImage: "bubble.left")
                 }
-                .font(.subheadline)
-                .foregroundColor(.secondary)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
 
                 RedditCommentsActionCapsule {
                     Button {
                         postSummaryWebAIProviderOverride = nil
                         appState.requestSummary(for: nil, redditPost: post)
                     } label: {
-                        compactHeaderIcon(systemName: "text.quote", grouped: true)
+                        Label("Summarize", systemImage: "text.quote")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(RedditCommentsChromeLabeledButtonStyle())
                     .accessibilityLabel("Summarize post")
                     .accessibilityHint("Summarize the Reddit post without comments")
                     .help("Summarize post only (without comments)")
 
                     if shouldShowExplicitWebAIControls {
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.15))
+                            .frame(width: 1, height: 18)
+                            .padding(.horizontal, 2)
+                            .accessibilityHidden(true)
+
                         Button {
                             postSummaryWebAIProviderOverride = appState.settings.selectedWebAIProvider
                             appState.requestWebSummary(for: post)
                         } label: {
-                            compactHeaderIcon(systemName: "globe", grouped: true)
+                            compactHeaderIcon(systemName: "quote.bubble", grouped: true)
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Summarize post with \(appState.settings.selectedWebAIProvider.displayName)")
@@ -485,13 +548,14 @@ struct RedditDetailView: View {
                 if appState.isSummarizingRedditPost(post) && visiblePostSummary == nil {
                     VStack(spacing: 16) {
                         HStack {
-                            Text("Summary")
-                                .font(.headline)
+                            Label("Summary", systemImage: "sparkles")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             summaryProviderBadge(webAIProviderOverride: postSummaryWebAIProviderOverride)
                             Spacer()
                         }
                         let summaryStreamText = appState.mlxStreamingText
-                        if (appState.settings.selectedSummaryProvider == .mlxLocal || appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !summaryStreamText.isEmpty {
+                        if (appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !summaryStreamText.isEmpty {
                             ScrollView {
                                 Text(summaryStreamText)
                                     .font(.body)
@@ -499,8 +563,6 @@ struct RedditDetailView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding()
                             }
-                            .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
-                            .cornerRadius(10)
                         } else {
                             VStack(spacing: 8) {
                                 ProgressView()
@@ -512,61 +574,38 @@ struct RedditDetailView: View {
                             }
                             .frame(maxWidth: .infinity)
                             .padding()
-                            .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
-                            .cornerRadius(10)
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .modifier(ArticleGlassyBackgroundModifier())
                     Divider()
                 } else if let summary = visiblePostSummary,
                           !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Summary")
-                                .font(.headline)
+                            Label("Summary", systemImage: "sparkles")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             summaryProviderBadge(webAIProviderOverride: postSummaryWebAIProviderOverride)
                             Spacer()
                             
-                            // TTS Controls with LiquidGlassButtonStyle
-                            HStack(spacing: 12) {
-                                // Cloud TTS button
-                                Button {
-                                    speakPostSummary(summary)
-                                } label: {
-                                    Image(systemName: "speaker.wave.2")
-                                        .font(.subheadline)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .ttsActiveGlow(isSynthesizingSpeechSummary, color: .blue)
-                                .help("Read aloud (Cloud)")
-                                .disabled(isSynthesizingSpeechSummary || isSpeakingLocallySummary || summary.isEmpty)
-                                
-                                // Stop speech
-                                Button {
-                                    stopPostSummarySpeech()
-                                } label: {
-                                    Image(systemName: "stop.fill")
-                                        .font(.subheadline)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .help("Stop speech")
-                                
-                                // Local TTS button
-                                Button {
-                                    speakPostSummaryLocally(summary)
-                                } label: {
-                                    Image(systemName: "speaker.wave.2.circle")
-                                        .font(.subheadline)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .ttsActiveGlow(isSpeakingLocallySummary, color: .green)
-                                .help("Read aloud (Local)")
-                                .disabled(isSynthesizingSpeechSummary || summary.isEmpty)
-                            }
+                            SummaryTTSMiniPlayer(
+                                isReddit: false,
+                                playDisabled: isSynthesizingSpeechSummary || isSpeakingLocallySummary || summary.isEmpty,
+                                stopDisabled: !isSynthesizingSpeechSummary && !isPreparingLocalTTSSummary && !isSpeakingLocallySummary,
+                                localDisabled: isSynthesizingSpeechSummary || summary.isEmpty,
+                                localIsActive: isPreparingLocalTTSSummary || isSpeakingLocallySummary,
+                                onPlay: { speakPostSummary(summary) },
+                                onStop: stopPostSummarySpeech,
+                                onLocal: { speakPostSummaryLocally(summary) },
+                                playHelp: "Read aloud (Cloud)",
+                                localHelp: "Read aloud (Local)"
+                            )
                         }
                         
-                        // Directly render markdown content
-                        if colorScheme == .dark {
-                            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
+                        // Same treatment as the article summary card: text sits directly on the card.
+                        SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary), summaryStructure: true)
                                 .font(.body)
                                 .onAskAI { selection in
                                     askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -574,22 +613,6 @@ struct RedditDetailView: View {
                                 .onAskAIWeb { selection in
                                     askAIFromRedditSelection(selection, post: post, action: .web)
                                 }
-                                .padding()
-                                .background(Color.black)
-                                .cornerRadius(10)
-                        } else {
-                            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
-                                .font(.body)
-                                .onAskAI { selection in
-                                    askAIFromRedditSelection(selection, post: post, action: .standard)
-                                }
-                                .onAskAIWeb { selection in
-                                    askAIFromRedditSelection(selection, post: post, action: .web)
-                                }
-                                .padding()
-                                .background(.regularMaterial)
-                                .cornerRadius(10)
-                        }
                         
                         // TTS status indicators
                         if isSynthesizingSpeechSummary {
@@ -629,7 +652,7 @@ struct RedditDetailView: View {
 
                         // Throughput badge for on-device providers (post summary)
                         let _redditSummaryProvider = appState.settings.selectedSummaryProvider
-                        if (_redditSummaryProvider == .mlxLocal || _redditSummaryProvider == .coreAIMLXLocal || _redditSummaryProvider == .appleLocal || _redditSummaryProvider == .applePCCGateway || _redditSummaryProvider == .summarizeDaemon),
+                        if (_redditSummaryProvider == .coreAIMLXLocal || _redditSummaryProvider == .appleLocal || _redditSummaryProvider == .applePCCGateway || _redditSummaryProvider == .summarizeDaemon),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -639,6 +662,9 @@ struct RedditDetailView: View {
                             .padding(.horizontal, 4)
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .modifier(ArticleGlassyBackgroundModifier())
                     Divider()
                 }
 
@@ -682,7 +708,7 @@ struct RedditDetailView: View {
                 
                 // Show additional images in a gallery if there are multiple
                 // Filter out the main image to avoid showing it twice
-                let additionalImages = post.allImageURLs.filter { $0 != post.bestImageURL }
+                let additionalImages = distinctAdditionalImages(for: post)
                 if !additionalImages.isEmpty {
                     VStack(alignment: .leading) {
                         Text("More Images:")
@@ -761,6 +787,10 @@ struct RedditDetailView: View {
                                     }
                                 }
                 
+    }
+
+    @ViewBuilder
+    private func redditCommentsContent(for post: RedditPost, proxy: ScrollViewProxy) -> some View {
                 Color.clear
                     .frame(height: 0)
                     .id(redditCommentSummaryAnchor)
@@ -768,8 +798,9 @@ struct RedditDetailView: View {
                 if isLoadingComments && commentSummary == nil && !comments.isEmpty {
                     VStack(spacing: 16) {
                         HStack {
-                            Text("Comment Summary")
-                                .font(.headline)
+                            Label("Comment Summary", systemImage: "sparkles")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                         }
@@ -781,15 +812,17 @@ struct RedditDetailView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
-                        .cornerRadius(10)
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .modifier(ArticleGlassyBackgroundModifier())
                     Divider()
                 } else if appState.isWaitingForCommentSummary && commentSummary == nil && !comments.isEmpty {
                     VStack(spacing: 16) {
                         HStack {
-                            Text("Comment Summary")
-                                .font(.headline)
+                            Label("Comment Summary", systemImage: "sparkles")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                         }
@@ -801,15 +834,17 @@ struct RedditDetailView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(colorScheme == .dark ? Color.black : AppColors.systemGray6)
-                        .cornerRadius(10)
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .modifier(ArticleGlassyBackgroundModifier())
                     Divider()
                 } else if let summary = commentSummary {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Comment Summary")
-                                .font(.headline)
+                            Label("Comment Summary", systemImage: "sparkles")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             summaryProviderBadge(webAIProviderOverride: commentSummaryWebAIProviderOverride)
                             Spacer()
                             Button(action: { 
@@ -824,7 +859,7 @@ struct RedditDetailView: View {
                             HStack {
                                 Spacer()
                                 SummaryTTSMiniPlayer(
-                                    isReddit: true,
+                                    isReddit: false,
                                     playDisabled: isSynthesizingSpeechSummary || isPreparingLocalTTSSummary || isSpeakingLocallySummary || summary.summary.isEmpty,
                                     stopDisabled: !isSynthesizingSpeechSummary && !isPreparingLocalTTSSummary && !isSpeakingLocallySummary,
                                     localDisabled: isSynthesizingSpeechSummary || summary.summary.isEmpty,
@@ -840,9 +875,8 @@ struct RedditDetailView: View {
                             .padding(.top, 4)
                             #endif
 
-                            // Directly render markdown content
-                            if colorScheme == .dark {
-                                SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
+                            // Same treatment as the article summary card: text sits directly on the card.
+                            SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary), summaryStructure: true)
                                     .font(.body)
                                     .onAskAI { selection in
                                         askAIFromRedditSelection(selection, post: post, action: .standard)
@@ -850,26 +884,10 @@ struct RedditDetailView: View {
                                     .onAskAIWeb { selection in
                                         askAIFromRedditSelection(selection, post: post, action: .web)
                                     }
-                                    .padding()
-                                    .background(Color.black)
-                                    .cornerRadius(10)
-                            } else {
-                                SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
-                                    .font(.body)
-                                    .onAskAI { selection in
-                                        askAIFromRedditSelection(selection, post: post, action: .standard)
-                                    }
-                                    .onAskAIWeb { selection in
-                                        askAIFromRedditSelection(selection, post: post, action: .web)
-                                    }
-                                    .padding()
-                                    .background(.regularMaterial)
-                                    .cornerRadius(10)
-                            }
                         }
                         // Throughput badge for on-device providers (comment summary)
                         let _redditCommentSummaryProvider = appState.settings.selectedSummaryProvider
-                        if (_redditCommentSummaryProvider == .mlxLocal || _redditCommentSummaryProvider == .coreAIMLXLocal || _redditCommentSummaryProvider == .appleLocal || _redditCommentSummaryProvider == .applePCCGateway || _redditCommentSummaryProvider == .summarizeDaemon),
+                        if (_redditCommentSummaryProvider == .coreAIMLXLocal || _redditCommentSummaryProvider == .appleLocal || _redditCommentSummaryProvider == .applePCCGateway || _redditCommentSummaryProvider == .summarizeDaemon),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -879,6 +897,9 @@ struct RedditDetailView: View {
                             .padding(.horizontal, 4)
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .modifier(ArticleGlassyBackgroundModifier())
                     Divider()
                 }
 
@@ -912,95 +933,35 @@ struct RedditDetailView: View {
                         // Display the toggled Q&A interface
                         if showQAInterface {
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("Ask a question about this post:")
-                                    .font(.headline)
-                                
-                                if #available(iOS 26.0, *) {
-                                    TextField("Type your question...", text: $questionText)
-                                        .textFieldStyle(LiquidGlassTextFieldStyle())
-                                        .disabled(isProcessingQuestion)
-                                        .onSubmit {
-                                            if !questionText.isEmpty && !isProcessingQuestion {
-                                                askQuestion(post: post)
-                                            }
-                                        }
-                                        .onAppear {
-                                            print("📱 RedditDetailView: Q&A interface appeared")
-                                        }
-                                } else {
-                                    TextField("Type your question...", text: $questionText)
-                                        .textFieldStyle(AdaptiveLiquidGlassTextFieldStyle(cornerRadius: 12, tintColor: .blue.opacity(0.3)))
-                                        .disabled(isProcessingQuestion)
-                                        .onSubmit {
-                                            if !questionText.isEmpty && !isProcessingQuestion {
-                                                askQuestion(post: post)
-                                            }
-                                        }
-                                        .onAppear {
-                                            print("📱 RedditDetailView: Q&A interface appeared")
-                                        }
-                                }
-                                
-                                HStack {
-                                    Button(action: {
-                                        if !questionText.isEmpty {
-                                            askQuestion(post: post)
-                                        }
-                                    }) {
-                                        Image(systemName: "questionmark.circle")
-                                            .font(.subheadline)
-                                    }
-                                    .accessibilityLabel("Ask")
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    .disabled(questionText.isEmpty || isProcessingQuestion)
-
-                                    if shouldShowExplicitWebAIControls {
-                                        Button(action: {
-                                            askWebQuestion(post: post)
-                                        }) {
-                                            Image(systemName: "globe")
-                                                .font(.subheadline)
-                                        }
-                                        .accessibilityLabel(appState.settings.selectedWebAIProvider.displayName)
-                                        #if os(macOS)
-                                        .buttonStyle(RedditQAActionButtonStyle())
-                                        #else
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        #endif
-                                        .disabled(questionText.isEmpty || isProcessingQuestion)
-                                    }
-                                    
-                                    Button(action: {
+                                AskComposerBar(
+                                    text: $questionText,
+                                    placeholder: "Ask about this post and its comments…",
+                                    accent: .orange,
+                                    isBusy: isProcessingQuestion,
+                                    suggestions: [
+                                        .init(label: "Key points", question: "What are the key points of this post and its comments?"),
+                                        .init(label: "Where do people disagree?", question: "Where do the commenters disagree?"),
+                                        .init(label: "Consensus", question: "What's the overall consensus in the comments?")
+                                    ],
+                                    webAskLabel: shouldShowExplicitWebAIControls
+                                        ? "Ask \(appState.settings.selectedWebAIProvider.displayName)"
+                                        : nil,
+                                    onAsk: { askQuestion(post: post) },
+                                    onAskWeb: shouldShowExplicitWebAIControls ? { askWebQuestion(post: post) } : nil,
+                                    onClose: {
                                         showQAInterface = false
                                         questionText = ""
                                         answerText = "Ask a question about this post or its comments..."
+                                        markdownAnswerText = nil
                                         answerParagraphs = nil
                                         commentsSentToLLMCount = nil
-                                        print("📱 RedditDetailView: Q&A interface canceled by user")
-                                    }) {
-                                        Image(systemName: "xmark.circle")
-                                            .font(.subheadline)
                                     }
-                                    .accessibilityLabel("Cancel")
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    #if !os(macOS)
-                                    Spacer()
-                                    #endif
-                                }
-                                #if os(macOS)
-                                .modifier(RedditCommentsActionPillModifier())
-                                #endif
-                                
+                                )
+
+                                if isProcessingQuestion || !qaAnswerUnavailable {
+                                    VStack(alignment: .leading, spacing: 8) {
                                 let qaStreamText = appState.mlxStreamingText
-                                if isProcessingQuestion && (appState.settings.selectedSummaryProvider == .mlxLocal || appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !qaStreamText.isEmpty {
+                                if isProcessingQuestion && (appState.settings.selectedSummaryProvider == .coreAIMLXLocal) && !qaStreamText.isEmpty {
                                     Text(qaStreamText)
                                         .font(.body)
                                         .foregroundColor(.primary)
@@ -1016,10 +977,10 @@ struct RedditDetailView: View {
                                         .font(.body)
                                         .foregroundColor(.primary)
                                         .onAskAI { selection in
-                                            askAIFromRedditSelection(selection, post: post, action: .standard)
+                                            askAIFromRedditQASelection(selection, context: paragraphs.joined(separator: "\n\n"), post: post, action: .standard)
                                         }
                                         .onAskAIWeb { selection in
-                                            askAIFromRedditSelection(selection, post: post, action: .web)
+                                            askAIFromRedditQASelection(selection, context: paragraphs.joined(separator: "\n\n"), post: post, action: .web)
                                         }
                                         .padding(.vertical, 16)
                                         .padding(.horizontal, 20)
@@ -1034,87 +995,54 @@ struct RedditDetailView: View {
                                         .font(.body)
                                         .foregroundColor(.primary)
                                         .onAskAI { selection in
-                                            askAIFromRedditSelection(selection, post: post, action: .standard)
+                                            askAIFromRedditQASelection(selection, context: answerText, post: post, action: .standard)
                                         }
                                         .onAskAIWeb { selection in
-                                            askAIFromRedditSelection(selection, post: post, action: .web)
+                                            askAIFromRedditQASelection(selection, context: answerText, post: post, action: .web)
                                         }
                                         .padding(.vertical, 16)
                                         .padding(.horizontal, 20)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                HStack(spacing: qaAnswerButtonSpacing) {
-                                    // Cloud TTS button
-                                    Button {
-                                        speakAnswerQA(answerText)
-                                    } label: {
-                                        Image(systemName: "speaker.wave.2")
-                                            .font(.subheadline)
-                                    }
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    .ttsActiveGlow(isSynthesizingSpeechQA, color: .blue)
-                                    .help("Read aloud (Cloud)")
-                                    .disabled(isSynthesizingSpeechQA || isPreparingLocalTTSQA || isSpeakingLocallyQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
-                                    
-                                    // Stop speech
-                                    Button {
-                                        stopQASpeech()
-                                    } label: {
-                                        Image(systemName: "stop.fill")
-                                            .font(.subheadline)
-                                    }
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    .help("Stop speech")
-                                    
-                                    // Local TTS button
-                                    Button {
-                                        speakAnswerLocallyQA(answerText)
-                                    } label: {
-                                        Image(systemName: "speaker.wave.2.circle")
-                                            .font(.subheadline)
-                                    }
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    .ttsActiveGlow(isPreparingLocalTTSQA || isSpeakingLocallyQA, color: .green)
-                                    .help("Read aloud (Local)")
-                                    .disabled(isSynthesizingSpeechQA || answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
-                                    
-                                    // Copy button
-                                    Button(action: {
-                                        #if os(iOS)
-                                        UIPasteboard.general.string = answerText
-                                        #elseif os(macOS)
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(answerText, forType: .string)
-                                        #endif
-                                    }) {
-                                        Image(systemName: "doc.on.doc")
-                                            .font(.subheadline)
-                                    }
-                                    #if os(macOS)
-                                    .buttonStyle(RedditQAActionButtonStyle())
-                                    #else
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    #endif
-                                    .help("Copy answer")
-                                    .disabled(answerText.isEmpty || answerText == "Ask a question about this post or its comments...")
+                                HStack(spacing: 2) {
+                                    SummaryTTSMiniPlayer(
+                                        isReddit: false,
+                                        playDisabled: isSynthesizingSpeechQA || isPreparingLocalTTSQA || isSpeakingLocallyQA || qaAnswerUnavailable,
+                                        stopDisabled: !isSynthesizingSpeechQA && !isPreparingLocalTTSQA && !isSpeakingLocallyQA,
+                                        localDisabled: isSynthesizingSpeechQA || qaAnswerUnavailable,
+                                        localIsActive: isPreparingLocalTTSQA || isSpeakingLocallyQA,
+                                        onPlay: { speakAnswerQA(answerText) },
+                                        onStop: stopQASpeech,
+                                        onLocal: { speakAnswerLocallyQA(answerText) },
+                                        playHelp: "Read aloud (Cloud)",
+                                        localHelp: "Read aloud (Local)"
+                                    )
+                                    SummaryGlassActionButton(
+                                        systemName: "doc.on.doc",
+                                        tint: .secondary,
+                                        isDisabled: qaAnswerUnavailable,
+                                        helpText: "Copy answer",
+                                        action: {
+                                            #if os(macOS)
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(answerText, forType: .string)
+                                            #else
+                                            UIPasteboard.general.string = answerText
+                                            #endif
+                                        }
+                                    )
                                 }
-                                #if os(macOS)
-                                .modifier(RedditCommentsActionPillModifier())
-                                #endif
-                                .padding(.top, 5)
-                                
+                                .padding(.leading, 12)
+                                .padding(.top, 2)
+
+                                    }
+                                    .padding(8)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                            .fill(Color.primary.opacity(colorScheme == .dark ? 0.05 : 0.035))
+                                    )
+                                }
+
                                 // TTS status indicators
                                 if isSynthesizingSpeechQA {
                                     HStack {
@@ -1175,7 +1103,7 @@ struct RedditDetailView: View {
 
                                 // Throughput badge for on-device providers (Q&A only)
                                 let _redditQAProvider = appState.settings.selectedSummaryProvider
-                                if (_redditQAProvider == .mlxLocal || _redditQAProvider == .coreAIMLXLocal || _redditQAProvider == .appleLocal || _redditQAProvider == .applePCCGateway || _redditQAProvider == .summarizeDaemon),
+                                if (_redditQAProvider == .coreAIMLXLocal || _redditQAProvider == .appleLocal || _redditQAProvider == .applePCCGateway || _redditQAProvider == .summarizeDaemon),
                                    !appState.mlxLastQAThroughput.isEmpty,
                                    !isProcessingQuestion,
                                    answerText != "Ask a question about this post or its comments..." {
@@ -1187,8 +1115,6 @@ struct RedditDetailView: View {
                                     .padding(.top, 4)
                                 }
                             }
-                            .padding()
-                            .modifier(AdaptiveGlassModifier(cornerRadius: 12, tintColor: .blue.opacity(0.1)))
                             .padding(.bottom, 16)
                         }
                         
@@ -1200,19 +1126,11 @@ struct RedditDetailView: View {
                                 print("🔵 Load more comments button tapped")
                                 loadMoreComments()
                             } label: {
-                                HStack {
-                                    Image(systemName: "arrow.down.circle.fill")
-                                        .font(.system(size: 20))
-                                    Text("Load more comments")
-                                        .font(.system(size: 16, weight: .medium))
-                                }
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 12)
-                                .background(Color.blue)
-                                .cornerRadius(25)
+                                Label("Load more comments", systemImage: "chevron.down")
+                                    .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(PlainButtonStyle()) // Use plain style to avoid interference
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
                             .padding(.vertical, 16)
                             .onAppear {
                                 print("📱 Load more comments button appeared, hasMoreCommentsToLoad: \(hasMoreCommentsToLoad)")
@@ -1220,48 +1138,58 @@ struct RedditDetailView: View {
                         }
                     }
                 }
-                .padding(14)
-                .background {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .fill(
-                                    colorScheme == .dark
-                                        ? Color(red: 0.045, green: 0.047, blue: 0.075).opacity(0.86)
-                                        : Color.white.opacity(0.82)
-                                )
-                        )
+                .padding(.top, 8)
+    }
+
+    private func postDetailView(for post: RedditPost, proxy: ScrollViewProxy) -> some View {
+        let visiblePostSummary = post.summary
+        return ZStack {
+            AppColors.background
+                .ignoresSafeArea()
+            
+            Group {
+            #if os(macOS)
+            // Wide panes: post on the left, comments on the right, each scrolling on its own.
+            GeometryReader { geo in
+                if geo.size.width >= 1100 {
+                    HStack(alignment: .top, spacing: 0) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 16) {
+                                redditPostMainContent(for: post, proxy: proxy)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 40)
+                            .padding(.top, 28)
+                            .padding(.bottom, 40)
+                        }
+                        .frame(width: geo.size.width * 0.56)
+
+                        Rectangle()
+                            .fill(AppColors.separatorColor)
+                            .frame(width: 0.5)
+                            .ignoresSafeArea()
+
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 16) {
+                                redditCommentsContent(for: post, proxy: proxy)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 28)
+                            .padding(.top, 28)
+                            .padding(.bottom, 40)
+                        }
+                    }
+                } else {
+                    redditSingleColumn(for: post, proxy: proxy)
                 }
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(
-                            colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08),
-                            lineWidth: 1
-                        )
-                )
-                .overlay(alignment: .top) {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.45), lineWidth: 1)
-                        .blendMode(.screen)
-                }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.1), radius: 24, x: 0, y: 12)
             }
-            .padding()
-            #if os(iOS)
-            // Add top padding for navigation overlay - balanced for iPhone and iPad
-            .padding(.top, UIDevice.current.userInterfaceIdiom == .phone ? 120 : 180)
-            #endif
-            // No extra top padding needed on macOS since there's no overlay navigation
-            #if os(iOS)
-            // Apply enhanced swipe back only for iPad
-            .modifier(ConditionalEnhancedSwipeBack(isEnabled: UIDevice.current.userInterfaceIdiom != .phone, appState: appState))
             #else
-            .enhancedSwipeBack {
-                appState.navigateBack()
-            }
+            redditSingleColumn(for: post, proxy: proxy)
             #endif
-        }
+            }
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                redditPaneWidth = width
+            }
         
         .overlay(alignment: .bottomTrailing) {
             #if os(iOS)
@@ -1279,19 +1207,7 @@ struct RedditDetailView: View {
                 .padding(.bottom, 24)
             }
             #else
-            Button(action: {
-                withAnimation(.easeInOut) {
-                    proxy.scrollTo(redditTopAnchor, anchor: .top)
-                }
-            }) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2.weight(.semibold))
-            }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
-            .controlSize(.large)
-            .padding(.trailing, 24)
-            .padding(.bottom, 24)
+            EmptyView()
             #endif
         }
         
@@ -1398,6 +1314,10 @@ struct RedditDetailView: View {
         #endif
     }
 
+    private var qaAnswerUnavailable: Bool {
+        answerText.isEmpty || answerText == "Ask a question about this post or its comments..."
+    }
+
     private func commentsSectionHeader(for post: RedditPost) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
@@ -1430,29 +1350,40 @@ struct RedditDetailView: View {
             HStack(spacing: 6) {
                 compactCommentSortMenu(for: post)
                 RedditCommentsActionCapsule {
+                    Button {
+                        commentSummary = nil
+                        summarizeComments(for: post)
+                    } label: {
+                        Label("Summarize", systemImage: "text.quote")
+                    }
+                    .buttonStyle(RedditCommentsChromeLabeledButtonStyle())
+                    .accessibilityLabel("Summarize comments")
+                    .help("Summarize comments")
+                    .disabled(isLoadingComments)
+
+                    Button { showQAInterface.toggle() } label: {
+                        Label(showQAInterface ? "Close" : "Ask", systemImage: showQAInterface ? "xmark.circle" : "questionmark.circle")
+                    }
+                    .buttonStyle(RedditCommentsChromeLabeledButtonStyle())
+                    .accessibilityLabel(showQAInterface ? "Close Q&A" : "Ask about comments")
+                    .help(showQAInterface ? "Close" : "Ask")
+                    .disabled(isLoadingComments)
+
                     compactAnalysisButton(grouped: true)
                     if shouldShowExplicitWebAIControls {
                         compactWebActionsMenu(for: post, grouped: true)
                     }
-                    compactSummarizeButton(for: post, grouped: true)
-                    compactAskButton(grouped: true)
                 }
             }
 
             HStack(spacing: 6) {
-                compactCommentSortMenu(for: post)
                 RedditCommentsActionCapsule {
                     compactSummarizeButton(for: post, grouped: true)
                     compactAskButton(grouped: true)
-                    compactOverflowMenu(for: post, includesSummary: false, grouped: true)
-                }
-            }
-
-            HStack(spacing: 6) {
-                compactCommentSortMenu(for: post)
-                RedditCommentsActionCapsule {
-                    compactAskButton(grouped: true)
-                    compactOverflowMenu(for: post, includesSummary: true, grouped: true)
+                    compactAnalysisButton(grouped: true)
+                    if shouldShowExplicitWebAIControls {
+                        compactWebActionsMenu(for: post, grouped: true)
+                    }
                 }
             }
         }
@@ -1498,27 +1429,31 @@ struct RedditDetailView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Deep Analysis")
+        .help("Deep Analysis")
+        .disabled(isLoadingComments)
     }
 
     private func compactWebActionsMenu(for post: RedditPost, grouped: Bool = false) -> some View {
         Menu {
-            Button {
-                summarizeComments(for: post, forceWebAI: true)
-            } label: {
-                Label("Comment Summary", systemImage: "text.redaction")
-            }
-
-            Button {
-                analyticsProviderOverride = .webAI
-                isShowingAnalytics = true
-            } label: {
-                Label("Deep Analysis", systemImage: "chart.pie.fill")
+            Section("Send to \(appState.settings.selectedWebAIProvider.displayName)") {
+                Button {
+                    summarizeComments(for: post, forceWebAI: true)
+                } label: {
+                    Label("Comment Summary", systemImage: "quote.bubble")
+                }
+                Button {
+                    analyticsProviderOverride = .webAI
+                    isShowingAnalytics = true
+                } label: {
+                    Label("Deep Analysis", systemImage: "chart.pie.fill")
+                }
             }
         } label: {
-            compactHeaderIcon(systemName: "globe", grouped: grouped)
+            compactHeaderIcon(systemName: "quote.bubble", grouped: grouped)
         }
         .buttonStyle(.plain)
-        .help("Send comment prompts to \(appState.settings.selectedWebAIProvider.displayName)")
+        .accessibilityLabel("Send to \(appState.settings.selectedWebAIProvider.displayName)")
+        .help("Send to \(appState.settings.selectedWebAIProvider.displayName)")
     }
 
     private func compactSummarizeButton(for post: RedditPost, grouped: Bool = false) -> some View {
@@ -1527,7 +1462,7 @@ struct RedditDetailView: View {
             commentSummary = nil
             summarizeComments(for: post)
         } label: {
-            compactHeaderIcon(systemName: "text.redaction", grouped: grouped)
+            compactHeaderIcon(systemName: "text.quote", grouped: grouped)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Summarize")
@@ -1544,7 +1479,7 @@ struct RedditDetailView: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(showQAInterface ? "Hide Q&A" : "Ask")
+        .accessibilityLabel(showQAInterface ? "Close Q&A" : "Ask")
         .disabled(isLoadingComments)
     }
 
@@ -1561,7 +1496,7 @@ struct RedditDetailView: View {
                 Button {
                     summarizeComments(for: post, forceWebAI: true)
                 } label: {
-                    Label("Web Summary", systemImage: "globe")
+                    Label("Web Summary", systemImage: "quote.bubble")
                 }
 
                 Button {
@@ -2027,7 +1962,7 @@ struct RedditDetailView: View {
         // JSON format instructions confuse Apple Intelligence and produce garbled output.
         let provider = appState.settings.selectedSummaryProvider
         let questionToSend: String
-        if provider == .appleLocal || provider == .mlxLocal || provider == .coreAIMLXLocal || provider == .applePCCGateway || provider == .summarizeDaemon {
+        if provider == .appleLocal || provider == .coreAIMLXLocal || provider == .applePCCGateway || provider == .summarizeDaemon {
             questionToSend = questionText
         } else {
             questionToSend = """
@@ -2090,7 +2025,35 @@ Each item ≤ 2–3 sentences.
         }
     }
 
-    private func askAIFromRedditSelection(_ selection: String, post: RedditPost, action: AskAISelectionAction) {
+    private func askAIFromRedditQASelection(
+        _ selection: String,
+        context: String,
+        post: RedditPost,
+        action: AskAISelectionAction
+    ) {
+        let source = appState.redditSelectionSourceContext(post: post, comments: comments)
+        let origin = AskAISelectionOrigin(
+            sourceLabel: source.label,
+            sourceText: source.text,
+            originalQuestion: previousQuestionText ?? questionText,
+            originalAnswer: answerText
+        )
+        askAIFromRedditSelection(
+            selection,
+            context: askAINearbyRenderedContext(selectedText: selection, in: context),
+            post: post,
+            action: action,
+            selectionOrigin: origin
+        )
+    }
+
+    private func askAIFromRedditSelection(
+        _ selection: String,
+        context: String = "",
+        post: RedditPost,
+        action: AskAISelectionAction,
+        selectionOrigin: AskAISelectionOrigin? = nil
+    ) {
         let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -2101,11 +2064,24 @@ Each item ≤ 2–3 sentences.
         selectionAskAIError = nil
         showSelectionAskAIResponse = true
 
-        let prompt = appState.redditQAPrompt(
-            post: post,
-            comments: comments,
-            question: "What is said about \(trimmed)?"
-        )
+        let prompt: String
+        if let selectionOrigin {
+            prompt = buildAskAISelectionPrompt(
+                selectedText: trimmed,
+                extractedContext: context,
+                sourceContext: selectionOrigin.boundedSource(additionalAnswer: answerText),
+                sourceLabel: selectionOrigin.promptSourceLabel
+            )
+        } else {
+            prompt = appState.redditQAPrompt(
+                post: post,
+                comments: comments,
+                question: "What is said about \(trimmed)?"
+            )
+        }
+        guard !prompt.isEmpty else { return }
+
+        self.selectionAskAIOrigin = selectionOrigin
 
         selectionAskAITask = Task {
             let answer = await withCheckedContinuation { continuation in
@@ -2640,7 +2616,9 @@ Each item ≤ 2–3 sentences.
             VStack(alignment: .leading, spacing: 14) {
                 ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                     Text(block)
-                        .font(.system(size: 15))
+                        // Match the article reader's body type (17px, 16px in narrow panes).
+                        .font(.system(size: redditPaneWidth > 0 && redditPaneWidth < 760 ? 16 : 17))
+                        .lineSpacing(5)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3360,7 +3338,7 @@ Each item ≤ 2–3 sentences.
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in onCompleted() }
             }
@@ -3369,7 +3347,7 @@ Each item ≤ 2–3 sentences.
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }
@@ -3505,7 +3483,7 @@ Each item ≤ 2–3 sentences.
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in onCompleted() }
             }
@@ -3514,7 +3492,7 @@ Each item ≤ 2–3 sentences.
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }
@@ -3938,7 +3916,7 @@ struct CommentAnalyticsViewIntegrated: View {
             
             if isThematicAnalysisLoading {
                 let thematicStreamText = appState.mlxStreamingText
-                if (effectiveSummaryProvider == .mlxLocal || effectiveSummaryProvider == .coreAIMLXLocal) && !thematicStreamText.isEmpty {
+                if (effectiveSummaryProvider == .coreAIMLXLocal) && !thematicStreamText.isEmpty {
                     ScrollView {
                         Text(thematicStreamText)
                             .font(.body)
@@ -3975,7 +3953,7 @@ struct CommentAnalyticsViewIntegrated: View {
                     .padding(.horizontal)
                 // Throughput badge for on-device providers (deep analysis)
                 let _deepAnalysisProvider = effectiveSummaryProvider
-                if (_deepAnalysisProvider == .mlxLocal || _deepAnalysisProvider == .coreAIMLXLocal || _deepAnalysisProvider == .appleLocal || _deepAnalysisProvider == .applePCCGateway || _deepAnalysisProvider == .summarizeDaemon),
+                if (_deepAnalysisProvider == .coreAIMLXLocal || _deepAnalysisProvider == .appleLocal || _deepAnalysisProvider == .applePCCGateway || _deepAnalysisProvider == .summarizeDaemon),
                    !appState.mlxLastThroughput.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "cpu").font(.caption2)
@@ -4144,7 +4122,7 @@ struct CommentAnalyticsViewIntegrated: View {
             let errorMessage: String?
             
             switch self.effectiveSummaryProvider {
-            case .appleLocal, .appleCloud, .applePCCGateway, .mlxLocal, .coreAIMLXLocal, .webAI, .summarizeDaemon:
+            case .appleLocal, .appleCloud, .applePCCGateway, .coreAIMLXLocal, .webAI, .summarizeDaemon:
                 // These providers do not need API keys for this flow.
                 canProceed = true
                 errorMessage = nil
@@ -4223,7 +4201,7 @@ struct CommentAnalyticsViewIntegrated: View {
                 }
             }
             return
-        } else if effectiveSummaryProvider == .mlxLocal || effectiveSummaryProvider == .coreAIMLXLocal {
+        } else if effectiveSummaryProvider == .coreAIMLXLocal {
             // Use MLX Local model for thematic analysis with higher token limit (2048)
             print("🧠 CommentAnalyticsViewIntegrated: Sending \(analyzedCommentCount) comments for thematic analysis using MLX Local.")
 
@@ -4345,6 +4323,7 @@ struct GlassyCommentSummary: View {
     var onAskAI: ((String) -> Void)? = nil
     var onAskAIWeb: ((String) -> Void)? = nil
     @EnvironmentObject var appState: AppState
+    @State private var didCopy = false
     // TTS state variables
     @State private var isSynthesizingSpeech: Bool = false
     @State private var isPreparingLocalTTS: Bool = false
@@ -4366,13 +4345,21 @@ struct GlassyCommentSummary: View {
 #endif
     
     var body: some View {
-VStack(alignment: .leading, spacing: 14) {
-            // Remove duplicate "Comment Summary" title since it's already shown in the main section
-            HStack(spacing: 12) {
+VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text(summary.sentiment.rawValue.capitalized)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(sentimentColor(summary.sentiment))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(sentimentColor(summary.sentiment).opacity(0.15), in: Capsule())
+                Text("\(summary.commentCount) comments")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 
                 SummaryTTSMiniPlayer(
-                    isReddit: true,
+                    isReddit: false,
                     playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally,
                     stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
                     localDisabled: isSynthesizingSpeech,
@@ -4383,16 +4370,32 @@ VStack(alignment: .leading, spacing: 14) {
                     playHelp: "Read aloud (Cloud)",
                     localHelp: "Read aloud (Local)"
                 )
+                SummaryQuietIconButton(
+                    systemName: didCopy ? "checkmark" : "doc.on.doc",
+                    tint: didCopy ? .green : nil,
+                    isDisabled: summary.summary.isEmpty,
+                    helpText: "Copy summary"
+                ) {
+                    #if os(macOS)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(summary.summary, forType: .string)
+                    #else
+                    UIPasteboard.general.string = summary.summary
+                    #endif
+                    didCopy = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopy = false }
+                }
             }
             .padding(.horizontal, 20)
-            .padding(.top, 16)
+            .padding(.top, 12)
             
-            SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary))
+            SelectableText(summary.summary, markdownText: normalizeConversationalAIReplyMarkdown(summary.summary), summaryStructure: true)
                 .font(.body)
                 .foregroundColor(.primary)
                 .onAskAI(onAskAI)
                 .onAskAIWeb(onAskAIWeb)
-                .padding(.vertical, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 16)
                 .padding(.horizontal, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             
@@ -4436,47 +4439,6 @@ VStack(alignment: .leading, spacing: 14) {
                     .padding(.horizontal, 20)
             }
             
-            // Add Copy button here
-            Button(action: {
-                #if os(iOS)
-                UIPasteboard.general.string = summary.summary
-                #elseif os(macOS)
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(summary.summary, forType: .string)
-                #endif
-            }) {
-                Label("Copy Summary", systemImage: "doc.on.doc")
-            }
-            .buttonStyle(LiquidGlassButtonStyle())
-            .disabled(summary.summary.isEmpty)
-            .padding(.top, 5)
-            .padding(.horizontal, 20)
-            
-            // Stats section
-            VStack(alignment: .leading, spacing: 10) {
-                // Add comment count indicator first
-                Text("Summary based on \(summary.commentCount) comments")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                
-                HStack {
-                    Text("Sentiment: ")
-                        .fontWeight(.semibold)
-                    Text(summary.sentiment.rawValue.capitalized)
-                        .foregroundColor(sentimentColor(summary.sentiment))
-                        .fontWeight(.bold)
-                }
-                if !summary.topCommenters.isEmpty {
-                    Text("Top commenters: \(summary.topCommenters.joined(separator: ", "))")
-                        .font(.subheadline)
-                }
-                if !summary.mainTopics.isEmpty {
-                    Text("Main topics: \(summary.mainTopics.joined(separator: ", "))")
-                        .font(.subheadline)
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 16)
         }
         .modifier(GlassyBackgroundModifier())
         .onAppear {
@@ -4943,7 +4905,7 @@ VStack(alignment: .leading, spacing: 14) {
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in
                     onCompleted()
@@ -4954,7 +4916,7 @@ VStack(alignment: .leading, spacing: 14) {
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }
@@ -5119,10 +5081,21 @@ struct GlassySummary: View {
     
     var body: some View {
 VStack(alignment: .leading) {
-            HStack(spacing: 12) {
+            // Same header as the article summary card: label, copy, then the shared player.
+            HStack(spacing: 2) {
+                Label("Analysis", systemImage: "sparkles")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
                 Spacer()
+                SummaryQuietIconButton(
+                    systemName: "doc.on.doc",
+                    isDisabled: summary.isEmpty,
+                    helpText: "Copy summary"
+                ) {
+                    copyToClipboard(summary)
+                }
                 SummaryTTSMiniPlayer(
-                    isReddit: true,
+                    isReddit: false,
                     playDisabled: isSynthesizingSpeech || isPreparingLocalTTS || isSpeakingLocally,
                     stopDisabled: !isSynthesizingSpeech && !isPreparingLocalTTS && !isSpeakingLocally,
                     localDisabled: isSynthesizingSpeech,
@@ -5133,26 +5106,17 @@ VStack(alignment: .leading) {
                     playHelp: "Read aloud (Cloud)",
                     localHelp: "Read aloud (Local)"
                 )
-                
-                // Copy button
-                Button {
-                    copyToClipboard(summary)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(.subheadline)
-                }
-                .buttonStyle(LiquidGlassButtonStyle())
-                .help("Copy summary")
             }
             .padding(.horizontal, 20)
-            .padding(.top, 16)
+            .padding(.top, 12)
             
-            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary))
+            SelectableText(summary, markdownText: normalizeConversationalAIReplyMarkdown(summary), summaryStructure: true)
                 .font(.body)
                 .foregroundColor(.primary)
                 .onAskAI(onAskAI)
                 .onAskAIWeb(onAskAIWeb)
-                .padding(.vertical, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 16)
                 .padding(.horizontal, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             
@@ -5199,7 +5163,7 @@ VStack(alignment: .leading) {
                     .padding(.bottom, 16)
             }
         }
-        .modifier(GlassyBackgroundModifier())
+        .modifier(ArticleGlassyBackgroundModifier())
         .onAppear {
             // Set up sound delegate callbacks
             #if os(iOS)
@@ -5666,7 +5630,7 @@ VStack(alignment: .leading) {
         taskStore = Task {
             defer {
                 if !PersistenceManager.shared.loadSettings().kokoroPrecacheEnabled {
-                    KokoroTTSService.shared.unloadIfAllowed()
+                    KokoroTTSService.shared.scheduleIdleUnload()
                 }
                 Task { @MainActor in
                     onCompleted()
@@ -5677,7 +5641,7 @@ VStack(alignment: .leading) {
                 guard !trimmed.isEmpty else { return }
 
                 func makeKokoroChunks(from input: String) -> [String] {
-                    let firstSize = min(240, input.count)
+                    let firstSize = KokoroTTSService.shared.firstReadAloudChunkLength(in: input)
                     let firstChunk = String(input.prefix(firstSize))
                     let remaining = String(input.dropFirst(firstSize)).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !remaining.isEmpty else { return [firstChunk] }

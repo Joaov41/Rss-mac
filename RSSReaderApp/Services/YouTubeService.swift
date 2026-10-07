@@ -97,6 +97,7 @@ actor YouTubeService {
 
     private let session: URLSession
     private var memoryTranscripts: [String: YouTubeTranscript] = [:]
+    private var channelAvatarCache: [String: URL] = [:]
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -147,6 +148,36 @@ actor YouTubeService {
         }
 
         return try Self.parseChannelFeed(data, feedURL: urlString)
+    }
+
+    func channelAvatarURL(channelID rawChannelID: String) async -> URL? {
+        let channelID = rawChannelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !channelID.isEmpty else { return nil }
+        if let cachedURL = channelAvatarCache[channelID] { return cachedURL }
+
+        for (index, url) in Self.channelAvatarPageURLs(channelID: channelID).enumerated() {
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25)
+            request.setValue(Self.browserUserAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+
+            if let (data, response) = try? await session.data(for: request),
+               let http = response as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode),
+               let html = String(data: data, encoding: .utf8),
+               let avatarURL = Self.parseChannelAvatarURL(from: html) {
+                channelAvatarCache[channelID] = avatarURL
+                return avatarURL
+            }
+
+            if index == 0 {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+
+        // Do not negatively cache failures. YouTube can briefly return consent,
+        // throttling, or incomplete pages; a later row appearance should retry.
+        return nil
     }
 
     func transcript(videoID: String, preferredLanguageCodes: [String] = Locale.preferredLanguages) async throws -> YouTubeTranscript {
@@ -402,6 +433,42 @@ actor YouTubeService {
 
     static func parseChannelFeed(_ data: Data, feedURL: String) throws -> Feed {
         try YouTubeAtomParser(data: data, feedURL: feedURL).parse()
+    }
+
+    static func channelAvatarPageURLs(channelID: String) -> [URL] {
+        [
+            URL(string: "https://www.youtube.com/channel/\(channelID)?hl=en"),
+            URL(string: "https://m.youtube.com/channel/\(channelID)?hl=en&cbrd=1&ucbcb=1")
+        ].compactMap { $0 }
+    }
+
+    static func parseChannelAvatarURL(from html: String) -> URL? {
+        let patterns = [
+            #"<meta\b[^>]*(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"'][^>]*content\s*=\s*[\"']([^\"']+)[\"'][^>]*>"#,
+            #"<meta\b[^>]*content\s*=\s*[\"']([^\"']+)[\"'][^>]*(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"'][^>]*>"#
+        ]
+
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let match = expression.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: html) else { continue }
+            let value = String(html[range])
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let url = URL(string: value), url.scheme == "https" { return url }
+        }
+
+        // YouTube sometimes omits Open Graph tags from a consent/throttled
+        // response while still embedding the channel avatar in page data.
+        let directPattern = #"https://yt3\.googleusercontent\.com/[^\s\"'<>\\]+"#
+        if let expression = try? NSRegularExpression(pattern: directPattern, options: [.caseInsensitive]),
+           let match = expression.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let range = Range(match.range, in: html),
+           let url = URL(string: String(html[range])) {
+            return url
+        }
+        return nil
     }
 
     struct CaptionTrack {

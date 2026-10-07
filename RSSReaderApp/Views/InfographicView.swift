@@ -467,12 +467,12 @@ struct WebView: UIViewRepresentable {
             }
             var actions = suggestedActions
             if parent.onAskAI != nil {
-                actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+                actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "questionmark.circle")) { [weak self] _ in
                     self?.sendSelection(to: self?.parent.onAskAI)
                 })
             }
             if parent.onAskAIWeb != nil {
-                actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "globe")) { [weak self] _ in
+                actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "quote.bubble")) { [weak self] _ in
                     self?.sendSelection(to: self?.parent.onAskAIWeb)
                 })
             }

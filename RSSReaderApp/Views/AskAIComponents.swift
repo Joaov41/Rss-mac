@@ -14,6 +14,194 @@ enum AskAISelectionAction {
 private let conversationalMarkdownParagraphMarker = "\u{E000}"
 private let conversationalMarkdownParagraphSeparator = "\n\n\(conversationalMarkdownParagraphMarker)\n\n"
 
+/// Carries the bounded source that grounded an answer into a later selection
+/// follow-up. The source and the original Q&A are kept separate so a reply
+/// selection can add its current displayed answer without losing the source.
+struct AskAISelectionOrigin {
+    let sourceLabel: String
+    let sourceText: String
+    let originalQuestion: String?
+    let originalAnswer: String?
+
+    init(
+        sourceLabel: String,
+        sourceText: String,
+        originalQuestion: String? = nil,
+        originalAnswer: String? = nil
+    ) {
+        self.sourceLabel = sourceLabel
+        self.sourceText = sourceText
+        self.originalQuestion = originalQuestion
+        self.originalAnswer = originalAnswer
+    }
+
+    var promptSourceLabel: String {
+        let hasQA = !(originalQuestion?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            || !(originalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        return hasQA ? "Original source and Q&A context" : sourceLabel
+    }
+
+    func boundedSource(additionalAnswer: String? = nil, maxCharacters: Int = 40_000) -> String {
+        func normalized(_ value: String?) -> String {
+            guard let value else { return "" }
+            return value
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+                .replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let source = normalized(sourceText)
+        let question = normalized(originalQuestion)
+        let answer = normalized(originalAnswer)
+        let currentAnswer = normalized(additionalAnswer)
+        var qaSections: [(label: String, body: String)] = []
+        if !question.isEmpty {
+            qaSections.append(("Original Q&A question", question))
+        }
+        if !answer.isEmpty {
+            qaSections.append(("Complete Q&A answer", answer))
+        }
+        if !currentAnswer.isEmpty, currentAnswer != answer {
+            qaSections.append(("Current displayed Ask AI answer", currentAnswer))
+        }
+        let sourceLabel = sourceLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Original source"
+            : sourceLabel
+        let sectionCount = (source.isEmpty ? 0 : 1) + qaSections.count
+        let separatorBudget = max(0, sectionCount - 1) * 2
+        let sourceHeaderBudget = source.isEmpty ? 0 : sourceLabel.count + 2
+        let qaHeaderBudget = qaSections.reduce(0) { $0 + $1.label.count + 2 }
+        let availableBodyBudget = max(0, maxCharacters - separatorBudget - sourceHeaderBudget - qaHeaderBudget)
+        let qaBodyCount = qaSections.reduce(0) { $0 + $1.body.count }
+
+        // Keep at least a quarter of the available body budget for the source
+        // when both the source and Q&A are oversized. This prevents a long
+        // answer from silently replacing the article or Reddit grounding.
+        let sourceMinimumBudget = source.isEmpty ? 0 : min(source.count, max(1, availableBodyBudget / 4))
+        let sourceBudget: Int
+        if source.isEmpty {
+            sourceBudget = 0
+        } else if source.count + qaBodyCount <= availableBodyBudget {
+            sourceBudget = source.count
+        } else {
+            let qaReservation = min(qaBodyCount, max(0, availableBodyBudget - sourceMinimumBudget))
+            sourceBudget = min(source.count, max(sourceMinimumBudget, availableBodyBudget - qaReservation))
+        }
+
+        let qaBudget = max(0, availableBodyBudget - sourceBudget)
+        var qaBodyBudgets = Array(repeating: 0, count: qaSections.count)
+        var remainingQABudget = qaBudget
+        for index in qaSections.indices where remainingQABudget > 0 {
+            qaBodyBudgets[index] = min(1, qaSections[index].body.count)
+            remainingQABudget -= qaBodyBudgets[index]
+        }
+        while remainingQABudget > 0 {
+            var madeProgress = false
+            for index in qaSections.indices where remainingQABudget > 0 {
+                guard qaBodyBudgets[index] < qaSections[index].body.count else { continue }
+                qaBodyBudgets[index] += 1
+                remainingQABudget -= 1
+                madeProgress = true
+            }
+            if !madeProgress { break }
+        }
+
+        var sections: [String] = []
+        if sourceBudget > 0 {
+            sections.append("\(sourceLabel):\n\(source.prefix(sourceBudget))")
+        }
+        for (index, section) in qaSections.enumerated() where qaBodyBudgets[index] > 0 {
+            sections.append("\(section.label):\n\(section.body.prefix(qaBodyBudgets[index]))")
+        }
+
+        let composed = sections.joined(separator: "\n\n")
+        return composed.count > maxCharacters ? String(composed.prefix(maxCharacters)) : composed
+    }
+}
+
+func buildAskAISelectionPrompt(
+    selectedText: String,
+    extractedContext: String,
+    sourceContext: String,
+    sourceLabel: String = "Original source"
+) -> String {
+    func normalized(_ value: String, maxCharacters: Int) -> String {
+        var normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.count > maxCharacters {
+            normalized = String(normalized.prefix(maxCharacters))
+        }
+        return normalized
+    }
+
+    let selected = normalized(selectedText, maxCharacters: 8_000)
+    let context = normalized(extractedContext, maxCharacters: 16_000)
+    let source = normalized(sourceContext, maxCharacters: 40_000)
+    let label = normalized(sourceLabel, maxCharacters: 120)
+    guard !selected.isEmpty else { return "" }
+
+    if !source.isEmpty {
+        return """
+        Answer the question using only the selected text, nearby rendered context, and original source material.
+
+        Rules:
+        - Return plain text only.
+        - Do not use Markdown symbols, headings, bullets, or code fences.
+        - Use short paragraphs separated by a blank line when the answer has multiple ideas.
+        - Treat the selected text as the thing being asked about.
+        - Use the original source material to verify, explain, or add relevant detail.
+        - If the original source material does not answer it, say the information is not available in the source.
+
+        Question:
+        What is said about this selected text in the original source?
+
+        Selected text:
+        \(selected)
+
+        Nearby rendered context:
+        \(context.isEmpty ? "(No nearby rendered context was captured.)" : context)
+
+        \(label.isEmpty ? "Original source" : label):
+        \(source)
+        """
+    }
+
+    return """
+    Answer the question using only the selected text and nearby rendered context.
+
+    Rules:
+    - Return plain text only.
+    - Do not use Markdown symbols, headings, bullets, or code fences.
+    - Use short paragraphs separated by a blank line when the answer has multiple ideas.
+    - If the selected text and nearby context do not answer it, say the information is not available.
+
+    Question:
+    What is said about this selected text?
+
+    Selected text:
+    \(selected)
+
+    Nearby rendered context:
+    \(context.isEmpty ? "(No nearby rendered context was captured.)" : context)
+    """
+}
+
+func askAINearbyRenderedContext(selectedText: String, in renderedText: String, window: Int = 320) -> String {
+    let selected = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !selected.isEmpty else { return "" }
+    let text = renderedText
+    guard let range = text.range(of: selected) else {
+        return String(text.prefix(window * 2))
+    }
+    let start = text.index(range.lowerBound, offsetBy: -window, limitedBy: text.startIndex) ?? text.startIndex
+    let end = text.index(range.upperBound, offsetBy: window, limitedBy: text.endIndex) ?? text.endIndex
+    return String(text[start..<end])
+}
+
 /// Preserve Markdown block syntax while making provider-supplied prose line
 /// breaks visible in the native macOS text view.
 func normalizeAIReplyMarkdown(_ input: String) -> String {
@@ -242,6 +430,7 @@ struct AskAIResponseSheet: View {
     let isLoading: Bool
     let response: String?
     var markdownResponse: String? = nil
+    var selectionOrigin: AskAISelectionOrigin? = nil
     let errorMessage: String?
     let onClose: () -> Void
     let onCopy: () -> Void
@@ -260,6 +449,7 @@ struct AskAIResponseSheet: View {
                     isLoading: false,
                     response: followUpResponse,
                     markdownResponse: followUpMarkdownResponse,
+                    selectionOrigin: selectionOrigin,
                     errorMessage: nil,
                     onClose: {
                         showFollowUpSheet = false
@@ -418,25 +608,18 @@ struct AskAIResponseSheet: View {
         let selected = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let context = formatAskAIResponseForDisplay(currentAnswer)
         guard !selected.isEmpty, !context.isEmpty else { return }
+        let nearbyContext = askAINearbyRenderedContext(selectedText: selected, in: context)
 
-        let prompt = """
-        Answer the question using only the selected text and the current Ask AI answer.
-
-        Rules:
-        - Return plain text only.
-        - Do not use Markdown symbols, headings, bullets, or code fences.
-        - Use short paragraphs separated by a blank line when the answer has multiple ideas.
-        - If the current answer does not contain enough information, say so.
-
-        Question:
-        What is said about this selected text in the current answer?
-
-        Selected text:
-        \(selected)
-
-        Current Ask AI Answer:
-        \(context)
-        """
+        let origin = selectionOrigin ?? AskAISelectionOrigin(
+            sourceLabel: "Current Ask AI answer",
+            sourceText: context
+        )
+        let prompt = buildAskAISelectionPrompt(
+            selectedText: selected,
+            extractedContext: nearbyContext,
+            sourceContext: origin.boundedSource(additionalAnswer: context),
+            sourceLabel: origin.promptSourceLabel
+        )
 
         followUpResponse = nil
         followUpMarkdownResponse = nil
@@ -535,6 +718,7 @@ extension EnvironmentValues {
 struct SelectableText: View {
     let text: String
     var markdownText: String? = nil
+    var summaryStructure: Bool = false
     var normalizesMarkdownParagraphs: Bool = true
     var font: Font = .body
     var fontWeight: Font.Weight? = nil
@@ -551,17 +735,20 @@ struct SelectableText: View {
     var onAskAIWebSelection: ((String) -> Void)? = nil
     var summaryReferenceCount: Int = 0
     var onSummaryReferenceTap: ((Int) -> Void)? = nil
+    var onTimestampTap: ((TimeInterval) -> Void)? = nil
     @Environment(\.askAISelectionHandler) private var askAISelectionHandler
     @Environment(\.askAIWebSelectionHandler) private var askAIWebSelectionHandler
 
     init(
         _ text: String,
         markdownText: String? = nil,
-        normalizesMarkdownParagraphs: Bool = true
+        normalizesMarkdownParagraphs: Bool = true,
+        summaryStructure: Bool = false
     ) {
         self.text = text
         self.markdownText = markdownText
         self.normalizesMarkdownParagraphs = normalizesMarkdownParagraphs
+        self.summaryStructure = summaryStructure
     }
 
     init(_ attributedString: AttributedString) {
@@ -590,6 +777,7 @@ struct SelectableText: View {
             text: text,
             markdownText: markdownText,
             normalizesMarkdownParagraphs: normalizesMarkdownParagraphs,
+            summaryStructure: summaryStructure,
             font: font,
             fontWeight: fontWeight,
             foregroundColor: foregroundColor,
@@ -599,7 +787,8 @@ struct SelectableText: View {
             onAskAI: onAskAISelection ?? askAISelectionHandler,
             onAskAIWeb: onAskAIWebSelection ?? askAIWebSelectionHandler,
             summaryReferenceCount: summaryReferenceCount,
-            onSummaryReferenceTap: onSummaryReferenceTap
+            onSummaryReferenceTap: onSummaryReferenceTap,
+            onTimestampTap: onTimestampTap
         )
         .frame(width: frameWidth, height: frameHeight)
         .frame(maxWidth: frameMaxWidth, maxHeight: frameMaxHeight)
@@ -622,6 +811,12 @@ struct SelectableText: View {
     func font(_ font: Font) -> SelectableText {
         var copy = self
         copy.font = font
+        return copy
+    }
+
+    func onTimestampTap(_ handler: ((TimeInterval) -> Void)?) -> SelectableText {
+        var copy = self
+        copy.onTimestampTap = handler
         return copy
     }
 
@@ -795,12 +990,12 @@ final class SelectableUITextView: UITextView {
         guard onAskAI != nil || onAskAIWeb != nil else { return }
         var actions: [UIAction] = []
         if onAskAI != nil {
-            actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+            actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "questionmark.circle")) { [weak self] _ in
             self?.askAI(nil)
             })
         }
         if onAskAIWeb != nil {
-            actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "globe")) { [weak self] _ in
+            actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "quote.bubble")) { [weak self] _ in
                 self?.askAIWeb(nil)
             })
         }
@@ -935,6 +1130,13 @@ final class AskAISelectableTextView: NSTextView {
         return NSSize(width: NSView.noIntrinsicMetric, height: height)
     }
 
+    // Text re-wraps when the pane gets narrower; report the new height.
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - frame.width) > 0.5
+        super.setFrameSize(newSize)
+        if widthChanged { invalidateIntrinsicContentSize() }
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu()
         guard onAskAI != nil || onAskAIWeb != nil else { return menu }
@@ -979,6 +1181,7 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
     let text: String
     let markdownText: String?
     let normalizesMarkdownParagraphs: Bool
+    let summaryStructure: Bool
     let font: Font
     let fontWeight: Font.Weight?
     let foregroundColor: Color
@@ -989,21 +1192,28 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
     let onAskAIWeb: ((String) -> Void)?
     let summaryReferenceCount: Int
     let onSummaryReferenceTap: ((Int) -> Void)?
+    let onTimestampTap: ((TimeInterval) -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onSummaryReferenceTap: onSummaryReferenceTap)
+        Coordinator(onSummaryReferenceTap: onSummaryReferenceTap, onTimestampTap: onTimestampTap)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var onSummaryReferenceTap: ((Int) -> Void)?
+        var onTimestampTap: ((TimeInterval) -> Void)?
 
-        init(onSummaryReferenceTap: ((Int) -> Void)?) {
+        init(onSummaryReferenceTap: ((Int) -> Void)?, onTimestampTap: ((TimeInterval) -> Void)?) {
             self.onSummaryReferenceTap = onSummaryReferenceTap
+            self.onTimestampTap = onTimestampTap
         }
 
         func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-            guard let url = link as? URL,
-                  url.scheme == "rssreader-summary",
+            guard let url = link as? URL else { return false }
+            if url.scheme == "rssreader-time", let seconds = TimeInterval(url.host ?? "") {
+                onTimestampTap?(seconds)
+                return true
+            }
+            guard url.scheme == "rssreader-summary",
                   let value = url.pathComponents.last,
                   let referenceNumber = Int(value) else {
                 return false
@@ -1011,6 +1221,21 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             onSummaryReferenceTap?(referenceNumber)
             return true
         }
+    }
+
+    /// Measure for the width SwiftUI proposes, so the card grows when the pane narrows
+    /// instead of keeping the height it had at a wider width.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AskAISelectableTextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0,
+              let storage = nsView.textStorage, storage.length > 0 else { return nil }
+        let padding = (nsView.textContainer?.lineFragmentPadding ?? 5) * 2
+        let inset = nsView.textContainerInset
+        let textWidth = max(width - padding - inset.width * 2, 1)
+        let rect = storage.boundingRect(
+            with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return CGSize(width: width, height: ceil(rect.height) + inset.height * 2)
     }
 
     func makeNSView(context: Context) -> AskAISelectableTextView {
@@ -1039,6 +1264,7 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         nsView.onAskAI = onAskAI
         nsView.onAskAIWeb = onAskAIWeb
         context.coordinator.onSummaryReferenceTap = onSummaryReferenceTap
+        context.coordinator.onTimestampTap = onTimestampTap
 
         let fontKey: String
         let baseFont: NSFont
@@ -1062,8 +1288,9 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             fontKey = "subheadline"
             baseFont = NSFont.preferredFont(forTextStyle: .subheadline)
         case .body:
+            // macOS body (13pt) is too small for reading summaries and answers.
             fontKey = "body"
-            baseFont = NSFont.preferredFont(forTextStyle: .body)
+            baseFont = NSFont.systemFont(ofSize: 15)
         case .callout:
             fontKey = "callout"
             baseFont = NSFont.preferredFont(forTextStyle: .callout)
@@ -1078,7 +1305,7 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             baseFont = NSFont.preferredFont(forTextStyle: .caption2)
         default:
             fontKey = "body"
-            baseFont = NSFont.preferredFont(forTextStyle: .body)
+            baseFont = NSFont.systemFont(ofSize: 15)
         }
 
         let finalFont: NSFont
@@ -1152,6 +1379,7 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         hasher.combine(normalizedMarkdown ?? "")
         hasher.combine(normalizesMarkdownParagraphs)
+        hasher.combine(summaryStructure)
         hasher.combine(fontKey)
         hasher.combine(weightKey)
         hasher.combine(finalFont.pointSize)
@@ -1163,13 +1391,14 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
         hasher.combine(lineLimit ?? -1)
         hasher.combine(paragraphStyle.alignment.rawValue)
         hasher.combine(summaryReferenceCount)
+        hasher.combine(onTimestampTap != nil)
         let signature = hasher.finalize()
 
         if nsView.lastRenderedText != text
             || nsView.lastRenderedMarkdownText != normalizedMarkdown
             || nsView.renderSignature != signature {
             let attributedText: NSMutableAttributedString
-            if let normalizedMarkdown, !normalizedMarkdown.isEmpty,
+            if !summaryStructure, let normalizedMarkdown, !normalizedMarkdown.isEmpty,
                let parsed = try? AttributedString(
                    markdown: normalizedMarkdown,
                    options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
@@ -1184,6 +1413,10 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             } else {
                 attributedText = NSMutableAttributedString(string: text, attributes: attributes)
             }
+            if summaryStructure {
+                applyInlineBoldMarkers(to: attributedText, baseFont: finalFont)
+                applySummaryStructureStyling(to: attributedText, baseFont: finalFont, paragraphStyle: paragraphStyle)
+            }
             if underline, attributedText.length > 0 {
                 attributedText.addAttribute(
                     .underlineStyle,
@@ -1193,10 +1426,13 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             }
             applySummaryReferenceLinks(
                 to: attributedText,
-                text: text,
+                text: attributedText.string,
                 maximumReference: summaryReferenceCount,
                 baseFont: finalFont
             )
+            if onTimestampTap != nil {
+                applyTimestampLinks(to: attributedText, baseFont: finalFont)
+            }
             nsView.textStorage?.setAttributedString(attributedText)
 
             if let limit = lineLimit {
@@ -1225,6 +1461,121 @@ struct MacSelectableTextRepresentable: NSViewRepresentable {
             if current[.foregroundColor] == nil { additions[.foregroundColor] = fallbackAttributes[.foregroundColor] }
             if current[.paragraphStyle] == nil { additions[.paragraphStyle] = fallbackAttributes[.paragraphStyle] }
             if !additions.isEmpty { attributedText.addAttributes(additions, range: range) }
+        }
+    }
+
+    /// Summary mode shows the model's text as-is, so `**bold**` would appear literally.
+    /// Render those spans bold and drop the asterisks.
+    private func applyInlineBoldMarkers(to storage: NSMutableAttributedString, baseFont: NSFont) {
+        guard let regex = try? NSRegularExpression(pattern: #"\*\*(.+?)\*\*"#) else { return }
+        let matches = regex.matches(in: storage.string, range: NSRange(location: 0, length: storage.length))
+        let boldFont = NSFont.systemFont(ofSize: baseFont.pointSize, weight: .semibold)
+        for match in matches.reversed() {
+            let inner = match.range(at: 1)
+            let innerText = (storage.string as NSString).substring(with: inner)
+            let attributes = storage.attributes(at: match.range.location, effectiveRange: nil)
+            let replacement = NSMutableAttributedString(string: innerText, attributes: attributes)
+            replacement.addAttribute(.font, value: boldFont, range: NSRange(location: 0, length: replacement.length))
+            storage.replaceCharacters(in: match.range, with: replacement)
+        }
+    }
+
+    private func applySummaryStructureStyling(
+        to storage: NSMutableAttributedString,
+        baseFont: NSFont,
+        paragraphStyle: NSParagraphStyle
+    ) {
+        let source = storage.string as NSString
+        guard source.length > 0 else { return }
+        var paragraphRanges: [NSRange] = []
+        var enclosingRanges: [NSRange] = []
+        source.enumerateSubstrings(in: NSRange(location: 0, length: source.length), options: [.byParagraphs, .substringNotRequired]) { _, range, enclosingRange, _ in
+            paragraphRanges.append(range)
+            enclosingRanges.append(enclosingRange)
+        }
+        let contentCount = paragraphRanges.filter {
+            !source.substring(with: $0).trimmingCharacters(in: .whitespaces).isEmpty
+        }.count
+        guard contentCount > 1 else { return }
+
+        let headingFont = NSFont.systemFont(ofSize: baseFont.pointSize + 4, weight: .bold)
+        let labelFont = NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
+        let shortBlankFont = NSFont.systemFont(ofSize: max(4, baseFont.pointSize * 0.35))
+        let bulletPrefix = "• "
+        let bulletIndent = (bulletPrefix as NSString).size(withAttributes: [.font: baseFont]).width
+        var previousWasHeading = false
+
+        for (index, range) in paragraphRanges.enumerated() {
+            let paragraph = source.substring(with: range)
+            let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else {
+                if previousWasHeading {
+                    storage.addAttribute(.font, value: shortBlankFont, range: enclosingRanges[index])
+                }
+                previousWasHeading = false
+                continue
+            }
+            if Self.isSummaryHeading(trimmed) {
+                storage.addAttribute(.font, value: headingFont, range: range)
+                previousWasHeading = true
+                continue
+            }
+            previousWasHeading = false
+            var labelStart = 0
+            if paragraph.hasPrefix(bulletPrefix) {
+                let style = paragraphStyle.mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+                style.headIndent = bulletIndent
+                storage.addAttribute(.paragraphStyle, value: style, range: range)
+                labelStart = (bulletPrefix as NSString).length
+            }
+            if let labelLength = Self.summaryLabelLength(in: paragraph, from: labelStart) {
+                storage.addAttribute(.font, value: labelFont, range: NSRange(location: range.location + labelStart, length: labelLength))
+            }
+        }
+    }
+
+    private static func isSummaryHeading(_ line: String) -> Bool {
+        guard line.count <= 70,
+              let first = line.unicodeScalars.first,
+              CharacterSet.uppercaseLetters.contains(first) || CharacterSet.decimalDigits.contains(first),
+              !line.hasPrefix("• ") else { return false }
+        let words = line.split(whereSeparator: { $0.isWhitespace })
+        guard (1...9).contains(words.count) else { return false }
+        if line.hasSuffix(":") { return !line.dropLast().contains(":") }
+        guard let last = line.last, !".!?,;:\"”".contains(last) else { return false }
+        return !line.contains(": ")
+    }
+
+    private static func summaryLabelLength(in paragraph: String, from offset: Int) -> Int? {
+        let text = paragraph as NSString
+        guard offset < text.length else { return nil }
+        let body = text.substring(from: offset)
+        guard let match = body.range(of: "^[A-Z0-9][A-Za-z0-9&/'’()\\- ]{0,48}:(?=\\s)", options: .regularExpression) else { return nil }
+        let label = body[match]
+        guard label.split(separator: " ").count <= 6,
+              body[match.upperBound...].trimmingCharacters(in: .whitespaces).count > 0 else { return nil }
+        return (String(label) as NSString).length
+    }
+
+    private func applyTimestampLinks(to storage: NSMutableAttributedString, baseFont: NSFont) {
+        let pattern = #"\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[–-](?:\d{1,2}:)?\d{1,2}:\d{2})?\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
+        let text = storage.string as NSString
+        for match in regex.matches(in: storage.string, range: NSRange(location: 0, length: text.length)) {
+            let citation = text.substring(with: match.range).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            let first = citation.split(whereSeparator: { $0 == "–" || $0 == "-" }).first.map(String.init) ?? citation
+            let parts = first.split(separator: ":").compactMap { Double($0) }
+            guard parts.count == 2 || parts.count == 3 else { continue }
+            let seconds = parts.count == 2
+                ? parts[0] * 60 + parts[1]
+                : parts[0] * 3_600 + parts[1] * 60 + parts[2]
+            guard let url = URL(string: "rssreader-time://\(seconds)") else { continue }
+            storage.addAttributes([
+                .link: url,
+                .foregroundColor: NSColor.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .semibold)
+            ], range: match.range)
         }
     }
 
@@ -1335,12 +1686,12 @@ final class AskAIWebView: WKWebView {
         guard onAskAI != nil || onAskAIWeb != nil else { return }
         var actions: [UIAction] = []
         if onAskAI != nil {
-            actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+            actions.append(UIAction(title: "Ask AI", image: UIImage(systemName: "questionmark.circle")) { [weak self] _ in
                 self?.askAI(nil)
             })
         }
         if onAskAIWeb != nil {
-            actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "globe")) { [weak self] _ in
+            actions.append(UIAction(title: "Ask AI Web", image: UIImage(systemName: "quote.bubble")) { [weak self] _ in
                 self?.askAIWeb(nil)
             })
         }

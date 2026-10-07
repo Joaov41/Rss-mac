@@ -88,6 +88,41 @@ private func stripArticleAdvertisingElements(in element: SwiftSoup.Element) {
     }
 }
 
+/// Distinguish RSS audio enclosures from artwork before constructing Article.
+/// A podcast feed may omit the enclosure MIME type, so an iTunes feed marker
+/// plus a non-image enclosure is enough to retain it as playable audio.
+struct FeedEnclosureClassification: Equatable {
+    let isPodcastAudio: Bool
+    let shouldUseAsArtwork: Bool
+}
+
+enum FeedEnclosureClassifier {
+    static func classify(url: URL?, mimeType: String?, hasPodcastMetadata: Bool) -> FeedEnclosureClassification {
+        let mime = mimeType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let noType = mime.isEmpty
+        let genericType = mime == "application/octet-stream" || mime == "binary/octet-stream"
+        let audio = isAudio(url: url, mimeType: mime)
+        let image = isImage(url: url, mimeType: mime)
+        let podcastAudio = audio || (hasPodcastMetadata && !image && (noType || genericType))
+        return FeedEnclosureClassification(
+            isPodcastAudio: podcastAudio,
+            shouldUseAsArtwork: !podcastAudio && (image || noType || (!hasPodcastMetadata && !audio))
+        )
+    }
+
+    static func isAudio(url: URL?, mimeType: String?) -> Bool {
+        if mimeType?.lowercased().hasPrefix("audio/") == true { return true }
+        guard let ext = url?.pathExtension.lowercased(), !ext.isEmpty else { return false }
+        return ["mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "aiff", "aif"].contains(ext)
+    }
+
+    static func isImage(url: URL?, mimeType: String?) -> Bool {
+        if mimeType?.lowercased().hasPrefix("image/") == true { return true }
+        guard let ext = url?.pathExtension.lowercased(), !ext.isEmpty else { return false }
+        return ["jpg", "jpeg", "png", "gif", "webp", "heic", "avif"].contains(ext)
+    }
+}
+
 // MARK: - String Extension for HTML Processing
 extension String {
     func removingHTML() -> String {
@@ -253,14 +288,40 @@ class FeedService {
                 htmlContent = item.description ?? ""
             }
             
-            // Try to get standard image URLs first
-            var articleImageURL: URL? = nil
-            if let enclosureLink = item.enclosure?.attributes?.url, !enclosureLink.isEmpty {
-                articleImageURL = URL(string: enclosureLink)
-            } else if let mediaContents = item.media?.mediaContents,
+            let enclosureURL = self.resolvedFeedURL(item.enclosure?.attributes?.url, relativeTo: url)
+            let enclosureMIMEType = item.enclosure?.attributes?.type
+            let hasPodcastMetadata = item.iTunes != nil || feed.iTunes != nil
+            let classification = FeedEnclosureClassifier.classify(
+                url: enclosureURL,
+                mimeType: enclosureMIMEType,
+                hasPodcastMetadata: hasPodcastMetadata
+            )
+            let podcastAudioURL = classification.isPodcastAudio ? enclosureURL : nil
+
+            // Feed-level artwork is appropriate for podcast episodes, but for
+            // ordinary RSS items it is usually a site logo. Let normal articles
+            // prefer their own enclosure, media, or content image instead.
+            var articleImageURL = podcastAudioURL.flatMap { _ in
+                self.resolvedFeedURL(
+                    item.iTunes?.iTunesImage?.attributes?.href
+                        ?? feed.iTunes?.iTunesImage?.attributes?.href
+                        ?? feed.image?.url,
+                    relativeTo: url
+                )
+            }
+            if articleImageURL == nil,
+               let enclosureURL,
+               podcastAudioURL == nil,
+               classification.shouldUseAsArtwork {
+                articleImageURL = enclosureURL
+            } else if articleImageURL == nil,
+                      let mediaContents = item.media?.mediaContents,
                       let firstMedia = mediaContents.first,
                       let mediaURL = firstMedia.attributes?.url, !mediaURL.isEmpty {
-                articleImageURL = URL(string: mediaURL)
+                let resolvedMediaURL = self.resolvedFeedURL(mediaURL, relativeTo: url)
+                if !FeedEnclosureClassifier.isAudio(url: resolvedMediaURL, mimeType: firstMedia.attributes?.type) {
+                    articleImageURL = resolvedMediaURL
+                }
             }
 
             // --- Fallback: Extract first <img> from content if no standard URL found ---
@@ -304,6 +365,10 @@ class FeedService {
                 feedTitle: feed.title?.removingHTML() ?? "Unknown Feed",
                 feedURL: url,
                 imageURL: articleImageURL,
+                podcastAudioURL: podcastAudioURL,
+                podcastAudioMIMEType: podcastAudioURL == nil ? nil : enclosureMIMEType,
+                podcastDuration: podcastAudioURL == nil ? nil : item.iTunes?.iTunesDuration,
+                podcastLanguageCode: podcastAudioURL == nil ? nil : feed.language,
                 isRead: false,
                 isFavorite: false
             )
@@ -439,6 +504,13 @@ class FeedService {
     // MARK: - Secondary Fetch for Full Article Content
     
     /// Returns true if the content appears truncated.
+    private func resolvedFeedURL(_ rawValue: String?, relativeTo feedURL: String) -> URL? {
+        guard let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        if let absolute = URL(string: value), absolute.scheme != nil { return absolute }
+        guard let baseURL = URL(string: feedURL) else { return URL(string: value) }
+        return URL(string: value, relativeTo: baseURL)?.absoluteURL
+    }
+
     private func isTruncated(_ content: String) -> Bool {
         let lower = content.lowercased()
         
@@ -485,14 +557,18 @@ class FeedService {
     /// For each article in the feed that appears truncated, fetch the full content from the webpage.
     private func fetchFullArticlesIfNeeded(for feed: Feed) -> AnyPublisher<Feed, Never> {
         let articlePublishers = feed.articles.map { article -> AnyPublisher<Article, Never> in
-            if isTruncated(article.content), let link = article.url {
+            if !article.isPodcastEpisode, isTruncated(article.content), let link = article.url {
                 return fetchFullArticle(for: article, from: link)
             } else {
                 return Just(article).eraseToAnyPublisher()
             }
         }
         
-        return Publishers.MergeMany(articlePublishers)
+        // Keep secondary article requests bounded. A single feed can contain
+        // many truncated entries; MergeMany would otherwise start every page
+        // request at once and exhaust the shared connection pool.
+        return articlePublishers.publisher
+            .flatMap(maxPublishers: .max(4)) { $0 }
             .collect()
             .map { updatedArticles -> Feed in
                 // Sort articles by publishDate descending (most recent first)

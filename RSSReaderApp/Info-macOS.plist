@@ -37,6 +37,8 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>RSS uses the local network to connect iPad and Mac Codex / Summarize bridge requests.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>RSS uses on-device speech recognition only when you ask to create a private podcast transcript.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

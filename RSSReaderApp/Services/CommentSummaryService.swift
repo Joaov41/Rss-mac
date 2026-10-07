@@ -99,6 +99,14 @@ class CommentSummaryService {
         value = value.replacingOccurrences(of: "(?m)^\\s{0,3}#{1,6}\\s*", with: "", options: .regularExpression)
         value = value.replacingOccurrences(of: "(?m)(^\\s*[-•]?\\s*)#{1,6}\\s*", with: "$1", options: .regularExpression)
         value = value.replacingOccurrences(of: "(?m)^\\s*\\*\\s+", with: "- ", options: .regularExpression)
+        value = value.replacingOccurrences(of: "(?m)^[ \\t]*[-–][ \\t]+", with: "• ", options: .regularExpression)
+        let zeroTimestampPattern = #"[ \t]?\[0?0:00\]"#
+        if let zeroTimestampRegex = try? NSRegularExpression(pattern: zeroTimestampPattern) {
+            let range = NSRange(value.startIndex..., in: value)
+            if zeroTimestampRegex.numberOfMatches(in: value, range: range) >= 3 {
+                value = zeroTimestampRegex.stringByReplacingMatches(in: value, range: range, withTemplate: "")
+            }
+        }
         value = value.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }

@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import WebKit
 #if os(iOS)
 import AVFoundation
 #elseif os(macOS)
@@ -22,9 +23,10 @@ private struct MacSettingsGlassButtonStyle: ButtonStyle {
             .glassEffect(
                 .regular.tint(
                     tintColor ?? (prominent ? Color.accentColor.opacity(0.42) : macSettingsGlassTint)
-                ),
+                ).interactive(),
                 in: .capsule
             )
+            .contentShape(Capsule())
             .opacity(configuration.isPressed ? 0.82 : 1)
             .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
     }
@@ -33,25 +35,36 @@ private struct MacSettingsGlassButtonStyle: ButtonStyle {
 private struct MacSettingsSelectorSurface: ViewModifier {
     let isSelected: Bool
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content
+        let label = content
             .font(.body.weight(.semibold))
             .foregroundStyle(isSelected ? Color.white : Color.primary)
             .padding(.horizontal, 18)
             .padding(.vertical, 9)
-            .background {
-                Capsule()
-                    .fill(
-                        isSelected
-                            ? Color.accentColor.opacity(0.78)
-                            : Color(red: 0.30, green: 0.38, blue: 0.48).opacity(0.34)
-                    )
-            }
-            .overlay {
-                Capsule()
-                    .stroke(Color.black.opacity(0.38), lineWidth: 1)
-            }
             .contentShape(Capsule())
+
+        if #available(macOS 26.0, *) {
+            label.glassEffect(
+                .regular.tint(isSelected ? Color.accentColor.opacity(0.42) : macSettingsGlassTint)
+                    .interactive(),
+                in: .capsule
+            )
+        } else {
+            label
+                .background {
+                    Capsule()
+                        .fill(
+                            isSelected
+                                ? Color.accentColor.opacity(0.78)
+                                : Color(red: 0.30, green: 0.38, blue: 0.48).opacity(0.34)
+                        )
+                }
+                .overlay {
+                    Capsule()
+                        .stroke(Color.black.opacity(0.38), lineWidth: 1)
+                }
+        }
     }
 }
 
@@ -68,6 +81,35 @@ private struct MacSettingsSelectorButtonStyle: ButtonStyle {
 #endif
 
 private extension View {
+    @ViewBuilder
+    func settingsGlassControlGroup() -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: 8) { self }
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func settingsGlassIconButtonStyle<Fallback: PrimitiveButtonStyle>(fallback: Fallback) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            self
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
+        } else {
+            self.buttonStyle(fallback)
+        }
+        #else
+        self.buttonStyle(fallback)
+        #endif
+    }
+
     @ViewBuilder
     func settingsGlassButtonStyle(prominent: Bool = false, tintColor: Color? = nil) -> some View {
         #if os(macOS)
@@ -94,7 +136,7 @@ private extension View {
             self
                 .glassEffect(
                     .regular.tint(macSettingsGlassTint),
-                    in: .rect(cornerRadius: 40)
+                    in: .rect(topLeadingRadius: 40, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 40)
                 )
         } else {
             self.modifier(AdaptiveGlassModifier(cornerRadius: 40))
@@ -179,6 +221,8 @@ struct SettingsView: View {
     @State private var isCheckingHealth: Bool = false
     @State private var geminiHealthCheck: (isWorking: Bool, responseTime: TimeInterval?, error: String?)? = nil
     @State private var openaiHealthCheck: (isWorking: Bool, responseTime: TimeInterval?, error: String?)? = nil
+    @State private var isChatGPTWebAILoggedIn = false
+    @State private var isGeminiWebAILoggedIn = false
 
     // MLX Local model management
     @State private var isLoadingMLXModel = false
@@ -190,6 +234,7 @@ struct SettingsView: View {
     @State private var summarizeConnectionStatus: String? = nil
     @State private var isTestingPCCGatewayConnection = false
     @State private var pccGatewayConnectionStatus: String? = nil
+    @State private var pendingWebAILoginProvider: WebAIProvider?
     private let mlxModelBookmarkKey = "MLXExternalModelBookmark"
     private let mlxModelPathKey = "MLXExternalModelPath"
     
@@ -224,6 +269,42 @@ struct SettingsView: View {
         }
     }
 
+    private var chatGPTLoginButtonTitle: String {
+        isChatGPTWebAILoggedIn ? "Logged in to ChatGPT" : "Log In to ChatGPT"
+    }
+
+    private var geminiLoginButtonTitle: String {
+        isGeminiWebAILoggedIn ? "Logged in to Gemini" : "Log In to Gemini"
+    }
+
+    private func refreshWebAILoginStates() {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let chatGPTLoggedIn = cookies.contains { cookie in
+                let domain = cookie.domain.lowercased()
+                let name = cookie.name.lowercased()
+                let isChatGPTDomain = domain.contains("chatgpt.com") || domain.contains("openai.com")
+                let isSessionCookie = name.contains("session-token") || name.contains("auth-session")
+                return isChatGPTDomain && isSessionCookie
+            }
+
+            let authenticatedGoogleCookieNames: Set<String> = [
+                "sid", "hsid", "ssid", "apisid", "sapisid",
+                "__secure-1psid", "__secure-3psid"
+            ]
+            let geminiLoggedIn = cookies.contains { cookie in
+                let domain = cookie.domain.lowercased()
+                let name = cookie.name.lowercased()
+                let isGoogleDomain = domain == "google.com" || domain.hasSuffix(".google.com")
+                return isGoogleDomain && authenticatedGoogleCookieNames.contains(name)
+            }
+
+            DispatchQueue.main.async {
+                isChatGPTWebAILoggedIn = chatGPTLoggedIn
+                isGeminiWebAILoggedIn = geminiLoggedIn
+            }
+        }
+    }
+
     private func summaryProviderDidChange(_ newValue: AppSettings.SummaryProvider) {
         appState.mlxLastThroughput = ""
         appState.mlxLastQAThroughput = ""
@@ -231,11 +312,8 @@ struct SettingsView: View {
         newSettings.selectedSummaryProvider = newValue
         appState.updateSettings(newSettings)
 
-        if newValue != .mlxLocal && newValue != .coreAIMLXLocal {
-            Task {
-                await LiteRTLocalService.shared.unloadAllModels()
-                await MLXLocalService.shared.unloadAllModels()
-            }
+        if newValue != .coreAIMLXLocal {
+            Task { await MLXLocalService.shared.unloadAllModels() }
         } else {
             Task { await appState.warmUpMLXIfNeeded() }
         }
@@ -253,22 +331,62 @@ struct SettingsView: View {
         }
     }
 
+    private func macSummaryProviderTitle(_ provider: AppSettings.SummaryProvider) -> String {
+        switch provider {
+        case .gemini: return "Gemini API"
+        case .appleCloud: return "Apple PCC"
+        case .coreAIMLXLocal: return "Local Server"
+        case .summarizeDaemon: return "Codex"
+        default: return provider.displayName
+        }
+    }
+
     private var macSummaryProviderSelector: some View {
         Menu {
-            ForEach(AppSettings.SummaryProvider.allCases, id: \.self) { provider in
-                Button(provider.displayName) {
+            ForEach(AppSettings.SummaryProvider.allCases.filter { $0 != .webAI && $0 != .applePCCGateway }, id: \.self) { provider in
+                Button(macSummaryProviderTitle(provider)) {
                     appState.settings.selectedSummaryProvider = provider
                 }
             }
         } label: {
             HStack(spacing: 10) {
-                Text(appState.settings.selectedSummaryProvider.displayName)
+                Text(macSummaryProviderTitle(appState.settings.selectedSummaryProvider))
                 Image(systemName: "chevron.up.chevron.down")
             }
-            .modifier(MacSettingsSelectorSurface(isSelected: false))
         }
         .menuStyle(.borderlessButton)
+        .modifier(MacSettingsSelectorSurface(isSelected: false))
         .fixedSize()
+    }
+
+    private var macWebAISessionButtons: some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+            GridRow {
+                Button(chatGPTLoginButtonTitle) {
+                    pendingWebAILoginProvider = .chatgpt
+                }
+                .settingsGlassButtonStyle()
+
+                Button("Reset ChatGPT") {
+                    appState.resetWebAISession(for: .chatgpt)
+                    isChatGPTWebAILoggedIn = false
+                }
+                .settingsGlassButtonStyle()
+            }
+
+            GridRow {
+                Button(geminiLoginButtonTitle) {
+                    pendingWebAILoginProvider = .gemini
+                }
+                .settingsGlassButtonStyle()
+
+                Button("Reset Gemini") {
+                    appState.resetWebAISession(for: .gemini)
+                    isGeminiWebAILoggedIn = false
+                }
+                .settingsGlassButtonStyle()
+            }
+        }
     }
 
     private var macWebAISelector: some View {
@@ -372,33 +490,35 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
 
+                            #if os(macOS)
+                            macWebAISessionButtons
+                            #else
                             HStack(spacing: 10) {
-                                Button("Log In to ChatGPT") {
-                                    launchWebAILogin(.chatgpt)
+                                Button(chatGPTLoginButtonTitle) {
+                                    pendingWebAILoginProvider = .chatgpt
                                 }
                                 .settingsGlassButtonStyle()
 
                                 Button("Reset ChatGPT") {
                                     appState.resetWebAISession(for: .chatgpt)
+                                    isChatGPTWebAILoggedIn = false
                                 }
                                 .settingsGlassButtonStyle()
                             }
 
                             HStack(spacing: 10) {
-                                Button("Log In to Gemini") {
-                                    launchWebAILogin(.gemini)
+                                Button(geminiLoginButtonTitle) {
+                                    pendingWebAILoginProvider = .gemini
                                 }
                                 .settingsGlassButtonStyle()
 
                                 Button("Reset Gemini") {
                                     appState.resetWebAISession(for: .gemini)
+                                    isGeminiWebAILoggedIn = false
                                 }
                                 .settingsGlassButtonStyle()
                             }
-                        }
-
-                        if appState.settings.selectedSummaryProvider == .mlxLocal {
-                            mlxSettingsView
+                            #endif
                         }
 
                         if appState.settings.selectedSummaryProvider == .coreAIMLXLocal {
@@ -591,6 +711,7 @@ struct SettingsView: View {
 
                     redditAuthSection
 
+                    #if !os(macOS)
                     Section("Text-to-Speech") {
                         Toggle("Enable TTS", isOn: $enableTTS)
                         
@@ -617,6 +738,8 @@ struct SettingsView: View {
                             }
                         }
                     }
+
+                    #endif
 
                     Section("Local TTS Engine") {
                         Picker("Engine", selection: $localTTSEngine) {
@@ -799,9 +922,11 @@ struct SettingsView: View {
                                     synth.startSpeaking("This is a test of the selected voice.")
                                     testSynthMac = synth
                                 }
+                                .settingsGlassButtonStyle()
                                 Button("Set as Default") {
                                     UserDefaults.standard.set(localVoiceID, forKey: macVoiceKey)
                                 }
+                                .settingsGlassButtonStyle()
                             }
                         }
                         #endif
@@ -878,7 +1003,7 @@ struct SettingsView: View {
                             .settingsGlassButtonStyle(prominent: true)
                             .tint(.red)
 
-                            Text("Clears removable caches and preserves downloaded LiteRT and MLX models.")
+                            Text("Clears removable caches and preserves downloaded MLX models.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
 
@@ -909,7 +1034,7 @@ struct SettingsView: View {
                             .disabled(isCleaningFailedModelDownloads)
                             .settingsGlassButtonStyle()
 
-                            Text("Removes only incomplete .download files. Completed LiteRT and MLX models are kept.")
+                            Text("Removes only incomplete .download files. Completed MLX models are kept.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
 
@@ -925,7 +1050,7 @@ struct SettingsView: View {
                     Section("Storage Breakdown") {
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
-                                Text("App Container")
+                                Text("App Storage")
                                     .foregroundColor(.secondary)
                                 Spacer()
                                 if isLoadingStorageBreakdown {
@@ -937,7 +1062,7 @@ struct SettingsView: View {
                                     } label: {
                                         Image(systemName: "arrow.clockwise")
                                     }
-                                    .buttonStyle(.borderless)
+                                    .settingsGlassIconButtonStyle(fallback: .borderless)
                                 }
                             }
 
@@ -982,7 +1107,7 @@ struct SettingsView: View {
                                                 } label: {
                                                     Image(systemName: "trash")
                                                 }
-                                                .buttonStyle(.borderless)
+                                                .settingsGlassIconButtonStyle(fallback: .borderless)
                                                 .disabled(isDeletingStorageBreakdown)
                                             }
                                         }
@@ -1022,7 +1147,7 @@ struct SettingsView: View {
                                     } label: {
                                         Image(systemName: "arrow.clockwise")
                                     }
-                                    .buttonStyle(.borderless)
+                                    .settingsGlassIconButtonStyle(fallback: .borderless)
                                 }
                             }
 
@@ -1033,7 +1158,7 @@ struct SettingsView: View {
                             } else {
                                 ForEach(modelStorageItems) { item in
                                     HStack(alignment: .top, spacing: 12) {
-                                        Image(systemName: item.kind == .liteRT ? "cube.box.fill" : "cpu.fill")
+                                        Image(systemName: "cpu.fill")
                                             .foregroundStyle(.secondary)
                                             .frame(width: 22, alignment: .center)
 
@@ -1075,7 +1200,7 @@ struct SettingsView: View {
                                         } label: {
                                             Image(systemName: "trash")
                                         }
-                                        .buttonStyle(.borderless)
+                                        .settingsGlassIconButtonStyle(fallback: .borderless)
                                         .disabled(isDeletingModelStorage)
                                         .frame(width: 24, alignment: .center)
                                     }
@@ -1115,10 +1240,28 @@ struct SettingsView: View {
                 .formStyle(.grouped)
                 .frame(minWidth: 700, idealWidth: 820, maxWidth: .infinity)
                 #endif
+                #if !os(macOS)
                 .safeAreaPadding(.horizontal, 24)
                 .safeAreaPadding(.vertical, 8)
                 .clipShape(RoundedRectangle(cornerRadius: 25, style: .continuous))
                 .padding()
+                #endif
+                .settingsGlassControlGroup()
+                #if os(macOS)
+                .clipped()
+                .contentShape(Rectangle())
+                #endif
+
+                if let provider = pendingWebAILoginProvider {
+                    WebAILoginWarningPopup(
+                        provider: provider,
+                        onCancel: { pendingWebAILoginProvider = nil },
+                        onContinue: {
+                            pendingWebAILoginProvider = nil
+                            launchWebAILogin(provider)
+                        }
+                    )
+                }
             }
             .navigationTitle("Settings")
             #if os(iOS)
@@ -1129,10 +1272,12 @@ struct SettingsView: View {
             )
             #elseif os(macOS)
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         presentationMode.wrappedValue.dismiss()
                     }
+                    .settingsGlassButtonStyle(prominent: true)
+                    .keyboardShortcut(.defaultAction)
                 }
             }
             #endif
@@ -1192,11 +1337,12 @@ struct SettingsView: View {
                 if item.isModelStorage {
                     Text("This will delete \(item.name). The model can be downloaded again later.")
                 } else {
-                    Text("This will delete removable files from \(item.name). LiteRT and MLX model folders are preserved.")
+                    Text("This will delete removable files from \(item.name). MLX model folders are preserved.")
                 }
             }
             .onAppear {
                 loadCurrentSettings()
+                refreshWebAILoginStates()
                 updateCacheSize()
                 refreshStorageBreakdown()
                 refreshModelStorage()
@@ -1244,7 +1390,10 @@ struct SettingsView: View {
     }
     
     private func updateCacheSize() {
-        cacheSizeDisplay = appState.getCacheSize()
+        cacheSizeDisplay = "Calculating…"
+        appState.loadCacheSize { display in
+            cacheSizeDisplay = display
+        }
     }
 
     private func refreshStorageBreakdown() {
@@ -1403,6 +1552,10 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
+                Text("Choose app type: installed app. Set the redirect URI exactly to redapp://auth (no trailing slash).")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
                 TextField("Reddit Client ID", text: Binding(
                     get: { appState.settings.redditClientId },
                     set: { newValue in
@@ -1511,10 +1664,8 @@ struct SettingsView: View {
             #else
             return "Uses a token-protected Mac gateway that forwards OpenAI-style requests to fm serve with the pcc model"
             #endif
-        case .mlxLocal:
-            return "Runs Gemma locally with LiteRT-LM acceleration using .litertlm model files"
         case .coreAIMLXLocal:
-            return "Runs an MLX-format model locally through CoreAI MLX for direct comparison with LiteRT"
+            return "Runs an MLX-format model locally through CoreAI MLX"
         case .webAI:
             return "Uses the selected web AI destination as the live summary provider and captures replies back into the app"
         case .summarizeDaemon:
@@ -1764,106 +1915,6 @@ struct SettingsView: View {
 
     // MARK: - Local Model Settings View
     @ViewBuilder
-    private var mlxSettingsView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            let effectiveContextTokens = AppSettings.effectiveLiteRTContextTokens(appState.settings.mlxMaxContextTokens)
-            let maxOutputTokens = max(64, min(1024, effectiveContextTokens - max(256, effectiveContextTokens / 4)))
-
-            TextField("LiteRT Hugging Face Repo", text: Binding(
-                get: { appState.settings.mlxModelID },
-                set: { newValue in
-                    var newSettings = appState.settings
-                    newSettings.mlxModelID = LiteRTLocalService.normalizedModelID(newValue)
-                    appState.updateSettings(newSettings)
-                }
-            ))
-            .textFieldStyle(AdaptiveLiquidGlassTextFieldStyle(
-                cornerRadius: 12,
-                tintColor: .orange.opacity(0.3)
-            ))
-            .onSubmit {
-                Task { await appState.warmUpMLXIfNeeded() }
-            }
-
-            Text("Use a LiteRT-LM repo such as \(LiteRTLocalService.defaultModelRepo).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Stepper(
-                value: Binding(
-                    get: { appState.settings.mlxMaxContextTokens },
-                    set: { newValue in
-                        var newSettings = appState.settings
-                        newSettings.mlxMaxContextTokens = AppSettings.normalizedLiteRTContextTokens(newValue)
-                        newSettings.mlxMaxOutputTokens = AppSettings.normalizedLiteRTOutputTokens(
-                            newSettings.mlxMaxOutputTokens,
-                            contextTokens: AppSettings.effectiveLiteRTContextTokens(newSettings.mlxMaxContextTokens)
-                        )
-                        appState.updateSettings(newSettings)
-                    }
-                ),
-                in: 0...LiteRTLocalService.maxContextTokens,
-                step: LiteRTLocalService.defaultContextTokens
-            ) {
-                Text(
-                    "Context tokens: " + (appState.settings.mlxMaxContextTokens == 0
-                        ? "Auto"
-                        : "\(appState.settings.mlxMaxContextTokens)")
-                )
-            }
-
-            Stepper(
-                value: Binding(
-                    get: { appState.settings.mlxMaxOutputTokens },
-                    set: { newValue in
-                        var newSettings = appState.settings
-                        newSettings.mlxMaxOutputTokens = AppSettings.normalizedLiteRTOutputTokens(
-                            newValue,
-                            contextTokens: AppSettings.effectiveLiteRTContextTokens(newSettings.mlxMaxContextTokens)
-                        )
-                        appState.updateSettings(newSettings)
-                    }
-                ),
-                in: 64...maxOutputTokens,
-                step: 128
-            ) {
-                Text("Max output tokens: \(appState.settings.mlxMaxOutputTokens)")
-            }
-
-            Button(action: {
-                preloadLiteRTModel()
-            }) {
-                HStack {
-                    if isLoadingMLXModel {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "arrow.down.circle")
-                    }
-                    Text("Download LiteRT Model")
-                }
-            }
-            .settingsGlassButtonStyle(tintColor: .blue.opacity(0.3))
-            .disabled(isLoadingMLXModel)
-
-            if let progress = mlxDownloadProgress {
-                ProgressView(progress)
-            }
-
-            if let mlxLoadError {
-                Text(mlxLoadError)
-                    .font(.caption)
-                    .foregroundColor(.red)
-            }
-
-            Text("If the prompt exceeds LiteRT context, the app asks which provider to reroute to.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.top, 8)
-    }
-
-    @ViewBuilder
     private var coreAIMLXSettingsView: some View {
         VStack(alignment: .leading, spacing: 10) {
             let effectiveContextTokens = AppSettings.effectiveCoreAIMLXContextTokens(appState.settings.coreAIMLXMaxContextTokens)
@@ -1885,7 +1936,7 @@ struct SettingsView: View {
                 Task { await appState.warmUpMLXIfNeeded() }
             }
 
-            Text("Uses an MLX-format Gemma 4 E2B model for comparison with the LiteRT Gemma 4 E2B model.")
+            Text("Uses an MLX-format Gemma 4 E2B model for local summaries.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1961,47 +2012,6 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.top, 8)
-    }
-
-    private func preloadLiteRTModel() {
-        mlxLoadError = nil
-        let progress = Progress(totalUnitCount: 100)
-        mlxDownloadProgress = progress
-        isLoadingMLXModel = true
-
-        let modelID = LiteRTLocalService.normalizedModelID(appState.settings.mlxModelID)
-        if modelID != appState.settings.mlxModelID {
-            var newSettings = appState.settings
-            newSettings.mlxModelID = modelID
-            appState.updateSettings(newSettings)
-        }
-        let maxContextTokens = appState.settings.mlxMaxContextTokens > 0 ? appState.settings.mlxMaxContextTokens : nil
-        Task {
-            defer {
-                Task { @MainActor in isLoadingMLXModel = false }
-            }
-            do {
-                try await LiteRTLocalService.shared.preloadModel(
-                    modelID: modelID,
-                    maxContextTokens: maxContextTokens,
-                    onProgress: { fraction in
-                        Task { @MainActor in
-                            progress.completedUnitCount = Int64(max(0, min(1, fraction)) * 100)
-                            mlxDownloadProgress = progress
-                        }
-                    }
-                )
-                await MainActor.run {
-                    progress.completedUnitCount = 100
-                    mlxDownloadProgress = progress
-                }
-                await appState.warmUpMLXIfNeeded()
-            } catch {
-                await MainActor.run {
-                    mlxLoadError = error.localizedDescription
-                }
-            }
-        }
     }
 
     private func preloadCoreAIMLXModel() {
@@ -2232,6 +2242,47 @@ struct OPMLDocument: FileDocument {
     }
 }
 
+private struct WebAILoginWarningPopup: View {
+    let provider: WebAIProvider
+    let onCancel: () -> Void
+    let onContinue: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 16) {
+                Text("IMPORTANT")
+                    .font(.headline)
+
+                Text("Do not use your main ChatGPT or Gemini account. Create a free new account just to use with this app. The providers may terminate access at any time. These model options are optional and come with no guarantees.")
+                    .font(.body)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(spacing: 10) {
+                    Button(action: onCancel) {
+                        Text("Cancel")
+                            .frame(maxWidth: .infinity)
+                    }
+                        .settingsGlassButtonStyle()
+                    Button(action: onContinue) {
+                        Text("Continue to \(provider.displayName)")
+                            .frame(maxWidth: .infinity)
+                    }
+                        .settingsGlassButtonStyle(prominent: true)
+                }
+                .settingsGlassControlGroup()
+            }
+            .padding(24)
+            .frame(maxWidth: 520)
+            .modifier(AdaptiveGlassModifier(cornerRadius: 24))
+            .padding(.horizontal, 24)
+        }
+        .zIndex(10)
+    }
+}
+
 struct SettingsView_Previews: PreviewProvider {
     static var previews: some View {
         SettingsView()
@@ -2269,7 +2320,7 @@ struct ManageMLXModelsView: View {
                             } label: {
                                 Image(systemName: "xmark.circle")
                             }
-                            .buttonStyle(.plain)
+                            .settingsGlassIconButtonStyle(fallback: .plain)
                         }
                     } else {
                         Text("No model selected")
@@ -2281,16 +2332,23 @@ struct ManageMLXModelsView: View {
                     } label: {
                         Label("Select Model from Files", systemImage: "folder.badge.plus")
                     }
+                    #if os(macOS)
+                    .settingsGlassButtonStyle()
+                    #endif
                 } header: {
                     Text("Selected Model")
                 } footer: {
                     Text("Select a model folder from iCloud Drive, local storage, or external drives. Use \"Download Model\" in Settings to download new models to your preferred location.")
                 }
             }
+            .settingsGlassControlGroup()
             .navigationTitle("Manage Models")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
+                    #if os(macOS)
+                    .settingsGlassButtonStyle(prominent: true)
+                    #endif
                 }
             }
             .fileImporter(

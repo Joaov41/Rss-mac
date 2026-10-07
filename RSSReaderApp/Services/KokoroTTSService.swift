@@ -93,7 +93,41 @@ final class KokoroTTSService {
     private var hasConfiguredMemory = false
     #endif
 
+    private let idleUnloadDelay: TimeInterval = 300
+    private var idleUnloadWorkItem: DispatchWorkItem?
+
     private init() { }
+
+    func scheduleIdleUnload() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.idleUnloadWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in self?.unloadIfAllowed() }
+            self.idleUnloadWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.idleUnloadDelay, execute: workItem)
+        }
+    }
+
+    private func cancelIdleUnload() {
+        DispatchQueue.main.async { [weak self] in
+            self?.idleUnloadWorkItem?.cancel()
+            self?.idleUnloadWorkItem = nil
+        }
+    }
+
+    func firstReadAloudChunkLength(in text: String) -> Int {
+        let limit = min(240, text.count)
+        guard text.count > limit else { return limit }
+        let prefix = String(text.prefix(limit))
+        if let sentenceEnd = prefix.lastIndex(where: { ".!?".contains($0) }) {
+            let length = prefix.distance(from: prefix.startIndex, to: prefix.index(after: sentenceEnd))
+            if length >= 60 { return length }
+        }
+        if let lastSpace = prefix.lastIndex(where: { $0.isWhitespace }) {
+            return max(1, prefix.distance(from: prefix.startIndex, to: lastSpace))
+        }
+        return limit
+    }
 
     func newPlaybackToken() -> UUID {
         playbackLock.lock()
@@ -147,6 +181,7 @@ final class KokoroTTSService {
 
     func synthesize(text: String, voice: String, speed: Float, allowCaching: Bool = true) async throws -> Data {
         #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
+        cancelIdleUnload()
         if allowCaching {
             recordVoiceForWarmup(voice)
         }
@@ -246,6 +281,7 @@ final class KokoroTTSService {
 
     func unloadIfAllowed() {
         #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
+        cancelIdleUnload()
         initLock.lock()
         initTask?.cancel()
         initTask = nil

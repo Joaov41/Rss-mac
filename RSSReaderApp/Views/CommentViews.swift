@@ -50,7 +50,7 @@ struct ClickableCommentImage: View {
                         .fill(Color.gray.opacity(0.1))
                         .overlay(ProgressView())
                 }
-                .frame(width: 120, height: 120)
+                .frame(width: 180, height: 180)
                 .cornerRadius(8)
                 .clipped()
             } else if isGIF {
@@ -60,7 +60,7 @@ struct ClickableCommentImage: View {
                     .placeholder {
                         Rectangle()
                             .fill(Color.gray.opacity(0.1))
-                            .frame(width: 120, height: 120)
+                            .frame(width: 180, height: 180)
                             .cornerRadius(8)
                             .overlay(
                                 VStack {
@@ -73,7 +73,7 @@ struct ClickableCommentImage: View {
                     }
                     .fade(duration: 0.25)
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: 120, height: 120)
+                    .frame(width: 180, height: 180)
                     .cornerRadius(8)
                     .clipped()
                     .onAppear {
@@ -84,7 +84,7 @@ struct ClickableCommentImage: View {
                     .placeholder {
                         Rectangle()
                             .fill(Color.gray.opacity(0.1))
-                            .frame(width: 120, height: 120)
+                            .frame(width: 180, height: 180)
                             .cornerRadius(8)
                             .overlay(
                                 VStack {
@@ -98,7 +98,7 @@ struct ClickableCommentImage: View {
                     .fade(duration: 0.25)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: 120, height: 120)
+                    .frame(width: 180, height: 180)
                     .cornerRadius(8)
                     .clipped()
                 #endif
@@ -108,7 +108,7 @@ struct ClickableCommentImage: View {
                     .placeholder {
                         Rectangle()
                             .fill(Color.gray.opacity(0.1))
-                            .frame(width: 120, height: 120)
+                            .frame(width: 180, height: 180)
                             .cornerRadius(8)
                             .overlay(
                                 ProgressView()
@@ -117,7 +117,7 @@ struct ClickableCommentImage: View {
                     .fade(duration: 0.25)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: 120, height: 120)
+                    .frame(width: 180, height: 180)
                     .cornerRadius(8)
                     .clipped()
             }
@@ -413,7 +413,7 @@ struct CommentView: View {
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Text("u/\(comment.author)")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(.primary)
                     .lineLimit(1)
 
@@ -422,7 +422,7 @@ struct CommentView: View {
                     .foregroundColor(metadataColor)
 
                 Text("\(displayedScore) \(displayedScore == 1 ? "point" : "points")")
-                    .font(.system(size: 14))
+                    .font(.system(size: 12))
                     .foregroundColor(metadataColor)
                     .lineLimit(1)
 
@@ -430,28 +430,10 @@ struct CommentView: View {
                     .font(.caption)
                     .foregroundColor(metadataColor)
 
-                Text(comment.createdDate, style: .relative)
-                    .font(.system(size: 14))
+                Text(comment.createdDate.formatted(.relative(presentation: .named, unitsStyle: .abbreviated)))
+                    .font(.system(size: 12))
                     .foregroundColor(metadataColor)
                     .lineLimit(1)
-
-                Spacer(minLength: 8)
-
-                if !comment.replies.isEmpty {
-                    Text("\(comment.replies.count)")
-                        .font(.caption)
-                        .foregroundColor(metadataColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(metadataColor.opacity(0.12))
-                        )
-                }
-
-                Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(metadataColor)
             }
         }
         .buttonStyle(.plain)
@@ -462,13 +444,8 @@ struct CommentView: View {
         ZStack {
             fallbackAvatar
 
-            Circle()
-                .stroke(Color.white.opacity(colorScheme == .dark ? 0.18 : 0.7), lineWidth: 1)
         }
-        .frame(width: 44, height: 44)
-        #if os(macOS)
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 6, x: 0, y: 3)
-        #endif
+        .frame(width: 28, height: 28)
         .accessibilityHidden(true)
     }
 
@@ -481,9 +458,9 @@ struct CommentView: View {
                 .resizable()
                 .scaledToFit()
                 .foregroundColor(.white)
-                .frame(width: 24, height: 24)
+                .frame(width: 16, height: 16)
         }
-        .frame(width: 44, height: 44)
+        .frame(width: 28, height: 28)
     }
 
     @ViewBuilder
@@ -505,7 +482,7 @@ struct CommentView: View {
 
     private func commentBodyText(_ block: AttributedString) -> AttributedString {
         var styledBlock = block
-        styledBlock.font = .system(size: 13)
+        styledBlock.font = .system(size: 15)
         return styledBlock
     }
 
@@ -514,10 +491,6 @@ struct CommentView: View {
         let imageURLs = comment.imageURLs
         if !imageURLs.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text("\(imageURLs.count) \(imageURLs.count == 1 ? "image" : "images")")
-                    .font(.caption)
-                    .foregroundColor(metadataColor)
-
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: 12) {
                         ForEach(imageURLs.prefix(5), id: \.absoluteString) { url in
@@ -526,7 +499,7 @@ struct CommentView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(height: 136)
+                .frame(height: 188)
             }
         }
     }
@@ -559,7 +532,7 @@ struct CommentView: View {
     }
 
     private var commentActionRow: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 16) {
             Button {
                 Task {
                     await submitVote(.up)
@@ -567,9 +540,9 @@ struct CommentView: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 12, weight: .semibold))
                     Text("\(displayedScore)")
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                 }
             }
             .buttonStyle(.plain)
@@ -582,7 +555,7 @@ struct CommentView: View {
                 }
             } label: {
                 Image(systemName: "arrow.down")
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 12, weight: .semibold))
             }
             .buttonStyle(.plain)
             .foregroundColor(voteDirection == .down ? accentColor : metadataColor)
@@ -592,16 +565,18 @@ struct CommentView: View {
                 showReplySheet = true
             } label: {
                 Label("Reply", systemImage: "bubble")
-                    .labelStyle(.titleAndIcon)
+                    .labelStyle(.iconOnly)
             }
             .buttonStyle(.plain)
+            .help("Reply")
             .foregroundColor(metadataColor)
 
             ShareLink(item: commentURL) {
                 Label("Share", systemImage: "square.and.arrow.up")
-                    .labelStyle(.titleAndIcon)
+                    .labelStyle(.iconOnly)
             }
             .buttonStyle(.plain)
+            .help("Share")
             .foregroundColor(metadataColor)
 
             Menu {
@@ -618,15 +593,14 @@ struct CommentView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
             }
             .menuStyle(.borderlessButton)
             .foregroundColor(metadataColor)
         }
-        .font(.system(size: 14, weight: .medium))
+        .font(.system(size: 12, weight: .medium))
         .lineLimit(1)
-        .minimumScaleFactor(0.75)
-        .padding(.top, 2)
+        .fixedSize()
         .sheet(isPresented: $showReplySheet) {
             RedditCommentReplySheet(comment: comment) { body in
                 try await redditService.replyToComment(commentID: comment.id, body: body)
@@ -662,47 +636,66 @@ struct CommentView: View {
         #endif
     }
 
+    @State private var actionsFitOnHeaderLine = true
+
+    private var collapseButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isCollapsed.toggle()
+            }
+        } label: {
+            Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(metadataColor)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isCollapsed ? "Expand comment" : "Collapse comment")
+    }
+
     private var commentCard: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: 10) {
             avatarView
 
-            VStack(alignment: .leading, spacing: 10) {
-                commentHeader
+            VStack(alignment: .leading, spacing: 5) {
+                // Actions share the header line so short comments don't leave an empty row;
+                // in narrow columns they drop below the text instead of squeezing the name.
+                HStack(alignment: .center, spacing: 12) {
+                    commentHeader
+                        .layoutPriority(1)
+                    Spacer(minLength: 8)
+                    if !isCollapsed && actionsFitOnHeaderLine {
+                        commentActionRow
+                    }
+                    collapseButton
+                }
 
                 if !isCollapsed {
                     commentBodyContent
                     commentImages
                     commentLinks
-                    commentActionRow
+                    if !actionsFitOnHeaderLine {
+                        commentActionRow
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .onGeometryChange(for: Bool.self) { $0.size.width >= 480 } action: { fits in
+                actionsFitOnHeaderLine = fits
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 14)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(cardBorder, lineWidth: 1)
-        )
-        #if os(macOS)
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.2 : 0.06), radius: 10, x: 0, y: 5)
-        #else
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.12 : 0.035), radius: 3, x: 0, y: 1)
-        #endif
+        .padding(.vertical, 8)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 8) {
                 if depth > 0 {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(replyRailColor)
-                        .frame(width: 3)
-                        .padding(.vertical, 10)
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.14))
+                        .frame(width: 1.5)
+                        .padding(.leading, 13)
                 }
 
                 commentCard
@@ -724,22 +717,23 @@ struct CommentView: View {
                                 Text("Show \(comment.replies.count - 5) more replies")
                                 Image(systemName: "chevron.down")
                             }
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(accentColor)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(
-                                Capsule()
-                                    .fill(accentColor.opacity(0.12))
-                            )
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.vertical, 6)
                         }
                         .buttonStyle(.plain)
-                        .padding(.leading, leadingIndent + 44)
+                        .padding(.leading, leadingIndent + 38)
                     }
                 }
             }
         }
-        .padding(.vertical, 2)
+        .overlay(alignment: .bottom) {
+            if depth == 0 {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(height: 0.5)
+            }
+        }
         .alert("Comment Action Failed", isPresented: Binding(
             get: { actionErrorMessage != nil },
             set: { isPresented in

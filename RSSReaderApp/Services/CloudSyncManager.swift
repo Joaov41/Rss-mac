@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 #if os(macOS)
 import Security
 #endif
@@ -33,6 +34,7 @@ final class CloudSyncManager {
         static let readRedditPosts = "cloud_readRedditPosts"
         static let favoriteRedditPosts = "cloud_favoriteRedditPosts"
         static let subscriptions = "cloud_subscriptions"
+        static let podcastSubscriptionRecordPrefix = "pcv1_"
         static let lastSyncTimestamp = "cloud_lastSyncTimestamp"
         // Primary device tracking
         static let primaryDeviceID = "cloud_primaryDeviceID"
@@ -113,7 +115,7 @@ final class CloudSyncManager {
     }
 
     // Snapshot of all read/favorite states for replay to late subscribers
-    struct ReadStateSnapshot {
+    struct ReadStateSnapshot: Equatable {
         let readArticles: Set<String>
         let favoriteArticles: Set<String>
         let readRedditPosts: Set<String>
@@ -275,6 +277,7 @@ final class CloudSyncManager {
         if let changedKeys = userInfo[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String] {
             var sawV2ReadArticlesChange = false
             var sawV2ReadRedditChange = false
+            var sawPodcastSubscriptionChange = false
 
             for key in changedKeys {
                 switch key {
@@ -299,9 +302,12 @@ final class CloudSyncManager {
                     remoteChangesPublisher.send(.favoriteRedditPosts(ids))
 
                 case Keys.subscriptions:
-                    let subs = getSubscriptions(forKey: Keys.subscriptions)
+                    let subs = getCloudSubscriptions()
                     print("☁️ CloudSyncManager: Received \(subs.count) subscriptions from cloud")
                     remoteChangesPublisher.send(.subscriptions(subs))
+
+                case let podcastKey where podcastKey.hasPrefix(Keys.podcastSubscriptionRecordPrefix):
+                    sawPodcastSubscriptionChange = true
 
                 case let shardKey where shardKey.hasPrefix(V2Keys.readArticlesShardPrefix):
                     sawV2ReadArticlesChange = true
@@ -338,6 +344,11 @@ final class CloudSyncManager {
                     flushPendingReadStateWritesIfPossible()
                 }
                 publishCurrentReadStateSnapshot(context: "\(reasonString) (v2 shard change)")
+            }
+
+            if sawPodcastSubscriptionChange {
+                let subscriptions = getCloudSubscriptions()
+                remoteChangesPublisher.send(.subscriptions(subscriptions))
             }
         }
     }
@@ -432,7 +443,46 @@ final class CloudSyncManager {
     }
 
     func getCloudSubscriptions() -> [Subscription] {
-        return getSubscriptions(forKey: Keys.subscriptions)
+        reconcilePodcastSubscriptions(in: getSubscriptions(forKey: Keys.subscriptions))
+    }
+
+    /// Podcast mutations are individual records, so a secondary device never
+    /// rewrites the shared subscription blob and can propagate deletions safely.
+    func syncPodcastSubscription(_ subscription: Subscription) {
+        guard subscription.isPodcast else { return }
+        setPodcastSubscriptionRecord(.init(subscription: subscription, isDeleted: false, modifiedAt: Date()))
+    }
+
+    func removePodcastSubscription(_ subscription: Subscription) {
+        let tagged = Subscription(id: subscription.id, title: subscription.title, url: subscription.url, type: subscription.type, contentKind: .podcast)
+        setPodcastSubscriptionRecord(.init(subscription: tagged, isDeleted: true, modifiedAt: Date()))
+    }
+
+    func activeCloudPodcastCanonicalKeys() -> Set<String> {
+        Set(podcastSubscriptionRecords().values.filter { !$0.isDeleted }.map { $0.subscription.canonicalKey })
+    }
+
+    func cloudPodcastRecordCanonicalKeys() -> Set<String> {
+        Set(podcastSubscriptionRecords().keys)
+    }
+
+    func hasCloudPodcastSubscriptionRecords() -> Bool {
+        cloudStore.dictionaryRepresentation.keys.contains { $0.hasPrefix(Keys.podcastSubscriptionRecordPrefix) }
+    }
+
+    func isPodcastSubscriptionSynced(_ subscription: Subscription) -> Bool {
+        guard let record = podcastSubscriptionRecords()[subscription.canonicalKey] else { return false }
+        return !record.isDeleted && record.subscription == subscription
+    }
+
+    func reconcilePodcastSubscriptions(in subscriptions: [Subscription]) -> [Subscription] {
+        let records = podcastSubscriptionRecords()
+        guard !records.isEmpty else { return subscriptions }
+        var reconciled = subscriptions.filter { records[$0.canonicalKey] == nil }
+        reconciled.append(contentsOf: records.values.filter { !$0.isDeleted }.map(\.subscription).sorted {
+            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        })
+        return reconciled
     }
 
     // MARK: - Merge Helpers
@@ -474,7 +524,7 @@ final class CloudSyncManager {
         let favoriteArticles = getStringSet(forKey: Keys.favoriteArticles)
         let readRedditPosts = getCloudReadRedditPosts()
         let favoriteRedditPosts = getStringSet(forKey: Keys.favoriteRedditPosts)
-        let subscriptions = getSubscriptions(forKey: Keys.subscriptions)
+        let subscriptions = getCloudSubscriptions()
 
         print("☁️ CloudSyncManager: Read-state snapshot after \(context) - Articles: \(readArticles.count), Reddit: \(readRedditPosts.count) [mainThread=\(Thread.isMainThread)]")
         // Show sample IDs for debugging
@@ -855,12 +905,46 @@ final class CloudSyncManager {
         }
     }
 
+    private struct CloudPodcastSubscriptionRecord: Codable {
+        let subscription: Subscription
+        let isDeleted: Bool
+        let modifiedAt: Date
+    }
+
+    private func setPodcastSubscriptionRecord(_ record: CloudPodcastSubscriptionRecord) {
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        cloudStore.set(data, forKey: podcastSubscriptionRecordKey(for: record.subscription))
+        updateSyncTimestamp()
+        _ = cloudStore.synchronize()
+    }
+
+    private func podcastSubscriptionRecords() -> [String: CloudPodcastSubscriptionRecord] {
+        var records: [String: CloudPodcastSubscriptionRecord] = [:]
+        for (key, value) in cloudStore.dictionaryRepresentation where key.hasPrefix(Keys.podcastSubscriptionRecordPrefix) {
+            guard let data = value as? Data,
+                  let record = try? JSONDecoder().decode(CloudPodcastSubscriptionRecord.self, from: data) else { continue }
+            let canonical = record.subscription.canonicalKey
+            if let existing = records[canonical], existing.modifiedAt >= record.modifiedAt { continue }
+            records[canonical] = record
+        }
+        return records
+    }
+
+    private func podcastSubscriptionRecordKey(for subscription: Subscription) -> String {
+        let digest = SHA256.hash(data: Data(subscription.canonicalKey.utf8))
+        return Keys.podcastSubscriptionRecordPrefix + digest.prefix(20).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func getSubscriptions(forKey key: String) -> [Subscription] {
         guard let data = cloudStore.data(forKey: key),
               let array = try? JSONDecoder().decode([Subscription].self, from: data) else {
             return []
         }
         return array
+    }
+
+    func hasCloudSubscriptionsValue() -> Bool {
+        cloudStore.data(forKey: Keys.subscriptions) != nil
     }
 
     private func updateSyncTimestamp() {
