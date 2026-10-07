@@ -15,6 +15,7 @@ struct RedditRateLimitStatus: Equatable {
     let subreddit: String?
     let endpoint: Endpoint
     let capturedAt: Date
+    var retryAfter: TimeInterval? = nil
 
     var isRateLimited: Bool {
         statusCode == 429
@@ -241,7 +242,8 @@ class RedditService {
             used: used,
             subreddit: subreddit,
             endpoint: endpoint,
-            capturedAt: Date()
+            capturedAt: Date(),
+            retryAfter: parseHeaderDouble(headers["retry-after"])
         )
         storeRateLimit(status)
         return status
@@ -295,7 +297,7 @@ class RedditService {
     func suggestedDelay(after status: RedditRateLimitStatus?, baseline: TimeInterval = 0.7) -> TimeInterval {
         guard let status else { return baseline }
         if status.isRateLimited {
-            return max(status.resetInterval ?? baseline, baseline)
+            return max(status.retryAfter ?? 0, status.resetInterval ?? 0, baseline)
         }
         if let remaining = status.remaining,
            remaining <= 1,
@@ -894,17 +896,23 @@ class RedditService {
     }
 
     @MainActor
-    func replyToComment(commentID: String, body: String) async throws {
-        let fullname = normalizedRedditThingID(prefix: "t1", rawID: commentID)
+    func replyToComment(commentID: String, body: String) async throws -> RedditCommentModel {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            throw RedditServiceError.apiError(message: "Reply text cannot be empty.")
+        }
+
+        let normalizedID = normalizedRedditThingID(prefix: "t1_", rawID: commentID)
         let data = try await performAuthenticatedRedditPost(
             path: "/api/comment",
             queryItems: [
                 URLQueryItem(name: "api_type", value: "json"),
-                URLQueryItem(name: "thing_id", value: fullname),
-                URLQueryItem(name: "text", value: body)
+                URLQueryItem(name: "thing_id", value: normalizedID),
+                URLQueryItem(name: "text", value: trimmedBody)
             ]
         )
         try validateRedditJSONResponse(data)
+        return submittedComment(from: data, fallbackBody: trimmedBody)
     }
 
     private func normalizedRedditThingID(prefix: String, rawID: String) -> String {
@@ -1382,6 +1390,84 @@ class RedditService {
             .prefix(count) // Take top 'count'
             .map { $0 } // Convert slice back to array
     }
+
+    @MainActor
+    func commentOnPost(postID: String, body: String) async throws -> RedditCommentModel {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            throw RedditServiceError.apiError(message: "Comment text cannot be empty.")
+        }
+
+        let normalizedID = normalizedRedditThingID(prefix: "t3_", rawID: postID)
+        let data = try await performAuthenticatedRedditPost(
+            path: "/api/comment",
+            queryItems: [
+                URLQueryItem(name: "api_type", value: "json"),
+                URLQueryItem(name: "thing_id", value: normalizedID),
+                URLQueryItem(name: "text", value: trimmedBody)
+            ]
+        )
+        try validateRedditJSONResponse(data)
+        return submittedComment(from: data, fallbackBody: trimmedBody)
+    }
+
+    private func submittedComment(from data: Data, fallbackBody: String) -> RedditCommentModel {
+        let fallbackAuthor = persistenceManager.loadSettings().redditUsername
+        let fallbackID = "local_\(UUID().uuidString)"
+        let fallbackCreatedUtc = Date().timeIntervalSince1970
+
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let json = object["json"] as? [String: Any],
+              let dataObject = json["data"] as? [String: Any],
+              let things = dataObject["things"] as? [[String: Any]],
+              let firstThing = things.first,
+              let commentData = firstThing["data"] as? [String: Any] else {
+            return RedditCommentModel(
+                id: fallbackID,
+                author: fallbackAuthor.isEmpty ? "me" : fallbackAuthor,
+                body: fallbackBody,
+                score: 1,
+                createdUtc: fallbackCreatedUtc,
+                replies: [],
+                indentationLevel: 0
+            )
+        }
+
+        let rawName = commentData["name"] as? String
+        let rawID = commentData["id"] as? String
+        let id = rawID ?? rawName?.replacingOccurrences(of: "t1_", with: "") ?? fallbackID
+        let author = (commentData["author"] as? String) ?? (fallbackAuthor.isEmpty ? "me" : fallbackAuthor)
+        let body = (commentData["body"] as? String) ?? fallbackBody
+        let score = (commentData["score"] as? Int) ?? (commentData["score"] as? NSNumber)?.intValue ?? 1
+        let createdUtc = (commentData["created_utc"] as? Double)
+            ?? (commentData["created_utc"] as? NSNumber)?.doubleValue
+            ?? fallbackCreatedUtc
+
+        return RedditCommentModel(
+            id: id,
+            author: author,
+            body: body,
+            score: score,
+            createdUtc: createdUtc,
+            replies: [],
+            indentationLevel: 0
+        )
+    }
+
+    func invalidateCommentCache(for postId: String, in subreddit: String) {
+        let normalizedPrefix = "\(subreddit)_\(postId)_".lowercased()
+        let keysToRemove = commentCache.keys.filter { $0.lowercased().hasPrefix(normalizedPrefix) }
+        keysToRemove.forEach { key in
+            commentCache.removeValue(forKey: key)
+        }
+
+        if !keysToRemove.isEmpty {
+            print("📱 RedditService: Invalidated \(keysToRemove.count) cached comment set(s) for post ID: \(postId) in r/\(subreddit)")
+        }
+    }
+
+    var hasReplyPermission: Bool { oauthManager?.hasReplyPermission ?? false }
+
 }
 
 // MARK: - Reddit JSON Models

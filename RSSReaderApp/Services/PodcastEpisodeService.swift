@@ -15,6 +15,7 @@ import FoundationXML
 
 #if os(macOS)
 import AVFoundation
+import MediaPlayer
 import Combine
 import Speech
 #endif
@@ -997,11 +998,11 @@ final class PodcastEpisodePlayerController: ObservableObject {
     private var player: AVPlayer?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
-    init() {}
-
     deinit {
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
     }
+
+    init() { configureRemoteCommands() }
 
     func prepare(_ article: Article) {
         guard let audioURL = article.podcastAudioURL else {
@@ -1032,6 +1033,8 @@ final class PodcastEpisodePlayerController: ObservableObject {
                 switch item.status {
                 case .readyToPlay:
                     self.refreshDuration(from: item)
+                self.updateNowPlayingInfo()
+                    self.updateNowPlayingInfo()
                 case .failed:
                     self.errorMessage = item.error?.localizedDescription ?? "This podcast episode could not be played."
                     self.isPlaying = false
@@ -1050,6 +1053,7 @@ final class PodcastEpisodePlayerController: ObservableObject {
                 if seconds.isFinite { self.currentTime = max(0, seconds) }
                 self.isPlaying = self.player?.timeControlStatus == .playing
                 self.refreshDuration(from: item)
+                self.updateNowPlayingInfo()
             }
         }
     }
@@ -1063,11 +1067,13 @@ final class PodcastEpisodePlayerController: ObservableObject {
         player.playImmediately(atRate: playbackRate)
         isPlaying = true
         errorMessage = nil
+        updateNowPlayingInfo()
     }
 
     func pause() {
         player?.pause()
         isPlaying = false
+        updateNowPlayingInfo()
     }
 
     func stop() {
@@ -1086,6 +1092,8 @@ final class PodcastEpisodePlayerController: ObservableObject {
         currentTime = 0
         duration = 0
         errorMessage = nil
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
     }
 
     func seek(to seconds: TimeInterval) {
@@ -1094,6 +1102,7 @@ final class PodcastEpisodePlayerController: ObservableObject {
         let target = min(max(0, seconds), upperBound)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         currentTime = target
+        updateNowPlayingInfo()
     }
 
     func skip(by seconds: TimeInterval) {
@@ -1103,6 +1112,7 @@ final class PodcastEpisodePlayerController: ObservableObject {
     func setPlaybackRate(_ rate: Float) {
         playbackRate = min(max(rate, 0.5), 2)
         if isPlaying { player?.rate = playbackRate }
+        updateNowPlayingInfo()
     }
 
     private func refreshDuration(from item: AVPlayerItem) {
@@ -1110,5 +1120,64 @@ final class PodcastEpisodePlayerController: ObservableObject {
         if seconds.isFinite, seconds > 0 { duration = seconds }
     }
 
+
+    private func configureRemoteCommands() {
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = true
+        commands.pauseCommand.isEnabled = true
+        commands.stopCommand.isEnabled = true
+        commands.skipForwardCommand.isEnabled = true
+        commands.skipBackwardCommand.isEnabled = true
+        commands.changePlaybackPositionCommand.isEnabled = true
+        commands.skipForwardCommand.preferredIntervals = [15]
+        commands.skipBackwardCommand.preferredIntervals = [15]
+
+        commands.playCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.play() }
+            return .success
+        }
+        commands.pauseCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.pause() }
+            return .success
+        }
+        commands.stopCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.stop() }
+            return .success
+        }
+        commands.skipForwardCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            Task { @MainActor in self.skip(by: interval) }
+            return .success
+        }
+        commands.skipBackwardCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            Task { @MainActor in self.skip(by: -interval) }
+            return .success
+        }
+        commands.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let self,
+                  let positionEvent = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            Task { @MainActor in self.seek(to: positionEvent.positionTime) }
+            return .success
+        }
+    }
+
+    private func updateNowPlayingInfo() {
+        guard activeEpisodeID != nil else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: activeEpisodeTitle,
+            MPMediaItemPropertyAlbumTitle: activeShowTitle,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? playbackRate : 0
+        ]
+        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+    }
 }
 #endif

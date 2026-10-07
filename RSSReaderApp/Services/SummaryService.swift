@@ -309,98 +309,42 @@ init(apiKey: String? = nil) {
         return try await synthesizeSpeech(text: text)
     }
     
-    func summarizeText(_ text: String, customPrompt: String? = nil) -> AnyPublisher<String, Never> {
-        // Check if API key is available
-        guard !apiKey.isEmpty else {
-            return Just("API key not configured. Please add your Gemini API key in Settings.")
-                .eraseToAnyPublisher()
-        }
-        
-        // Prepare the URL with API key
-        let urlString = "\(baseURL)?key=\(apiKey)"
-        guard let url = URL(string: urlString) else {
-            return Just("Invalid API URL")
-                .eraseToAnyPublisher()
-        }
-        
-        // Handle large text inputs
-        var inputText = text
-        let maxTextLength = 150000  // Adjust this based on API limits
-        
-        if inputText.count > maxTextLength {
-            print("⚠️ SummaryService: Text exceeds maximum length (\(inputText.count) chars). Truncating to \(maxTextLength) chars.")
-            inputText = String(inputText.prefix(maxTextLength))
-        }
-        
-        // Prepare the request body
-        let prompt: String
-        if let customPrompt = customPrompt {
-            // Use the custom prompt if provided
-            prompt = customPrompt
-        } else {
-            // Default prompt for article summarization
-            prompt = "Summarize the following text in a concise way, highlighting the key points: \(inputText)"
-        }
-
-        let generationConfig = makeGenerationConfig()
-        let requestBody = GeminiRequest(contents: [GeminiContent(parts: [GeminiPart(text: prompt)])], generationConfig: generationConfig)
-
-        // Log the model and thinking status
-        let modelName = modelNameForGeminiRequest
-        if generationConfig != nil {
-            print("🧠 SummaryService: Calling Gemini model '\(modelName)' with thinking disabled (budget: 0).")
-        } else {
-            print("🧠 SummaryService: Calling Gemini model '\(modelName)' without thinking budget (not supported by this model).")
-        }
-        let actualPromptLength = prompt.count
-        if customPrompt != nil {
-            print("📱 SummaryService: Processing custom prompt with \(actualPromptLength) characters")
-        } else {
-            print("📱 SummaryService: Processing \(inputText.count) characters for summarization")
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        do {
-            let jsonData = try JSONEncoder().encode(requestBody)
-            request.httpBody = jsonData
-        } catch {
-            return Just("Error encoding request: \(error.localizedDescription)")
-                .eraseToAnyPublisher()
-        }
-        
-        return URLSession.shared.dataTaskPublisher(for: request)
-            .handleEvents(receiveOutput: { data, response in
-                if let httpResponse = response as? HTTPURLResponse {
-                    print("🧠 SummaryService: Received HTTP status code: \(httpResponse.statusCode)")
-                }
-                if let jsonString = String(data: data, encoding: .utf8) {
-                    print("🧠 SummaryService: Raw Gemini API Response:\n---\n\(jsonString)\n---")
-                } else {
-                    print("🧠 SummaryService: Could not convert response data to UTF-8 string.")
-                }
-            })
-            .map { $0.data }
-            .decode(type: GeminiResponse.self, decoder: JSONDecoder())
-            .map { response -> String in
-                if let text = response.candidates?.first?.content.parts.first?.text {
-                    print("✅ SummaryService: Successfully decoded Gemini response.")
-                    return text
-                } else if let errorMessage = response.error?.message {
-                    return "Error: \(errorMessage)"
-                } else {
-                    return "No summary available"
+    func summarizeText(
+        _ text: String,
+        customPrompt: String? = nil,
+        preferredBackgroundTaskIdentifier: String? = nil,
+        existingBackgroundTaskHandle: Any? = nil
+    ) -> AnyPublisher<String, Never> {
+        return Future<String, Never> { promise in
+            Task(priority: .userInitiated) {
+                do {
+                    let summary = try await self.summarizeTextAsync(
+                        text,
+                        customPrompt: customPrompt,
+                        preferredBackgroundTaskIdentifier: preferredBackgroundTaskIdentifier,
+                        existingBackgroundTaskHandle: existingBackgroundTaskHandle
+                    )
+                    promise(.success(summary))
+                } catch SummaryServiceError.apiKeyMissing {
+                    promise(.success("API key not configured. Please add your Gemini API key in Settings."))
+                } catch is CancellationError {
+                    promise(.success("Error: Gemini request cancelled."))
+                } catch {
+                    let localizedMessage = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let userFacingMessage = localizedMessage.isEmpty ? "Error generating summary" : localizedMessage
+                    promise(.success(userFacingMessage))
                 }
             }
-            .replaceError(with: "Error generating summary")
-            .eraseToAnyPublisher()
+        }
+        .eraseToAnyPublisher()
     }
 
     // MARK: - Async Gemini Content Generation (for Whiteboard)
 
     func generateContentWithGemini(prompt: String) async throws -> String {
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating with AI")
+        defer { macActivity.finish(success: true) }
+
         guard !apiKey.isEmpty else {
             throw SummaryServiceError.apiKeyMissing
         }
@@ -451,7 +395,10 @@ init(apiKey: String? = nil) {
         settings: AppSettings,
         onPartial: ((String) -> Void)? = nil
     ) async throws -> String {
-        try await RSSSummarizeProviderClient.generate(
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating with AI")
+        defer { macActivity.finish(success: true) }
+
+        return try await RSSSummarizeProviderClient.generate(
             prompt: prompt,
             settings: settings,
             onPartial: onPartial
@@ -462,7 +409,10 @@ init(apiKey: String? = nil) {
         prompt: String,
         settings: AppSettings
     ) async throws -> String {
-        try await FMPCCGatewayClient().generate(prompt: prompt)
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating with AI")
+        defer { macActivity.finish(success: true) }
+
+        return try await FMPCCGatewayClient().generate(prompt: prompt)
     }
 
     func summarizeWithSummarizePublisher(
@@ -480,6 +430,218 @@ init(apiKey: String? = nil) {
             }
         }
         .eraseToAnyPublisher()
+    }
+
+    func summarizeTextAsync(
+        _ text: String,
+        customPrompt: String? = nil,
+        preferredBackgroundTaskIdentifier: String? = nil,
+        existingBackgroundTaskHandle: Any? = nil
+    ) async throws -> String {
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating Summary")
+        defer { macActivity.finish(success: true) }
+        guard !apiKey.isEmpty else {
+            throw SummaryServiceError.apiKeyMissing
+        }
+
+        let urlString = "\(baseURL)?key=\(apiKey)"
+        guard let url = URL(string: urlString) else {
+            throw SummaryServiceError.invalidURL
+        }
+
+        var inputText = text
+        let maxTextLength = 150000
+        if inputText.count > maxTextLength {
+            print("⚠️ SummaryService: Text exceeds maximum length (\(inputText.count) chars). Truncating to \(maxTextLength) chars.")
+            inputText = String(inputText.prefix(maxTextLength))
+        }
+
+        let prompt: String
+        if let customPrompt = customPrompt, !customPrompt.isEmpty {
+            prompt = customPrompt
+        } else {
+            prompt = "Summarize the following text in a concise way, highlighting the key points: \(inputText)"
+        }
+
+        let generationConfig = makeGenerationConfig()
+        let requestBody = GeminiRequest(contents: [GeminiContent(parts: [GeminiPart(text: prompt)])], generationConfig: generationConfig)
+
+        let modelName = modelNameForGeminiRequest
+        if generationConfig != nil {
+            print("🧠 SummaryService: Calling Gemini model '\(modelName)' with thinking disabled (budget: 0).")
+        } else {
+            print("🧠 SummaryService: Calling Gemini model '\(modelName)' without thinking budget (not supported by this model).")
+        }
+        print("📱 SummaryService: Processing \(inputText.count) characters for summarization")
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        // CRITICAL FIX: Set longer timeout for large summarization requests
+        // Global summaries with 50-100 posts can take 60-120 seconds to generate
+        let estimatedComplexity = prompt.count / 1000 // Rough estimate: 1 second per 1000 chars
+        let baseTimeout: TimeInterval = 120 // 2 minutes base for complex requests
+        let adaptiveTimeout = baseTimeout + Double(estimatedComplexity) * 2
+        request.timeoutInterval = min(adaptiveTimeout, 300) // Cap at 5 minutes
+
+        print("🧠 SummaryService: Set timeout to \(String(format: "%.0f", request.timeoutInterval))s for \(prompt.count) char prompt")
+
+        let jsonData: Data
+        do {
+            jsonData = try JSONEncoder().encode(requestBody)
+        } catch {
+            throw error
+        }
+        request.httpBody = jsonData
+
+        let subtitleSource: String
+        if let customPrompt = customPrompt, !customPrompt.isEmpty {
+            subtitleSource = customPrompt
+        } else {
+            subtitleSource = inputText
+        }
+        let backgroundSubtitle = String(subtitleSource.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+
+        #if os(iOS)
+        let backgroundHandle: GeminiBackgroundTaskHandle?
+        let shouldManageHandle: Bool
+        if let providedHandle = existingBackgroundTaskHandle as? GeminiBackgroundTaskHandle {
+            backgroundHandle = providedHandle
+            shouldManageHandle = false
+            backgroundHandle?.onTaskStarted?()
+        } else {
+            let taskIdentifier = preferredBackgroundTaskIdentifier ?? GeminiBackgroundTaskManager.shared.taskIdentifier(for: .processing)
+            let handle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+                identifier: taskIdentifier,
+                title: "Generating Summary: \(backgroundSubtitle.isEmpty ? "Gemini request" : backgroundSubtitle)"
+            )
+            backgroundHandle = handle
+            shouldManageHandle = true
+        }
+        #else
+        let shouldManageHandle = false
+        #endif
+
+        do {
+            #if os(iOS)
+            let summary = try await self.performGeminiSummary(
+                request: request,
+                promptCharacterCount: inputText.count,
+                backgroundHandle: backgroundHandle as Any
+            )
+            if shouldManageHandle {
+                backgroundHandle?.reportProgress(fractionCompleted: 1.0)
+                backgroundHandle?.finish(success: true)
+                print("✅ SummaryService: Background task completed successfully (works when locked)")
+            }
+            return summary
+            #else
+            return try await self.performGeminiSummary(
+                request: request,
+                promptCharacterCount: inputText.count,
+                backgroundHandle: nil
+            )
+            #endif
+        } catch is CancellationError {
+            #if os(iOS)
+            if let handle = backgroundHandle, shouldManageHandle {
+                handle.finish(success: false)
+            }
+            #endif
+            throw CancellationError()
+        } catch {
+            #if os(iOS)
+            if let handle = backgroundHandle, shouldManageHandle {
+                handle.finish(success: false)
+            }
+            #endif
+            print("🧠 SummaryService: Error executing Gemini request: \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    private func performGeminiSummary(request: URLRequest, promptCharacterCount: Int, backgroundHandle: Any?) async throws -> String {
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating Summary")
+        defer { macActivity.finish(success: true) }
+        #if os(iOS)
+        let handle = backgroundHandle as? GeminiBackgroundTaskHandle
+        await handle?.waitForTaskStartIfNeeded()
+        handle?.reportProgress(fractionCompleted: 0.05)
+
+        var heartbeatTask: Task<Void, Never>?
+        heartbeatTask = Task.detached(priority: .utility) { [weak handle] in
+            guard let handle else { return }
+
+            var nextFraction: Double = 0.1
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !handle.cancelled else { break }
+
+                let fraction = min(0.8, nextFraction)
+                handle.reportProgress(fractionCompleted: fraction)
+
+                if fraction >= 0.8 { break }
+                nextFraction += 0.05
+            }
+        }
+        defer { heartbeatTask?.cancel() }
+        #endif
+
+        let startTime = Date()
+        let fetchTask = Task<(Data, URLResponse), Error> {
+            try await URLSession.shared.data(for: request)
+        }
+
+        #if os(iOS)
+        handle?.registerCancellationHandler {
+            fetchTask.cancel()
+        }
+        #endif
+
+        do {
+            let (data, response) = try await fetchTask.value
+
+            #if os(iOS)
+            handle?.reportProgress(fractionCompleted: 0.65)
+            #endif
+
+            let responseTime = Date().timeIntervalSince(startTime)
+            print("🧠 SummaryService: Gemini response time: \(String(format: "%.2f", responseTime)) seconds for \(promptCharacterCount) characters")
+
+            if let httpResponse = response as? HTTPURLResponse {
+                print("🧠 SummaryService: Received HTTP status code: \(httpResponse.statusCode)")
+            }
+
+            if let jsonString = String(data: data, encoding: .utf8) {
+                print("🧠 SummaryService: Raw Gemini API Response:\n---\n\(jsonString)\n---")
+            } else {
+                print("🧠 SummaryService: Could not convert response data to UTF-8 string.")
+            }
+
+            let decoded = try JSONDecoder().decode(GeminiResponse.self, from: data)
+
+            #if os(iOS)
+            handle?.reportProgress(fractionCompleted: 0.9)
+            #endif
+
+            if let text = decoded.candidates?.first?.content.parts.first?.text {
+                print("✅ SummaryService: Successfully decoded Gemini response.")
+                return text
+            } else if let errorMessage = decoded.error?.message {
+                return "Error: \(errorMessage)"
+            } else {
+                return "No summary available"
+            }
+        } catch is CancellationError {
+            print("🧠 SummaryService: Gemini request cancelled while fetching data.")
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            print("🧠 SummaryService: Gemini request cancelled at transport layer.")
+            throw CancellationError()
+        } catch {
+            throw error
+        }
     }
 
     // MARK: - Text-to-Speech
@@ -1767,5 +1929,22 @@ public class ShortcutsTTS {
     public var isSpeaking: Bool {
         // We can't track speaking state with URL scheme
         return false
+    }
+}
+
+
+extension SummaryService {
+    func generateContentWithChatGPT(prompt: String, settings: AppSettings, onPartial: ((String) -> Void)? = nil) async throws -> String {
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating with AI")
+        defer { macActivity.finish(success: true) }
+
+        return try await ChatGPTPlanService.shared.generate(prompt: prompt, onPartial: onPartial)
+    }
+
+    func generateContentWithOpenAICompatible(prompt: String, settings: AppSettings, onPartial: ((String) -> Void)? = nil) async throws -> String {
+        let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "AI", title: "Generating with AI")
+        defer { macActivity.finish(success: true) }
+
+        return try await OpenAICompatibleService.generate(prompt: prompt, settings: settings)
     }
 }

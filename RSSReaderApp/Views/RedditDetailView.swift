@@ -59,6 +59,10 @@ private struct RedditCommentsActionCapsule<Content: View>: View {
         }
         .modifier(RedditCommentsActionPillModifier())
         .accessibilityElement(children: .contain)
+        .sheet(item: $postCommentTarget) { post in
+            postCommentSheet(for: post)
+        }
+
     }
 }
 
@@ -142,6 +146,7 @@ struct RedditDetailView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @State private var comments: [RedditCommentModel] = []
+    @State private var postCommentTarget: RedditPost?
     @State private var displayedComments: [RedditCommentModel] = []
     @State private var isLoadingComments = false
     @State private var selectedCommentSort: RedditService.CommentSortOption = .best
@@ -199,6 +204,10 @@ struct RedditDetailView: View {
             return "memorychip"
         case .webAI:
             return "quote.bubble"
+        case .chatGPT:
+            return "terminal"
+        case .openAICompatible:
+            return "terminal"
         case .summarizeDaemon:
             return "terminal"
         }
@@ -225,6 +234,7 @@ struct RedditDetailView: View {
     }
     
     // Q&A states
+    private let redditQAAnchor = "redditQAAnchor"
     @State private var showQAInterface = false
     @State private var questionText = ""
     @State private var answerText = "Ask a question about this post or its comments..."
@@ -413,7 +423,7 @@ struct RedditDetailView: View {
             titleVisibility: .visible,
             presenting: appState.pendingLocalReroute
         ) { _ in
-            ForEach(LocalRerouteProvider.allCases) { provider in
+            ForEach(LocalRerouteProvider.available) { provider in
                 Button(provider.displayName) {
                     appState.reroutePendingLocalRequest(to: provider)
                 }
@@ -465,6 +475,13 @@ struct RedditDetailView: View {
             }
             #endif
             }
+            .onChange(of: showQAInterface) { _, isShown in
+                guard isShown else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(redditQAAnchor, anchor: .top) }
+                }
+            }
+
     }
 
     @ViewBuilder
@@ -652,7 +669,7 @@ struct RedditDetailView: View {
 
                         // Throughput badge for on-device providers (post summary)
                         let _redditSummaryProvider = appState.settings.selectedSummaryProvider
-                        if (_redditSummaryProvider == .coreAIMLXLocal || _redditSummaryProvider == .appleLocal || _redditSummaryProvider == .applePCCGateway || _redditSummaryProvider == .summarizeDaemon),
+                        if (_redditSummaryProvider == .coreAIMLXLocal || _redditSummaryProvider == .appleLocal || _redditSummaryProvider == .applePCCGateway || _redditSummaryProvider == .summarizeDaemon || _redditSummaryProvider == .chatGPT || _redditSummaryProvider == .openAICompatible),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -887,7 +904,7 @@ struct RedditDetailView: View {
                         }
                         // Throughput badge for on-device providers (comment summary)
                         let _redditCommentSummaryProvider = appState.settings.selectedSummaryProvider
-                        if (_redditCommentSummaryProvider == .coreAIMLXLocal || _redditCommentSummaryProvider == .appleLocal || _redditCommentSummaryProvider == .applePCCGateway || _redditCommentSummaryProvider == .summarizeDaemon),
+                        if (_redditCommentSummaryProvider == .coreAIMLXLocal || _redditCommentSummaryProvider == .appleLocal || _redditCommentSummaryProvider == .applePCCGateway || _redditCommentSummaryProvider == .summarizeDaemon || _redditCommentSummaryProvider == .chatGPT || _redditCommentSummaryProvider == .openAICompatible),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -933,6 +950,7 @@ struct RedditDetailView: View {
                         // Display the toggled Q&A interface
                         if showQAInterface {
                             VStack(alignment: .leading, spacing: 12) {
+                                Color.clear.frame(height: 0).id(redditQAAnchor)
                                 AskComposerBar(
                                     text: $questionText,
                                     placeholder: "Ask about this post and its comments…",
@@ -1103,7 +1121,7 @@ struct RedditDetailView: View {
 
                                 // Throughput badge for on-device providers (Q&A only)
                                 let _redditQAProvider = appState.settings.selectedSummaryProvider
-                                if (_redditQAProvider == .coreAIMLXLocal || _redditQAProvider == .appleLocal || _redditQAProvider == .applePCCGateway || _redditQAProvider == .summarizeDaemon),
+                                if (_redditQAProvider == .coreAIMLXLocal || _redditQAProvider == .appleLocal || _redditQAProvider == .applePCCGateway || _redditQAProvider == .summarizeDaemon || _redditQAProvider == .chatGPT || _redditQAProvider == .openAICompatible),
                                    !appState.mlxLastQAThroughput.isEmpty,
                                    !isProcessingQuestion,
                                    answerText != "Ask a question about this post or its comments..." {
@@ -1119,7 +1137,9 @@ struct RedditDetailView: View {
                         }
                         
                         // Display limited comments with option to load more
-                        CommentThreadView(comments: displayedComments, post: post)
+                        CommentThreadView(comments: displayedComments, post: post) { parentID, reply in
+                            handleReplyPosted(to: parentID, reply: reply, post: post)
+                        }
                         
                         if hasMoreCommentsToLoad {
                             Button {
@@ -1146,7 +1166,7 @@ struct RedditDetailView: View {
         return ZStack {
             AppColors.background
                 .ignoresSafeArea()
-            
+
             Group {
             #if os(macOS)
             // Wide panes: post on the left, comments on the right, each scrolling on its own.
@@ -1323,6 +1343,14 @@ struct RedditDetailView: View {
             HStack(spacing: 8) {
                 commentsHeaderTitle
                 Spacer(minLength: 8)
+                Button {
+                    postCommentTarget = post
+                } label: {
+                    Label("Comment", systemImage: "square.and.pencil")
+                }
+                .buttonStyle(RedditCommentsChromeLabeledButtonStyle())
+                .disabled(!appState.redditOAuthManager.hasReplyPermission)
+                .help(appState.redditOAuthManager.hasReplyPermission ? "Post a comment" : "Reconnect Reddit in Settings to grant comment permission")
             }
 
             if !comments.isEmpty {
@@ -1553,6 +1581,118 @@ struct RedditDetailView: View {
                     }
             }
             .contentShape(Capsule(style: .continuous))
+    }
+
+    private func postCommentSheet(for post: RedditPost) -> some View {
+        RedditCommentReplySheet(post: post) { body in
+            let postedComment = try await appState.redditService.commentOnPost(postID: post.id, body: body)
+            let visibleComment = RedditCommentModel(
+                id: postedComment.id,
+                author: postedComment.author,
+                body: postedComment.body,
+                score: postedComment.score,
+                createdUtc: postedComment.createdUtc,
+                replies: postedComment.replies,
+                indentationLevel: 0
+            )
+            await MainActor.run {
+                handleTopLevelCommentPosted(visibleComment, post: post)
+            }
+        }
+    }
+
+    private func handleTopLevelCommentPosted(_ comment: RedditCommentModel, post: RedditPost) {
+        guard post.id == appState.selectedRedditPost?.id else { return }
+
+        appState.redditService.invalidateCommentCache(for: post.id, in: post.subreddit)
+
+        guard !containsComment(withID: comment.id, in: comments) else { return }
+
+        comments.insert(comment, at: 0)
+        displayedComments.insert(comment, at: 0)
+        if displayedComments.count > maxDisplayComments {
+            displayedComments = Array(displayedComments.prefix(maxDisplayComments))
+        }
+        hasMoreCommentsToLoad = displayedComments.count < comments.count
+        commentLoadStatusMessage = nil
+
+        commentSummary = nil
+        showCommentSummary = false
+        commentsSentToLLMCount = nil
+    }
+
+    private func handleReplyPosted(to parentCommentID: String, reply: RedditCommentModel, post: RedditPost) {
+        guard post.id == appState.selectedRedditPost?.id else { return }
+
+        appState.redditService.invalidateCommentCache(for: post.id, in: post.subreddit)
+
+        let fullUpdate = commentsByAppendingReply(reply, toParentID: parentCommentID, in: comments)
+        if fullUpdate.didInsert {
+            comments = fullUpdate.comments
+        }
+
+        let visibleUpdate = commentsByAppendingReply(reply, toParentID: parentCommentID, in: displayedComments)
+        if visibleUpdate.didInsert {
+            displayedComments = visibleUpdate.comments
+        } else if fullUpdate.didInsert {
+            displayedComments = Array(comments.prefix(maxDisplayComments))
+            hasMoreCommentsToLoad = displayedComments.count < comments.count
+        }
+
+        commentSummary = nil
+        showCommentSummary = false
+        commentsSentToLLMCount = nil
+    }
+
+    private func commentsByAppendingReply(
+        _ reply: RedditCommentModel,
+        toParentID parentCommentID: String,
+        in commentList: [RedditCommentModel]
+    ) -> (comments: [RedditCommentModel], didInsert: Bool) {
+        var didInsert = false
+
+        let updatedComments = commentList.map { comment -> RedditCommentModel in
+            if comment.id == parentCommentID {
+                didInsert = true
+                guard !containsComment(withID: reply.id, in: comment.replies) else {
+                    return comment
+                }
+
+                return RedditCommentModel(
+                    id: comment.id,
+                    author: comment.author,
+                    body: comment.body,
+                    score: comment.score,
+                    createdUtc: comment.createdUtc,
+                    replies: comment.replies + [reply],
+                    indentationLevel: comment.indentationLevel
+                )
+            }
+
+            let nestedUpdate = commentsByAppendingReply(reply, toParentID: parentCommentID, in: comment.replies)
+            if nestedUpdate.didInsert {
+                didInsert = true
+                return RedditCommentModel(
+                    id: comment.id,
+                    author: comment.author,
+                    body: comment.body,
+                    score: comment.score,
+                    createdUtc: comment.createdUtc,
+                    replies: nestedUpdate.comments,
+                    indentationLevel: comment.indentationLevel
+                )
+            }
+
+            return comment
+        }
+
+        return (updatedComments, didInsert)
+    }
+
+    private func containsComment(withID id: String, in commentList: [RedditCommentModel]) -> Bool {
+        commentList.contains { comment in
+            comment.id == id || containsComment(withID: id, in: comment.replies)
+        }
     }
     
     private func loadComments(for post: RedditPost) {
@@ -1866,7 +2006,59 @@ struct RedditDetailView: View {
                 self.isLoadingComments = false
             }
             return
-        } else if appState.settings.selectedSummaryProvider == .summarizeDaemon {
+        } else if appState.settings.selectedSummaryProvider == .chatGPT {
+            let prompt = appState.commentSummaryPrompt(comments: comments)
+
+            isLoadingComments = true
+            self.commentsSentToLLMCount = comments.count
+
+            appState.performChatGPTSummaryPublic(prompt: prompt, taskName: "Reddit Comment Summary") { summaryText in
+                guard shouldAcceptCommentSummaryResult(for: post) else {
+                    print("⚠️ RedditDetailView: Post selection changed before Summarize summary completed, discarding results")
+                    self.isLoadingComments = false
+                    return
+                }
+                self.commentSummary = CommentSummary(
+                    postId: post.id,
+                    subreddit: post.subreddit,
+                    summary: appState.cleanMarkdownArtifactsForDisplay(summaryText),
+                    commentCount: comments.count,
+                    topCommenters: [],
+                    mainTopics: [],
+                    sentiment: .neutral,
+                    createdDate: Date()
+                )
+                self.showCommentSummary = true
+                self.isLoadingComments = false
+            }
+            return
+                } else if appState.settings.selectedSummaryProvider == .openAICompatible {
+            let prompt = appState.commentSummaryPrompt(comments: comments)
+
+            isLoadingComments = true
+            self.commentsSentToLLMCount = comments.count
+
+            appState.performOpenAICompatibleSummaryPublic(prompt: prompt, taskName: "Reddit Comment Summary") { summaryText in
+                guard shouldAcceptCommentSummaryResult(for: post) else {
+                    print("⚠️ RedditDetailView: Post selection changed before Summarize summary completed, discarding results")
+                    self.isLoadingComments = false
+                    return
+                }
+                self.commentSummary = CommentSummary(
+                    postId: post.id,
+                    subreddit: post.subreddit,
+                    summary: appState.cleanMarkdownArtifactsForDisplay(summaryText),
+                    commentCount: comments.count,
+                    topCommenters: [],
+                    mainTopics: [],
+                    sentiment: .neutral,
+                    createdDate: Date()
+                )
+                self.showCommentSummary = true
+                self.isLoadingComments = false
+            }
+            return
+                } else if appState.settings.selectedSummaryProvider == .summarizeDaemon {
             let prompt = appState.commentSummaryPrompt(comments: comments)
 
             isLoadingComments = true
@@ -2070,13 +2262,15 @@ Each item ≤ 2–3 sentences.
                 selectedText: trimmed,
                 extractedContext: context,
                 sourceContext: selectionOrigin.boundedSource(additionalAnswer: answerText),
-                sourceLabel: selectionOrigin.promptSourceLabel
+                sourceLabel: selectionOrigin.promptSourceLabel,
+                explainSelection: action == .standard && appState.settings.selectedSummaryProvider != .webAI
             )
         } else {
-            prompt = appState.redditQAPrompt(
-                post: post,
-                comments: comments,
-                question: "What is said about \(trimmed)?"
+            let source = appState.redditSelectionSourceContext(post: post, comments: comments)
+            prompt = buildAskAISelectionPrompt(
+                selectedText: trimmed, extractedContext: context,
+                sourceContext: source.text, sourceLabel: source.label,
+                explainSelection: action == .standard && appState.settings.selectedSummaryProvider != .webAI
             )
         }
         guard !prompt.isEmpty else { return }
@@ -3953,7 +4147,7 @@ struct CommentAnalyticsViewIntegrated: View {
                     .padding(.horizontal)
                 // Throughput badge for on-device providers (deep analysis)
                 let _deepAnalysisProvider = effectiveSummaryProvider
-                if (_deepAnalysisProvider == .coreAIMLXLocal || _deepAnalysisProvider == .appleLocal || _deepAnalysisProvider == .applePCCGateway || _deepAnalysisProvider == .summarizeDaemon),
+                if (_deepAnalysisProvider == .coreAIMLXLocal || _deepAnalysisProvider == .appleLocal || _deepAnalysisProvider == .applePCCGateway || _deepAnalysisProvider == .summarizeDaemon || _deepAnalysisProvider == .chatGPT || _deepAnalysisProvider == .openAICompatible),
                    !appState.mlxLastThroughput.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "cpu").font(.caption2)
@@ -4122,7 +4316,7 @@ struct CommentAnalyticsViewIntegrated: View {
             let errorMessage: String?
             
             switch self.effectiveSummaryProvider {
-            case .appleLocal, .appleCloud, .applePCCGateway, .coreAIMLXLocal, .webAI, .summarizeDaemon:
+            case .appleLocal, .appleCloud, .applePCCGateway, .coreAIMLXLocal, .webAI, .summarizeDaemon, .chatGPT, .openAICompatible:
                 // These providers do not need API keys for this flow.
                 canProceed = true
                 errorMessage = nil
@@ -4234,7 +4428,27 @@ struct CommentAnalyticsViewIntegrated: View {
                 }
             )
             return
-        } else if effectiveSummaryProvider == .summarizeDaemon {
+        } else if effectiveSummaryProvider == .chatGPT {
+            print("⚙️ CommentAnalyticsViewIntegrated: Sending \(analyzedCommentCount) comments for thematic analysis using ChatGPT Plan.")
+            appState.performChatGPTSummaryPublic(prompt: prompt, taskName: "Reddit Thematic Analysis") { analysisText in
+                DispatchQueue.main.async {
+                    self.thematicAnalysis = self.appState.cleanMarkdownArtifactsForDisplay(analysisText)
+                    self.thematicAnalysisError = nil
+                    self.isThematicAnalysisLoading = false
+                }
+            }
+            return
+                } else if effectiveSummaryProvider == .openAICompatible {
+            print("⚙️ CommentAnalyticsViewIntegrated: Sending \(analyzedCommentCount) comments for thematic analysis using Custom Server.")
+            appState.performOpenAICompatibleSummaryPublic(prompt: prompt, taskName: "Reddit Thematic Analysis") { analysisText in
+                DispatchQueue.main.async {
+                    self.thematicAnalysis = self.appState.cleanMarkdownArtifactsForDisplay(analysisText)
+                    self.thematicAnalysisError = nil
+                    self.isThematicAnalysisLoading = false
+                }
+            }
+            return
+                } else if effectiveSummaryProvider == .summarizeDaemon {
             print("⚙️ CommentAnalyticsViewIntegrated: Sending \(analyzedCommentCount) comments for thematic analysis using Codex / Summarize.")
             appState.performSummarizeSummaryPublic(prompt: prompt, taskName: "Reddit Thematic Analysis") { analysisText in
                 DispatchQueue.main.async {

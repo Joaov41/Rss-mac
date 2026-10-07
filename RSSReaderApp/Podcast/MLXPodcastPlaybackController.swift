@@ -230,6 +230,15 @@ final class MLXPodcastPlaybackController: ObservableObject {
         playbackTask = Task { [weak self] in
             guard let self else { return }
             do {
+                let macActivity = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "Podcast", title: "Preparing podcast audio")
+                defer { macActivity.finish(success: true) }
+                guard let audioCache else {
+                    throw BatchPodcastError.audioExportFailed("The podcast audio cache could not be created.")
+                }
+                try await self.preparePlaybackAudio(
+                    plan: plan, hostAVoice: hostAVoice, hostBVoice: hostBVoice,
+                    speed: Float(clampedSpeed), token: token, operation: operation, audioCache: audioCache
+                )
                 try await self.runPlayback(
                     plan: plan,
                     hostAVoice: hostAVoice,
@@ -365,15 +374,9 @@ final class MLXPodcastPlaybackController: ObservableObject {
         operation: UUID,
         audioCache: PodcastAudioCache?
     ) async throws {
+        guard let audioCache else { throw BatchPodcastError.audioExportFailed("Prepared podcast audio is unavailable.") }
         var index = 0
-        let firstData = try await synthesize(
-            chunk: plan[0],
-            hostAVoice: hostAVoice,
-            hostBVoice: hostBVoice,
-            speed: speed,
-            token: token,
-            audioCache: audioCache
-        )
+        let firstData = try preparedData(for: plan[0], audioCache: audioCache)
         var currentBuffer = try makeBuffer(from: firstData)
         try ensureEngine(format: currentBuffer.format)
         try await waitIfPaused()
@@ -385,27 +388,14 @@ final class MLXPodcastPlaybackController: ObservableObject {
         currentSpeaker = plan[0].speaker
         statusMessage = "Playing \(plan[0].speaker.displayName)"
 
-        var nextTask: Task<Data, Error>? = plan.count > 1
-            ? makeSynthesisTask(
-                chunk: plan[1],
-                hostAVoice: hostAVoice,
-                hostBVoice: hostBVoice,
-                speed: speed,
-                token: token,
-                audioCache: audioCache
-            )
-            : nil
-        defer { nextTask?.cancel() }
-
         while true {
             try Task.checkCancellation()
             guard operationID == operation,
                   KokoroTTSService.shared.isPlaybackTokenCurrent(token) else { throw CancellationError() }
 
             var nextScheduled: (buffer: AVAudioPCMBuffer, latch: AudioCompletionLatch)?
-            if let nextTask {
-                state = .playing
-                let nextData = try await nextTask.value
+            if plan.indices.contains(index + 1) {
+                let nextData = try preparedData(for: plan[index + 1], audioCache: audioCache)
                 let buffer = try makeBuffer(from: nextData)
                 if plan.indices.contains(index + 1), plan[index + 1].isSpeakerChange,
                    let silence = makeSilenceBuffer(format: currentBuffer.format, duration: 0.12) {
@@ -424,23 +414,49 @@ final class MLXPodcastPlaybackController: ObservableObject {
             currentTurnIndex = plan[index].turnIndex
             currentSpeaker = plan[index].speaker
             statusMessage = "Playing \(plan[index].speaker.displayName)"
-
-            let followingIndex = index + 1
-            nextTask = plan.indices.contains(followingIndex)
-                ? makeSynthesisTask(
-                    chunk: plan[followingIndex],
-                    hostAVoice: hostAVoice,
-                    hostBVoice: hostBVoice,
-                    speed: speed,
-                    token: token,
-                    audioCache: audioCache
-                )
-                : nil
             try await waitIfPaused()
         }
 
         progress = 1
-        try? audioCache?.prepareCompleteEpisode(from: plan)
+    }
+
+    private func preparePlaybackAudio(
+        plan: [MLXPodcastPlaybackChunk],
+        hostAVoice: KokoroVoice,
+        hostBVoice: KokoroVoice,
+        speed: Float,
+        token: UUID,
+        operation: UUID,
+        audioCache: PodcastAudioCache
+    ) async throws {
+        statusMessage = "Preparing episode audio…"
+        progress = 0
+        for (index, chunk) in plan.enumerated() {
+            try Task.checkCancellation()
+            guard operationID == operation,
+                  KokoroTTSService.shared.isPlaybackTokenCurrent(token) else { throw CancellationError() }
+            statusMessage = "Preparing audio \(index + 1) of \(plan.count)…"
+            _ = try await synthesize(
+                chunk: chunk,
+                hostAVoice: hostAVoice,
+                hostBVoice: hostBVoice,
+                speed: speed,
+                token: token,
+                audioCache: audioCache
+            )
+            progress = Double(index + 1) / Double(plan.count)
+        }
+        statusMessage = "Finalizing episode audio…"
+        _ = try audioCache.prepareCompleteEpisode(from: plan)
+        progress = 0
+        statusMessage = "Audio ready"
+    }
+
+    private func preparedData(for chunk: MLXPodcastPlaybackChunk, audioCache: PodcastAudioCache) throws -> Data {
+        guard let data = audioCache.read(chunkID: chunk.id) else {
+            throw BatchPodcastError.audioExportFailed("Prepared podcast audio is missing. Please tap Play again.")
+        }
+        return data
     }
 
     private func makeSynthesisTask(

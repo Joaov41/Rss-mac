@@ -157,8 +157,10 @@ class SelectionOriginContextRegressionTests(unittest.TestCase):
     def test_summary_selection_and_nested_followups_retain_the_source(self):
         summary = read("RSSReaderApp/Views/SummaryColumnView.swift")
         self.assertIn("articleSelectionSourceContext(for: article)", summary)
-        self.assertIn("appState.articleQAPrompt(", summary)
-        self.assertIn("question: \"What is said about \\(trimmed)?\"", summary)
+        self.assertIn("buildAskAISelectionPrompt(", summary)
+        self.assertIn("sourceContext: source.text", summary)
+        self.assertIn("selectedText: trimmed", summary)
+        self.assertIn("explainSelection: action == .standard", summary)
         self.assertIn("selectionOrigin: selectionAskAIOrigin", summary)
 
         source = read("RSSReaderApp/Views/AskAIComponents.swift")

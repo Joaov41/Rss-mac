@@ -16,6 +16,20 @@ final class WebAISessionManager {
 
     private init() {}
 
+    func keepWebViewsAwake() {
+        for webView in webViews.values {
+            webView.evaluateJavaScript("0", completionHandler: nil)
+        }
+    }
+
+    func cancelActiveRequest(for provider: WebAIProvider) {
+        guard let webView = webViews[provider] else { return }
+        webView.stopLoading()
+        webView.evaluateJavaScript(
+            "if (window.__webAICapture && typeof window.__webAICapture.stop === 'function') { window.__webAICapture.stop(); }"
+        ) { _, _ in }
+    }
+
     func hasWebView(for provider: WebAIProvider) -> Bool {
         webViews[provider] != nil
     }

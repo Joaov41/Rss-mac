@@ -148,6 +148,7 @@ struct CommentView: View {
     let comment: RedditCommentModel
     let post: RedditPost
     let redditService: RedditService
+    var onReplyPosted: (String, RedditCommentModel) -> Void = { _, _ in }
     @State private var isCollapsed = false
     @State private var voteDirection: RedditVoteDirection = .none
     @State private var isSubmittingVote = false
@@ -569,6 +570,7 @@ struct CommentView: View {
             }
             .buttonStyle(.plain)
             .help("Reply")
+            .disabled(!redditService.hasReplyPermission)
             .foregroundColor(metadataColor)
 
             ShareLink(item: commentURL) {
@@ -603,7 +605,13 @@ struct CommentView: View {
         .fixedSize()
         .sheet(isPresented: $showReplySheet) {
             RedditCommentReplySheet(comment: comment) { body in
-                try await redditService.replyToComment(commentID: comment.id, body: body)
+                let postedReply = try await redditService.replyToComment(commentID: comment.id, body: body)
+                let visibleReply = RedditCommentModel(
+                    id: postedReply.id, author: postedReply.author, body: postedReply.body,
+                    score: postedReply.score, createdUtc: postedReply.createdUtc,
+                    replies: postedReply.replies, indentationLevel: comment.indentationLevel + 1
+                )
+                await MainActor.run { onReplyPosted(comment.id, visibleReply) }
             }
         }
     }
@@ -706,7 +714,7 @@ struct CommentView: View {
             if !isCollapsed {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(visibleReplies) { reply in
-                        CommentView(comment: reply, post: post, redditService: redditService)
+                        CommentView(comment: reply, post: post, redditService: redditService, onReplyPosted: onReplyPosted)
                     }
 
                     if shouldLimitReplies && comment.replies.count > 5 {
@@ -749,14 +757,30 @@ struct CommentView: View {
     }
 }
 
-private struct RedditCommentReplySheet: View {
+struct RedditCommentReplySheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
-    let comment: RedditCommentModel
+    let title: String
+    let contextTitle: String
+    let contextBody: String
     let onSubmit: (String) async throws -> Void
     @State private var replyText = ""
     @State private var isSubmitting = false
     @State private var errorMessage: String?
+
+    init(comment: RedditCommentModel, onSubmit: @escaping (String) async throws -> Void) {
+        title = "Reply"
+        contextTitle = "Replying to u/\(comment.author)"
+        contextBody = comment.body
+        self.onSubmit = onSubmit
+    }
+
+    init(post: RedditPost, onSubmit: @escaping (String) async throws -> Void) {
+        title = "Comment"
+        contextTitle = "Commenting in r/\(post.subreddit)"
+        contextBody = post.title
+        self.onSubmit = onSubmit
+    }
 
     private var trimmedReply: String {
         replyText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -810,7 +834,7 @@ private struct RedditCommentReplySheet: View {
 
                 Spacer()
 
-                Text("Reply")
+                Text(title)
                     .font(.system(size: 18, weight: .bold))
                     .foregroundColor(.white.opacity(0.9))
 
@@ -854,7 +878,7 @@ private struct RedditCommentReplySheet: View {
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundColor(lavender)
 
-                    Text("Replying to u/\(comment.author)")
+                    Text(contextTitle)
                         .font(.system(size: 16, weight: .bold))
                         .foregroundColor(.white.opacity(0.84))
                         .lineLimit(1)
@@ -865,7 +889,7 @@ private struct RedditCommentReplySheet: View {
                         .fill(lavender.opacity(0.72))
                         .frame(width: 4)
 
-                    Text(comment.body)
+                    Text(contextBody)
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white.opacity(0.68))
                         .lineLimit(4)
@@ -935,10 +959,10 @@ private struct RedditCommentReplySheet: View {
     private var lightReplyView: some View {
         NavigationView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Replying to u/\(comment.author)")
+                Text(contextTitle)
                     .font(.headline)
 
-                Text(comment.body)
+                Text(contextBody)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .lineLimit(4)
@@ -957,7 +981,7 @@ private struct RedditCommentReplySheet: View {
                 }
             }
             .padding()
-            .navigationTitle("Reply")
+            .navigationTitle(title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -999,11 +1023,12 @@ struct CommentThreadView: View {
     @EnvironmentObject private var appState: AppState
     let comments: [RedditCommentModel]
     let post: RedditPost
+    var onReplyPosted: (String, RedditCommentModel) -> Void = { _, _ in }
     
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 10) {
             ForEach(comments) { comment in
-                CommentView(comment: comment, post: post, redditService: appState.redditService)
+                CommentView(comment: comment, post: post, redditService: appState.redditService, onReplyPosted: onReplyPosted)
             }
         }
         .padding(.vertical, 4)

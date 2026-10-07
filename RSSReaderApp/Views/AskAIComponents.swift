@@ -124,7 +124,8 @@ func buildAskAISelectionPrompt(
     selectedText: String,
     extractedContext: String,
     sourceContext: String,
-    sourceLabel: String = "Original source"
+    sourceLabel: String = "Original source",
+    explainSelection: Bool = false
 ) -> String {
     func normalized(_ value: String, maxCharacters: Int) -> String {
         var normalized = value
@@ -132,9 +133,11 @@ func buildAskAISelectionPrompt(
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+
         if normalized.count > maxCharacters {
             normalized = String(normalized.prefix(maxCharacters))
         }
+
         return normalized
     }
 
@@ -142,7 +145,34 @@ func buildAskAISelectionPrompt(
     let context = normalized(extractedContext, maxCharacters: 16_000)
     let source = normalized(sourceContext, maxCharacters: 40_000)
     let label = normalized(sourceLabel, maxCharacters: 120)
-    guard !selected.isEmpty else { return "" }
+
+    guard !selected.isEmpty else {
+        return ""
+    }
+
+    // Opt in only for Settings-model Ask AI; preserve the existing Web prompt.
+    if explainSelection {
+        return """
+        Explain what the selected passage means in its context. Do not merely repeat or paraphrase the surrounding summary or Q&A answer.
+
+        Rules:
+        - Start with a direct explanation of the selected words or idea, not a recap of what commenters or articles discussed.
+        - Use the supplied source and nearby context to resolve references, wordplay, contrasts, and implied relationships. Make those relationships explicit in your answer.
+        - Distinguish a source author's claim from an established fact. Do not invent motives, background facts, or details absent from the supplied material.
+        - Explain what the supplied material supports even if there is no further detail. State only the specific uncertainty that remains; do not replace a supported explanation with an unavailable-information response.
+        - If a reference is genuinely ambiguous, say what is unclear rather than guessing.
+        - Return concise plain text in short paragraphs, without Markdown symbols, headings, bullets, or code fences.
+
+        Selected text:
+        \(selected)
+
+        Nearby rendered context:
+        \(context.isEmpty ? "(No nearby rendered context was captured.)" : context)
+
+        \(label.isEmpty ? "Original source" : label):
+        \(source.isEmpty ? "(No original source was captured; explain only what the selection and nearby context support.)" : source)
+        """
+    }
 
     if !source.isEmpty {
         return """
@@ -170,23 +200,41 @@ func buildAskAISelectionPrompt(
         """
     }
 
+    if context.isEmpty {
+        return """
+        Answer the question using only the selected text.
+
+        Rules:
+        - Return plain text only.
+        - Do not use Markdown symbols, headings, bullets, or code fences.
+        - Use short paragraphs separated by a blank line when the answer has multiple ideas.
+        - If the selected text does not answer it, say the information is not available in the selection.
+
+        Question:
+        What is said about this selected text?
+
+        Selected text:
+        \(selected)
+        """
+    }
+
     return """
-    Answer the question using only the selected text and nearby rendered context.
+    Answer the question using only the selected text and extracted context.
 
     Rules:
     - Return plain text only.
     - Do not use Markdown symbols, headings, bullets, or code fences.
     - Use short paragraphs separated by a blank line when the answer has multiple ideas.
-    - If the selected text and nearby context do not answer it, say the information is not available.
+    - If the context does not answer it, say the information is not available in the context.
 
     Question:
-    What is said about this selected text?
+    What is said about this selected text in the context?
 
     Selected text:
     \(selected)
 
-    Nearby rendered context:
-    \(context.isEmpty ? "(No nearby rendered context was captured.)" : context)
+    Extracted context:
+    \(context)
     """
 }
 
@@ -618,7 +666,8 @@ struct AskAIResponseSheet: View {
             selectedText: selected,
             extractedContext: nearbyContext,
             sourceContext: origin.boundedSource(additionalAnswer: context),
-            sourceLabel: origin.promptSourceLabel
+            sourceLabel: origin.promptSourceLabel,
+            explainSelection: !useWebAI && appState.settings.selectedSummaryProvider != .webAI
         )
 
         followUpResponse = nil

@@ -213,7 +213,7 @@ struct SummaryColumnView: View {
 
                         // Throughput badge for on-device providers
                         let _colProvider = appState.settings.selectedSummaryProvider
-                        if (_colProvider == .coreAIMLXLocal || _colProvider == .appleLocal || _colProvider == .applePCCGateway || _colProvider == .summarizeDaemon),
+                        if (_colProvider == .coreAIMLXLocal || _colProvider == .appleLocal || _colProvider == .applePCCGateway || _colProvider == .summarizeDaemon || _colProvider == .chatGPT || _colProvider == .openAICompatible),
                            !appState.mlxLastThroughput.isEmpty {
                             HStack(spacing: 4) {
                                 Image(systemName: "cpu").font(.caption2)
@@ -892,9 +892,11 @@ struct SummaryColumnView: View {
             sourceLabel: source.label,
             sourceText: source.text
         )
-        let prompt = appState.articleQAPrompt(
-            article: article,
-            question: "What is said about \(trimmed)?"
+        let prompt = buildAskAISelectionPrompt(
+            selectedText: trimmed,
+            extractedContext: askAINearbyRenderedContext(selectedText: trimmed, in: article.summary ?? ""),
+            sourceContext: source.text, sourceLabel: source.label,
+            explainSelection: action == .standard && appState.settings.selectedSummaryProvider != .webAI
         )
         guard !prompt.isEmpty else { return }
         selectionAskAIOrigin = origin
@@ -946,6 +948,10 @@ struct SummaryColumnView: View {
             return "memorychip"
         case .webAI:
             return "quote.bubble"
+        case .chatGPT:
+            return "terminal"
+        case .openAICompatible:
+            return "terminal"
         case .summarizeDaemon:
             return "terminal"
         }
@@ -965,6 +971,10 @@ struct SummaryColumnView: View {
             return .orange.opacity(0.1)
         case .webAI:
             return .teal.opacity(0.14)
+        case .chatGPT:
+            return .indigo.opacity(0.14)
+        case .openAICompatible:
+            return .indigo.opacity(0.14)
         case .summarizeDaemon:
             return .indigo.opacity(0.14)
         }

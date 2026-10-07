@@ -26,7 +26,7 @@ class RedditOAuthManager: NSObject, ObservableObject {
     }
     // MUST match your Reddit app's redirect URI exactly
     private let redirectURI = "redapp://auth"
-    private let scope = "read,identity,mysubreddits,history,vote,submit"
+    private let scope = "identity edit vote submit read mysubreddits history"
 
     // OAuth endpoints - use standard authorize (not compact for mobile)
     private let authorizationURL = "https://www.reddit.com/api/v1/authorize"
@@ -36,6 +36,7 @@ class RedditOAuthManager: NSObject, ObservableObject {
 
     @Published var isAuthenticated = false
     @Published var username: String = ""
+    @Published var grantedScopes: String = ""
 
     private let persistenceManager = PersistenceManager.shared
     private var cancellables = Set<AnyCancellable>()
@@ -69,6 +70,7 @@ class RedditOAuthManager: NSObject, ObservableObject {
         if !settings.redditAccessToken.isEmpty {
             isAuthenticated = true
             username = settings.redditUsername
+            grantedScopes = settings.redditGrantedScopes
 
             // Check if token is expired
             if let expiry = settings.redditTokenExpiry, expiry < Date() {
@@ -479,6 +481,10 @@ class RedditOAuthManager: NSObject, ObservableObject {
         if let refreshToken = tokenResponse.refresh_token {
             settings.redditRefreshToken = refreshToken
         }
+        settings.redditGrantedScopes = tokenResponse.scope
+        DispatchQueue.main.async {
+            self.grantedScopes = tokenResponse.scope
+        }
 
         // Calculate expiry time (Reddit tokens expire in 1 hour)
         let expiryDate = Date().addingTimeInterval(TimeInterval(tokenResponse.expires_in - 300)) // 5 min buffer
@@ -490,17 +496,37 @@ class RedditOAuthManager: NSObject, ObservableObject {
     // MARK: - Logout
 
     func logout() {
+        clearStoredTokens()
+
+        print("🔐 RedditOAuth: Logged out")
+    }
+
+    private func clearStoredTokens() {
         var settings = persistenceManager.loadSettings()
         settings.redditAccessToken = ""
         settings.redditRefreshToken = ""
         settings.redditTokenExpiry = nil
         settings.redditUsername = ""
+        settings.redditGrantedScopes = ""
         persistenceManager.saveSettings(settings)
 
         isAuthenticated = false
         username = ""
+        grantedScopes = ""
+    }
 
-        print("🔐 RedditOAuth: Logged out")
+    var hasReplyPermission: Bool {
+        Self.hasReplyPermission(in: grantedScopes)
+    }
+
+    private static func hasReplyPermission(in rawScopes: String) -> Bool {
+        let scopes = Set(
+            rawScopes
+                .components(separatedBy: CharacterSet(charactersIn: " ,"))
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        return scopes.contains("edit") && scopes.contains("submit")
     }
 
     // MARK: - Token Response Model

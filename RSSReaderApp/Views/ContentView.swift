@@ -621,7 +621,7 @@ enum ReaderModeService {
               '<title>' + escapeHtml(title) + '</title>' +
               '<style>' +
               ':root { --bg-color: #f8f8fa; --text-color: #1d1d1f; --secondary-color: #6e6e73; --link-color: #007AFF; }' +
-              '@media (prefers-color-scheme: dark) { :root { --bg-color: #1c1c1e; --text-color: #f2f2f7; --secondary-color: #98989d; --link-color: #64B5FF; } }' +
+              '@media (prefers-color-scheme: dark) { :root { --bg-color: #111827; --text-color: #f2f2f7; --secondary-color: #98989d; --link-color: #64B5FF; } }' +
               'html, body { background: transparent !important; } body { margin: 0; color: var(--text-color); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; -webkit-font-smoothing: antialiased; }' +
               '.reader-shell { max-width: \(readerMaxWidth); margin: 0 auto; padding: 32px \(readerSidePadding)px 60px; }' +
               '.reader-title { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; color: var(--text-color); letter-spacing: -0.02em; font-size: \(titleFontSize)px; line-height: 1.15; margin: 0 0 12px; font-weight: 700; transition: opacity .12s ease, transform .12s ease, height .12s ease, margin .12s ease; }' +
@@ -1053,7 +1053,7 @@ struct AppColors {
         #if os(iOS)
         return Color(UIColor.systemBackground)
         #else
-        return macDynamicColor(light: rgb(248, 248, 250), dark: rgb(28, 28, 30))
+        return macDynamicColor(light: rgb(248, 248, 250), dark: rgb(17, 24, 39))
         #endif
     }
 
@@ -1069,7 +1069,7 @@ struct AppColors {
         #if os(iOS)
         return Color(UIColor.systemGray6)
         #else
-        return macDynamicColor(light: rgb(242, 242, 247), dark: rgb(28, 28, 30))
+        return macDynamicColor(light: rgb(242, 242, 247), dark: rgb(17, 24, 39))
         #endif
     }
 
@@ -1099,7 +1099,11 @@ struct AppColors {
 
     @ViewBuilder
     static func feedListBackground(for colorScheme: ColorScheme, scrollOffset: CGFloat = 0) -> some View {
-        background
+        if colorScheme == .dark {
+            feedListDarkBackground(scrollOffset: scrollOffset)
+        } else {
+            background
+        }
     }
 
     static func feedListCardFill(for colorScheme: ColorScheme) -> Color {
@@ -1137,24 +1141,12 @@ struct AppColors {
 
         return LinearGradient(
             colors: [
-                interpolatedColor(
-                    from: (0.105, 0.205, 0.270),
-                    to: (0.310, 0.490, 0.585),
-                    progress: progress
-                ),
-                interpolatedColor(
-                    from: (0.175, 0.275, 0.375),
-                    to: (0.360, 0.485, 0.610),
-                    progress: progress
-                ),
-                interpolatedColor(
-                    from: (0.095, 0.105, 0.215),
-                    to: (0.175, 0.220, 0.345),
-                    progress: progress
-                )
+                interpolatedColor(from: (0.118, 0.176, 0.251), to: (0.165, 0.235, 0.325), progress: progress),
+                interpolatedColor(from: (0.086, 0.129, 0.192), to: (0.125, 0.180, 0.255), progress: progress),
+                interpolatedColor(from: (0.055, 0.075, 0.118), to: (0.085, 0.110, 0.165), progress: progress)
             ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
+            startPoint: .top,
+            endPoint: .bottom
         )
     }
 
@@ -2299,8 +2291,8 @@ struct ContentView: View {
             if colorScheme == .dark {
                 LinearGradient(
                     colors: [
-                        Color(red: 0.055, green: 0.058, blue: 0.095),
-                        Color(red: 0.025, green: 0.026, blue: 0.047)
+                        Color(red: 0.060, green: 0.077, blue: 0.118),
+                        Color(red: 0.032, green: 0.040, blue: 0.066)
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -2309,7 +2301,7 @@ struct ContentView: View {
                     LinearGradient(
                         colors: [
                             Color.white.opacity(0.035),
-                            Color(red: 0.35, green: 0.18, blue: 0.75).opacity(0.08),
+                            Color(red: 0.20, green: 0.38, blue: 0.75).opacity(0.07),
                             Color.clear
                         ],
                         startPoint: .topLeading,
@@ -2895,7 +2887,7 @@ struct ContentView: View {
             titleVisibility: .visible,
             presenting: appState.pendingLocalReroute
         ) { _ in
-            ForEach(LocalRerouteProvider.allCases) { provider in
+            ForEach(LocalRerouteProvider.available) { provider in
                 Button(provider.displayName) {
                     appState.reroutePendingLocalRequest(to: provider)
                 }
@@ -4405,10 +4397,7 @@ struct ContentView: View {
     }
 
     private func clearContentSelection() {
-        appState.selectedArticle = nil
-        appState.selectedArticleId = nil
-        appState.selectedRedditPost = nil
-        appState.selectedRedditPostId = nil
+        appState.exitActiveSubscriptionView()
     }
 }
 
@@ -4432,6 +4421,8 @@ private extension ContentView {
         #endif
 #if os(macOS)
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(sidebarSurfaceBackground)
         .background(MacListSelectionClearView())
         .frame(minWidth: 200)
 #else
@@ -4461,6 +4452,7 @@ private extension ContentView {
             appState.lastSelectedCategory = category
             appState.activeSubscriptionURL = nil
         }) { label() }
+        .modifier(MacMarkAllReadMenu(appState: appState, category: category))
         #else
         NavigationLink(destination: destination()) { label() }
         #endif
@@ -4471,6 +4463,17 @@ private extension ContentView {
         Section(header:
             sidebarSectionHeader("LIBRARY")
         ) {
+            sidebarLibraryLink(category: .reddit, destination: redditView) {
+                sidebarMenuRow(
+                    title: "Reddit",
+                    unreadCount: appState.unreadCount(in: .reddit),
+                    isSelected: isLibraryCategorySelected(.reddit)
+                ) {
+                    sidebarRedditIcon()
+                }
+            }
+            .buttonStyle(.plain)
+
             sidebarLibraryLink(category: .all, destination: allView) {
                 let unreadAllArticles = appState.unreadAllArticlesCount()
 
@@ -4678,6 +4681,15 @@ private extension ContentView {
             sidebarSubscriptionIcon(for: subscription, isSelected: isSelected)
         }
         .contentShape(Rectangle())
+        .contextMenu {
+            Button("Refresh Feed") {
+                if subscription.type == .rss {
+                    appState.refreshSingleRSSFeed(url: subscription.url)
+                } else {
+                    appState.refreshRedditFeeds(specificSubreddit: subscription.url)
+                }
+            }
+        }
     }
 }
 
@@ -6858,7 +6870,7 @@ struct ArticleDetailView: View {
         }
 
         let qaProvider = appState.settings.selectedSummaryProvider
-        if (qaProvider == .coreAIMLXLocal || qaProvider == .appleLocal || qaProvider == .applePCCGateway || qaProvider == .summarizeDaemon),
+        if (qaProvider == .coreAIMLXLocal || qaProvider == .appleLocal || qaProvider == .applePCCGateway || qaProvider == .summarizeDaemon || qaProvider == .chatGPT || qaProvider == .openAICompatible),
            !appState.mlxLastQAThroughput.isEmpty,
            !qaState.isProcessingQuestion,
            !qaAnswerUnavailable {
@@ -6944,12 +6956,15 @@ struct ArticleDetailView: View {
                 selectedText: trimmed,
                 extractedContext: context,
                 sourceContext: selectionOrigin.boundedSource(additionalAnswer: qaState.answerText),
-                sourceLabel: selectionOrigin.promptSourceLabel
+                sourceLabel: selectionOrigin.promptSourceLabel,
+                explainSelection: action == .standard && appState.settings.selectedSummaryProvider != .webAI
             )
         } else {
-            prompt = appState.articleQAPrompt(
-                article: article,
-                question: "What is said about \(trimmed)?"
+            let source = appState.articleSelectionSourceContext(for: article)
+            prompt = buildAskAISelectionPrompt(
+                selectedText: trimmed, extractedContext: context,
+                sourceContext: source.text, sourceLabel: source.label,
+                explainSelection: action == .standard && appState.settings.selectedSummaryProvider != .webAI
             )
         }
         guard !prompt.isEmpty else { return }
@@ -11200,7 +11215,7 @@ struct ArticleGlassySummary: View {
             
             // Throughput badge for on-device providers
             let _summaryProvider = appState.settings.selectedSummaryProvider
-            if (_summaryProvider == .coreAIMLXLocal || _summaryProvider == .appleLocal || _summaryProvider == .applePCCGateway || _summaryProvider == .summarizeDaemon),
+            if (_summaryProvider == .coreAIMLXLocal || _summaryProvider == .appleLocal || _summaryProvider == .applePCCGateway || _summaryProvider == .summarizeDaemon || _summaryProvider == .chatGPT || _summaryProvider == .openAICompatible),
                !appState.mlxLastThroughput.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "cpu").font(.caption2)
@@ -12762,12 +12777,11 @@ struct DraggableGlobalSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            summaryToolbar
-
             // Content
             ScrollViewReader { scrollProxy in
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 16) {
+                    Color.clear.frame(height: 52)
                     if let error = error, !error.isEmpty {
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -13070,6 +13084,7 @@ struct DraggableGlobalSummaryView: View {
                     summaryScrollProxy = nil
                 }
             }
+            .overlay(alignment: .top) { summaryToolbar }
 
             // Q&A Interface
             if showQAInterface {
@@ -13151,7 +13166,7 @@ struct DraggableGlobalSummaryView: View {
                                     .font(.subheadline)
                             }
                             .buttonStyle(LiquidGlassButtonStyle())
-                            
+
                             Spacer()
                         }
                         .transition(.opacity.combined(with: .slide))
@@ -13714,6 +13729,10 @@ struct DraggableGlobalSummaryView: View {
                 title: "Ask AI",
                 prompt: prompt
             )
+        case .chatGPT:
+            return try await appState.performChatGPTRequestAsync(prompt: prompt, taskName: "Ask AI")
+        case .openAICompatible:
+            return try await appState.performOpenAICompatibleRequestAsync(prompt: prompt, taskName: "Ask AI")
         case .summarizeDaemon:
             return try await appState.performSummarizeRequestAsync(prompt: prompt, taskName: "Ask AI")
         case .gemini:
@@ -13722,19 +13741,15 @@ struct DraggableGlobalSummaryView: View {
     }
 
     private func askAIResponse(for selection: String, action: AskAISelectionAction) async throws -> String {
-        if isRedditContent {
-            return await withCheckedContinuation { continuation in
-                appState.askQuestionAboutGlobalSummarySelection(
-                    selectedText: selection,
-                    useWebAI: action == .web
-                ) { response in
-                    continuation.resume(returning: formatAskAIResponseForDisplay(response))
-                }
+        await withCheckedContinuation { continuation in
+            appState.askQuestionAboutGlobalSummarySelection(
+                selectedText: selection,
+                extractedContext: buildAskAIContext(),
+                useWebAI: action == .web
+            ) { response in
+                continuation.resume(returning: formatAskAIResponseForDisplay(response))
             }
         }
-        let prompt = try makeAskAISelectionPrompt(for: selection)
-        let rawResponse = try await performAskAI(prompt: prompt, action: action)
-        return formatAskAIResponseForDisplay(rawResponse)
     }
 
     private func askAIFromSummarySelection(_ selection: String, action: AskAISelectionAction) {
@@ -13845,6 +13860,10 @@ struct DraggableGlobalSummaryView: View {
 
         case .webAI:
             generateWhiteboardWithWebAI(prompt: prompt, rankedCandidates: rankedCandidates)
+        case .chatGPT:
+            generateWhiteboardWithChatGPT(prompt: prompt, rankedCandidates: rankedCandidates)
+        case .openAICompatible:
+            generateWhiteboardWithOpenAICompatible(prompt: prompt, rankedCandidates: rankedCandidates)
         case .summarizeDaemon:
             generateWhiteboardWithSummarize(prompt: prompt, rankedCandidates: rankedCandidates)
         }
@@ -13941,6 +13960,78 @@ struct DraggableGlobalSummaryView: View {
         Task {
             do {
                 let response = try await appState.performSummarizeRequestAsync(prompt: prompt, taskName: "Whiteboard")
+
+                guard let payload = parseWhiteboardPayload(from: response, rankedCandidates: rankedCandidates) else {
+                    await MainActor.run {
+                        self.whiteboardError = "Failed to parse whiteboard data"
+                        self.isGeneratingWhiteboard = false
+                    }
+                    return
+                }
+
+                let html = buildWhiteboardHTML(from: payload)
+                guard let htmlData = html.data(using: .utf8) else {
+                    await MainActor.run {
+                        self.whiteboardError = "Failed to generate whiteboard"
+                        self.isGeneratingWhiteboard = false
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    self.whiteboardContent = htmlData
+                    self.isGeneratingWhiteboard = false
+                    self.showWhiteboard = true
+                }
+            } catch {
+                await MainActor.run {
+                    self.whiteboardError = "Error: \(error.localizedDescription)"
+                    self.isGeneratingWhiteboard = false
+                }
+            }
+        }
+    }
+
+    private func generateWhiteboardWithChatGPT(prompt: String, rankedCandidates: [RankedVisualCandidate]) {
+        Task {
+            do {
+                let response = try await appState.performChatGPTRequestAsync(prompt: prompt, taskName: "Whiteboard")
+
+                guard let payload = parseWhiteboardPayload(from: response, rankedCandidates: rankedCandidates) else {
+                    await MainActor.run {
+                        self.whiteboardError = "Failed to parse whiteboard data"
+                        self.isGeneratingWhiteboard = false
+                    }
+                    return
+                }
+
+                let html = buildWhiteboardHTML(from: payload)
+                guard let htmlData = html.data(using: .utf8) else {
+                    await MainActor.run {
+                        self.whiteboardError = "Failed to generate whiteboard"
+                        self.isGeneratingWhiteboard = false
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    self.whiteboardContent = htmlData
+                    self.isGeneratingWhiteboard = false
+                    self.showWhiteboard = true
+                }
+            } catch {
+                await MainActor.run {
+                    self.whiteboardError = "Error: \(error.localizedDescription)"
+                    self.isGeneratingWhiteboard = false
+                }
+            }
+        }
+    }
+
+    private func generateWhiteboardWithOpenAICompatible(prompt: String, rankedCandidates: [RankedVisualCandidate]) {
+        Task {
+            do {
+                let response = try await appState.performOpenAICompatibleRequestAsync(prompt: prompt, taskName: "Whiteboard")
 
                 guard let payload = parseWhiteboardPayload(from: response, rankedCandidates: rankedCandidates) else {
                     await MainActor.run {
@@ -14632,6 +14723,10 @@ struct DraggableGlobalSummaryView: View {
 
         case .webAI:
             generateInfographicWithWebAI(prompt: prompt, rankedCandidates: rankedCandidates)
+        case .chatGPT:
+            generateInfographicWithChatGPT(prompt: prompt, rankedCandidates: rankedCandidates)
+        case .openAICompatible:
+            generateInfographicWithOpenAICompatible(prompt: prompt, rankedCandidates: rankedCandidates)
         case .summarizeDaemon:
             generateInfographicWithSummarize(prompt: prompt, rankedCandidates: rankedCandidates)
         }
@@ -14689,6 +14784,82 @@ struct DraggableGlobalSummaryView: View {
         Task {
             do {
                 let response = try await appState.performSummarizeRequestAsync(prompt: prompt, taskName: "Infographic")
+
+                guard let payload = parseInfographicPayload(from: response, rankedCandidates: rankedCandidates) else {
+                    await MainActor.run {
+                        self.infographicError = "Failed to parse infographic data"
+                        self.isGeneratingInfographic = false
+                    }
+                    return
+                }
+
+                let html = buildInfographicHTML(from: payload)
+                let safe = sanitizeInfographicHTML(html)
+
+                guard let htmlData = safe.data(using: .utf8) else {
+                    await MainActor.run {
+                        self.infographicError = "Failed to generate infographic"
+                        self.isGeneratingInfographic = false
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    self.infographicContent = htmlData
+                    self.isGeneratingInfographic = false
+                    self.showInfographic = true
+                }
+            } catch {
+                await MainActor.run {
+                    self.infographicError = "Error: \(error.localizedDescription)"
+                    self.isGeneratingInfographic = false
+                }
+            }
+        }
+    }
+
+    private func generateInfographicWithChatGPT(prompt: String, rankedCandidates: [RankedVisualCandidate]) {
+        Task {
+            do {
+                let response = try await appState.performChatGPTRequestAsync(prompt: prompt, taskName: "Infographic")
+
+                guard let payload = parseInfographicPayload(from: response, rankedCandidates: rankedCandidates) else {
+                    await MainActor.run {
+                        self.infographicError = "Failed to parse infographic data"
+                        self.isGeneratingInfographic = false
+                    }
+                    return
+                }
+
+                let html = buildInfographicHTML(from: payload)
+                let safe = sanitizeInfographicHTML(html)
+
+                guard let htmlData = safe.data(using: .utf8) else {
+                    await MainActor.run {
+                        self.infographicError = "Failed to generate infographic"
+                        self.isGeneratingInfographic = false
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    self.infographicContent = htmlData
+                    self.isGeneratingInfographic = false
+                    self.showInfographic = true
+                }
+            } catch {
+                await MainActor.run {
+                    self.infographicError = "Error: \(error.localizedDescription)"
+                    self.isGeneratingInfographic = false
+                }
+            }
+        }
+    }
+
+    private func generateInfographicWithOpenAICompatible(prompt: String, rankedCandidates: [RankedVisualCandidate]) {
+        Task {
+            do {
+                let response = try await appState.performOpenAICompatibleRequestAsync(prompt: prompt, taskName: "Infographic")
 
                 guard let payload = parseInfographicPayload(from: response, rankedCandidates: rankedCandidates) else {
                     await MainActor.run {
@@ -17279,5 +17450,36 @@ struct GlobalSummaryResultView: View {
     private func copyToClipboard(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+
+private struct MacMarkAllReadMenu: ViewModifier {
+    @ObservedObject var appState: AppState
+    let category: FeedCategory
+    @State private var isConfirming = false
+    @State private var confirmCount = 0
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if category == .favorites {
+            content
+        } else {
+            content.contextMenu {
+                Button {
+                    confirmCount = appState.unreadCount(in: category)
+                    isConfirming = true
+                } label: {
+                    Label("Mark All as Read", systemImage: "checkmark.circle")
+                }
+                .disabled(appState.unreadCount(in: category) == 0)
+            }
+            .alert("Mark \(confirmCount) unread items as read?", isPresented: $isConfirming) {
+                Button("Mark All as Read") { appState.markAllAsRead(in: category) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will mark every unread item in \(category.rawValue) as read across your devices. This can't be undone.")
+            }
+        }
     }
 }

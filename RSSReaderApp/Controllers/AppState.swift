@@ -236,6 +236,79 @@ enum LocalReroutePresentationScope {
     case deepAnalysis
 }
 
+private struct OverallSummaryProviderResolution {
+    let selectedProvider: AppSettings.SummaryProvider
+    let effectiveProvider: AppSettings.SummaryProvider
+    let localFallbackProviderName: String?
+
+    var fallbackNotification: String? {
+        guard let localFallbackProviderName else { return nil }
+        return "Overall Summary requires large context — using Gemini instead of \(localFallbackProviderName) for this step."
+    }
+}
+
+private func resolveOverallSummaryProvider(
+    for provider: AppSettings.SummaryProvider
+) -> OverallSummaryProviderResolution {
+    switch provider {
+    case .gemini:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .gemini,
+            localFallbackProviderName: nil
+        )
+    case .appleCloud:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .appleCloud,
+            localFallbackProviderName: nil
+        )
+    case .applePCCGateway:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .applePCCGateway,
+            localFallbackProviderName: nil
+        )
+    case .webAI:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .webAI,
+            localFallbackProviderName: nil
+        )
+    case .summarizeDaemon:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .summarizeDaemon,
+            localFallbackProviderName: nil
+        )
+    case .chatGPT:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .chatGPT,
+            localFallbackProviderName: nil
+        )
+
+    case .openAICompatible:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .openAICompatible,
+            localFallbackProviderName: nil
+        )
+    case .appleLocal:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .gemini,
+            localFallbackProviderName: "Apple Local"
+        )
+    case .coreAIMLXLocal:
+        return OverallSummaryProviderResolution(
+            selectedProvider: provider,
+            effectiveProvider: .gemini,
+            localFallbackProviderName: "CoreAI MLX Local"
+        )
+    }
+}
+
 final class GlobalSummaryService {
     private let summaryService: SummaryService
     private let redditService: RedditService
@@ -339,7 +412,7 @@ final class GlobalSummaryService {
                             let entry = orderedPosts[nextParallelIndex]
                             nextParallelIndex += 1
                             group.addTask {
-                                let result = await self.redditService.fetchCommentsDetailed(for: entry.post.id, in: entry.post.subreddit, limit: topComments, depth: 10)
+                                let result = await self.fetchCommentsWithRetry(for: entry.post, limit: topComments, retryRateLimit: false)
                                 return (entry.index, result)
                             }
                         }
@@ -389,10 +462,6 @@ final class GlobalSummaryService {
 
                             if let status = lastRateStatus {
                                 var delay = self.redditService.suggestedDelay(after: status, baseline: 0.75)
-                                if delay > 2 {
-                                    print("⚠️ GlobalSummaryService: Clamping sequential delay from \(String(format: "%.2f", delay))s to 2s")
-                                    delay = 2
-                                }
                                 if delay > 0 {
                                     print("⏱️ GlobalSummaryService: Sequential delay \(String(format: "%.2f", delay))s before refetching index \(index)")
                                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -401,7 +470,7 @@ final class GlobalSummaryService {
 
                             let entry = orderedPosts[index]
                             print("📱 GlobalSummaryService: Sequentially refetching comments for post index \(index) in r/\(entry.post.subreddit)")
-                            let fetchResult = await self.redditService.fetchCommentsDetailed(for: entry.post.id, in: entry.post.subreddit, limit: topComments, depth: 10)
+                            let fetchResult = await self.fetchCommentsWithRetry(for: entry.post, limit: topComments, retryRateLimit: true)
                             storeResult(for: index, result: fetchResult)
                             if let updatedStatus = fetchResult.rateLimit {
                                 lastRateStatus = updatedStatus
@@ -543,13 +612,47 @@ final class GlobalSummaryService {
         let settings = settingsProvider()
         let provider = selectedProvider ?? settings.selectedSummaryProvider
 
+        if provider == .chatGPT {
+            print("⚙️ GlobalSummaryService: Using ChatGPT Plan for \(source) summary")
+            return Future<GlobalSummaryResult, Never> { promise in
+                Task(priority: .userInitiated) {
+                    do {
+                        let raw = try await self.summaryService.generateContentWithChatGPT(prompt: prompt, settings: settings)
+                        let result = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
+                        promise(.success(result))
+                    } catch {
+                        let result = GlobalSummaryResult.errorResult(source: source, message: "ChatGPT Plan error: \(error.localizedDescription)")
+                        promise(.success(result))
+                    }
+                }
+            }
+            .eraseToAnyPublisher()
+        }
+
+        if provider == .openAICompatible {
+            print("⚙️ GlobalSummaryService: Using Custom Server for \(source) summary")
+            return Future<GlobalSummaryResult, Never> { promise in
+                Task(priority: .userInitiated) {
+                    do {
+                        let raw = try await self.summaryService.generateContentWithOpenAICompatible(prompt: prompt, settings: settings)
+                        let result = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
+                        promise(.success(result))
+                    } catch {
+                        let result = GlobalSummaryResult.errorResult(source: source, message: "Custom Server error: \(error.localizedDescription)")
+                        promise(.success(result))
+                    }
+                }
+            }
+            .eraseToAnyPublisher()
+        }
+
         if provider == .summarizeDaemon {
             print("⚙️ GlobalSummaryService: Using Codex / Summarize for \(source) summary")
             return Future<GlobalSummaryResult, Never> { promise in
                 Task(priority: .userInitiated) {
                     do {
                         let raw = try await self.summaryService.generateContentWithSummarize(prompt: prompt, settings: settings)
-                        let result = self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+                        let result = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
                         promise(.success(result))
                     } catch {
                         let result = GlobalSummaryResult.errorResult(source: source, message: "Codex / Summarize error: \(error.localizedDescription)")
@@ -571,7 +674,7 @@ final class GlobalSummaryService {
                         let estimatedTokens = max(1, Int(Double(raw.split(separator: " ").count) * 1.3))
                         let tokPerSec = Double(estimatedTokens) / elapsed
                         self.throughputReporter?(String(format: "Apple PCC · ~%.1f tok/s · ~%d tokens", tokPerSec, estimatedTokens))
-                        let result = self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+                        let result = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
                         promise(.success(result))
                     } catch {
                         let result = GlobalSummaryResult.errorResult(source: source, message: "Apple PCC error: \(error.localizedDescription)")
@@ -600,13 +703,15 @@ final class GlobalSummaryService {
                         let safePrompt = prompt.count > maxPromptChars
                             ? String(prompt.prefix(maxPromptChars)) + "\n[Truncated]"
                             : prompt
-                        let raw = try await CoreAIMLXLocalService.shared.generateText(
+                        let raw = try await self.withMLXTimeout(seconds: 90) {
+            try await CoreAIMLXLocalService.shared.generateText(
                             prompt: safePrompt,
                             modelID: modelID,
                             maxOutputTokens: maxOutputTokens,
                             maxContextTokens: maxContextTokens
                         )
-                        promise(.success(self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)))
+        }
+                        promise(.success(self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)))
                     } catch {
                         promise(.success(GlobalSummaryResult.errorResult(source: source, message: "\(providerLabel) error: \(error.localizedDescription)")))
                     }
@@ -622,7 +727,7 @@ final class GlobalSummaryService {
                     LocalSummaryService.summarizeText(prompt) { result in
                         switch result {
                         case .success(let raw):
-                            let parsed = self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+                            let parsed = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
                             promise(.success(parsed))
                         case .failure(let error):
                             let errorResult = GlobalSummaryResult.errorResult(source: source, message: "Apple Local error: \(error.localizedDescription)")
@@ -652,7 +757,7 @@ final class GlobalSummaryService {
                         promise(.success(result))
                         return
                     }
-                    let result = self.parseAndDecodeResponse(raw: trimmed, source: source, referenceIds: referenceIds)
+                    let result = self.parseAppleCloudResponse(raw: trimmed, source: source, referenceIds: referenceIds)
                     print("☁️ GlobalSummaryService: Apple Cloud returned \(trimmed.count) characters for \(source), parsed result has \(result.summaries.count) summaries")
                     promise(.success(result))
                 }
@@ -673,7 +778,7 @@ final class GlobalSummaryService {
                 handler(provider, title, prompt, .strictJSON) { result in
                     switch result {
                     case .success(let raw):
-                        let parsed = self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+                        let parsed = self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
                         promise(.success(parsed))
                     case .failure(let error):
                         promise(.success(GlobalSummaryResult.errorResult(source: source, message: error.localizedDescription)))
@@ -687,40 +792,31 @@ final class GlobalSummaryService {
         return summaryService
             .summarizeText("", customPrompt: prompt)
             .map { raw -> GlobalSummaryResult in
-                self.parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+                self.parseAppleCloudResponse(raw: raw, source: source, referenceIds: referenceIds)
             }
             .replaceError(with: GlobalSummaryResult.errorResult(source: source, message: "LLM call failed"))
             .eraseToAnyPublisher()
     }
     
     private func parseAndDecodeResponse(raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult {
-        // Clean the response: remove markdown code blocks if present
         var cleanedResponse = raw
-        
-        // Remove ```json at the start and ``` at the end if present
         if cleanedResponse.hasPrefix("```json") {
             cleanedResponse = String(cleanedResponse.dropFirst(7))
             if cleanedResponse.hasPrefix("\n") {
                 cleanedResponse = String(cleanedResponse.dropFirst(1))
             }
-        }
-        // Also check for just ```
-        else if cleanedResponse.hasPrefix("```") {
+        } else if cleanedResponse.hasPrefix("```") {
             cleanedResponse = String(cleanedResponse.dropFirst(3))
             if cleanedResponse.hasPrefix("\n") {
                 cleanedResponse = String(cleanedResponse.dropFirst(1))
             }
         }
-        
-        // Remove trailing markdown code block
         if cleanedResponse.hasSuffix("```") {
             cleanedResponse = String(cleanedResponse.dropLast(3))
             if cleanedResponse.hasSuffix("\n") {
                 cleanedResponse = String(cleanedResponse.dropLast(1))
             }
         }
-        
-        // Trim whitespace and newlines
         cleanedResponse = cleanedResponse.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Additional cleaning: Fix common JSON formatting issues
@@ -732,13 +828,12 @@ final class GlobalSummaryService {
         if let lastBrace = cleanedResponse.lastIndex(of: "}") {
             cleanedResponse = String(cleanedResponse[...lastBrace])
         }
-        // Fix double quotes in strings (some models use smart quotes)
+        // Fix double quotes in strings (some LLMs use smart quotes)
         cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{201C}", with: "\"") // Left double quote
         cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{201D}", with: "\"") // Right double quote
         cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{2018}", with: "'")  // Left single quote
         cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{2019}", with: "'")  // Right single quote
 
-        // Detect upstream error strings before attempting to decode JSON
         let lowercased = cleanedResponse.lowercased()
         if cleanedResponse.isEmpty ||
             lowercased.hasPrefix("error:") ||
@@ -805,7 +900,19 @@ final class GlobalSummaryService {
                 }
             }
 
-            let msg = "Failed to decode JSON: \(errorDetails). This usually means the model didn't follow the exact format. Try again."
+            if let loose = self.parseLooseSummaries(raw: cleanedResponse, source: source, referenceIds: referenceIds) {
+                print("⚠️ GlobalSummaryService: Loose JSON parser recovered \(loose.summaries.count) summaries")
+                return loose
+            }
+
+            // Only treat genuine prose as prose. A malformed JSON envelope must never be shown as one summary card.
+            if !self.isJSONLikeSummaryResponse(cleanedResponse),
+               let fallback = self.fallbackSummaryResult(from: cleanedResponse, source: source, referenceIds: referenceIds) {
+                print("⚠️ GlobalSummaryService: Fallback parser created \(fallback.summaries.count) summaries for provider output that wasn't JSON")
+                return fallback
+            }
+
+            let msg = "Failed to decode JSON: \(errorDetails). This usually means the LLM didn't follow the exact format. Try again."
             print("❌ GlobalSummaryService: \(msg)")
             return GlobalSummaryResult.errorResult(source: source, message: msg)
         }
@@ -864,12 +971,14 @@ final class GlobalSummaryService {
                     """
                     
                     do {
-                        let raw = try await MLXLocalService.shared.generateText(
+                        let raw = try await self.withMLXTimeout(seconds: 90) {
+            try await MLXLocalService.shared.generateText(
                             prompt: singlePrompt,
                             modelID: modelID,
                             maxOutputTokens: maxOutputTokens,
                             maxContextTokens: 4096
                         )
+        }
                         
                         // Parse the response
                         let (subject, summary) = self.parseMLXSingleResponse(raw: raw, fallbackTitle: item.title)
@@ -933,12 +1042,14 @@ final class GlobalSummaryService {
                     """
                     
                     do {
-                        let raw = try await MLXLocalService.shared.generateText(
+                        let raw = try await self.withMLXTimeout(seconds: 90) {
+            try await MLXLocalService.shared.generateText(
                             prompt: singlePrompt,
                             modelID: modelID,
                             maxOutputTokens: maxOutputTokens,
                             maxContextTokens: 4096
                         )
+        }
                         
                         // Parse the response
                         let (subject, summary) = self.parseMLXSingleResponse(raw: raw, fallbackTitle: item.title)
@@ -1003,6 +1114,333 @@ final class GlobalSummaryService {
         subject = subject.replacingOccurrences(of: "Summary:", with: "", options: .caseInsensitive).trimmingCharacters(in: .whitespacesAndNewlines)
         
         return (subject, summary)
+    }
+
+    private func parseAppleCloudResponse(raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult {
+        if let decoded = decodeStrictJSON(raw: raw, source: source, referenceIds: referenceIds) {
+            return normalizeAppleCloudResult(decoded, source: source, referenceIds: referenceIds)
+        }
+
+        if let inner = decodeJSONStringIfNeeded(raw),
+           let decoded = decodeStrictJSON(raw: inner, source: source, referenceIds: referenceIds) {
+            return normalizeAppleCloudResult(decoded, source: source, referenceIds: referenceIds)
+        }
+
+        let parsed = parseAndDecodeResponse(raw: raw, source: source, referenceIds: referenceIds)
+        if !parsed.summaries.isEmpty || parsed.error == nil {
+            return normalizeAppleCloudResult(parsed, source: source, referenceIds: referenceIds)
+        }
+
+        if let loose = parseLooseSummaries(raw: raw, source: source, referenceIds: referenceIds) {
+            return normalizeAppleCloudResult(loose, source: source, referenceIds: referenceIds)
+        }
+
+        if !isJSONLikeSummaryResponse(raw),
+           let salvaged = fallbackSummaryResult(from: raw, source: source, referenceIds: referenceIds) {
+            return normalizeAppleCloudResult(salvaged, source: source, referenceIds: referenceIds)
+        }
+
+        return normalizeAppleCloudResult(parsed, source: source, referenceIds: referenceIds)
+    }
+
+    private func isJSONLikeSummaryResponse(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("{")
+            || trimmed.hasPrefix("[")
+            || trimmed.lowercased().hasPrefix("```json")
+    }
+
+    private func normalizeAppleCloudResult(_ result: GlobalSummaryResult, source: String, referenceIds: [String]) -> GlobalSummaryResult {
+        var summaries = result.summaries
+
+        if let first = summaries.first {
+            let subject = first.subject.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let summary = first.summary.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let headingTokens: Set<String> = [
+                "article summaries",
+                "articles summaries",
+                "reddit summaries",
+                "summary overview",
+                "summaries",
+                "article summary overview"
+            ]
+            if headingTokens.contains(subject) || (subject == source.lowercased() && summary.isEmpty) {
+                summaries.removeFirst()
+            }
+        }
+
+        if summaries.isEmpty {
+            return result
+        }
+
+        if !referenceIds.isEmpty {
+            let adjusted = summaries.enumerated().map { idx, item -> GlobalSummaryItem in
+                let ref = referenceIds.count > idx ? referenceIds[idx] : item.referenceId
+                return GlobalSummaryItem(subject: item.subject, summary: item.summary, referenceId: ref)
+            }
+            summaries = adjusted
+        }
+
+        return GlobalSummaryResult(source: source, summaries: summaries, error: result.error)
+    }
+
+    private func decodeJSONStringIfNeeded(_ raw: String) -> String? {
+        guard let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(String.self, from: data)
+    }
+
+    private func decodeStrictJSON(raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult? {
+        let cleanedResponse = cleanCloudJSON(raw)
+        guard !cleanedResponse.isEmpty else { return nil }
+
+        if let decoded = decodeJSON(cleanedResponse, source: source, referenceIds: referenceIds) {
+            return decoded
+        }
+
+        if let repaired = repairClosingDelimiters(cleanedResponse),
+           let decoded = decodeJSON(repaired, source: source, referenceIds: referenceIds) {
+            return decoded
+        }
+
+        return nil
+    }
+
+    private func decodeJSON(_ raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult? {
+        guard let data = raw.data(using: .utf8),
+              var result = try? JSONDecoder().decode(GlobalSummaryResult.self, from: data) else { return nil }
+
+        if result.source != source {
+            result = GlobalSummaryResult(source: source, summaries: result.summaries, error: result.error ?? "Invalid 'source' in response.")
+        }
+
+        if !referenceIds.isEmpty && result.summaries.count == referenceIds.count {
+            let adjustedSummaries = zip(result.summaries, referenceIds).map { summary, ref in
+                GlobalSummaryItem(subject: summary.subject, summary: summary.summary, referenceId: ref)
+            }
+            result = GlobalSummaryResult(source: result.source, summaries: adjustedSummaries, error: result.error)
+        }
+
+        return result
+    }
+
+    private func repairClosingDelimiters(_ raw: String) -> String? {
+        let openBraces = raw.filter { $0 == "{" }.count
+        let closeBraces = raw.filter { $0 == "}" }.count
+        let openBrackets = raw.filter { $0 == "[" }.count
+        let closeBrackets = raw.filter { $0 == "]" }.count
+
+        var fixed = raw
+        if openBrackets > closeBrackets {
+            fixed.append(String(repeating: "]", count: openBrackets - closeBrackets))
+        }
+        if openBraces > closeBraces {
+            fixed.append(String(repeating: "}", count: openBraces - closeBraces))
+        }
+
+        return fixed == raw ? nil : fixed
+    }
+
+    private func cleanCloudJSON(_ raw: String) -> String {
+        var cleanedResponse = raw
+        if cleanedResponse.hasPrefix("```json") {
+            cleanedResponse = String(cleanedResponse.dropFirst(7))
+            if cleanedResponse.hasPrefix("\n") {
+                cleanedResponse = String(cleanedResponse.dropFirst(1))
+            }
+        } else if cleanedResponse.hasPrefix("```") {
+            cleanedResponse = String(cleanedResponse.dropFirst(3))
+            if cleanedResponse.hasPrefix("\n") {
+                cleanedResponse = String(cleanedResponse.dropFirst(1))
+            }
+        }
+        if cleanedResponse.hasSuffix("```") {
+            cleanedResponse = String(cleanedResponse.dropLast(3))
+            if cleanedResponse.hasSuffix("\n") {
+                cleanedResponse = String(cleanedResponse.dropLast(1))
+            }
+        }
+        cleanedResponse = cleanedResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let firstBrace = cleanedResponse.firstIndex(of: "{") {
+            cleanedResponse = String(cleanedResponse[firstBrace...])
+        }
+        if let lastBrace = cleanedResponse.lastIndex(of: "}") {
+            cleanedResponse = String(cleanedResponse[...lastBrace])
+        }
+        cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{201C}", with: "\"")
+        cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{201D}", with: "\"")
+        cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{2018}", with: "'")
+        cleanedResponse = cleanedResponse.replacingOccurrences(of: "\u{2019}", with: "'")
+
+        return cleanedResponse
+    }
+
+    private func parseLooseSummaries(raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult? {
+        let pattern = "\"subject\"\\s*:\\s*\"([^\"]+)\".*?\"summary\"\\s*:\\s*\"(.*?)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators, .caseInsensitive]) else {
+            return nil
+        }
+        let ns = raw as NSString
+        var matches = regex.matches(in: raw, options: [], range: NSRange(location: 0, length: ns.length))
+
+        if matches.isEmpty {
+            let unescaped = raw
+                .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\n", with: "\n")
+                .replacingOccurrences(of: "\\/", with: "/")
+            let unescapedNS = unescaped as NSString
+            matches = regex.matches(in: unescaped, options: [], range: NSRange(location: 0, length: unescapedNS.length))
+            if matches.isEmpty { return nil }
+            return buildLooseResult(matches: matches, source: source, referenceIds: referenceIds, nsString: unescapedNS)
+        }
+
+        return buildLooseResult(matches: matches, source: source, referenceIds: referenceIds, nsString: ns)
+    }
+
+    private func buildLooseResult(matches: [NSTextCheckingResult], source: String, referenceIds: [String], nsString: NSString) -> GlobalSummaryResult? {
+        guard !matches.isEmpty else { return nil }
+
+        var summaries: [GlobalSummaryItem] = []
+        for (index, match) in matches.enumerated() {
+            guard match.numberOfRanges >= 3 else { continue }
+            let subject = nsString
+                .substring(with: match.range(at: 1))
+                .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\n", with: " ")
+            let summary = nsString
+                .substring(with: match.range(at: 2))
+                .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\n", with: " ")
+            let referenceId = referenceIds.count > index ? referenceIds[index] : nil
+            summaries.append(GlobalSummaryItem(subject: subject, summary: summary, referenceId: referenceId))
+        }
+
+        guard !summaries.isEmpty else { return nil }
+        return GlobalSummaryResult(source: source, summaries: summaries, error: nil)
+    }
+
+    private func fallbackSummaryResult(from raw: String, source: String, referenceIds: [String]) -> GlobalSummaryResult? {
+        // Attempt to salvage non-JSON output (common with some providers like Apple Intelligence)
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
+        let chunks = normalized
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !chunks.isEmpty else { return nil }
+
+        var summaries: [GlobalSummaryItem] = []
+        for (index, chunk) in chunks.enumerated() {
+            let lines = chunk.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            guard let firstLine = lines.first else { continue }
+
+            var subject: String = ""
+            var body = chunk
+
+            if let colonRange = firstLine.range(of: ":") {
+                let leading = String(firstLine[..<colonRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let remainder = String(firstLine[colonRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !leading.isEmpty {
+                    subject = leading
+                    let tailLines = ([remainder] + Array(lines.dropFirst())).filter { !$0.isEmpty }
+                    body = tailLines.joined(separator: " \n")
+                }
+            }
+
+            if subject.isEmpty {
+                // Use the first sentence or up to 8 words as a subject fallback
+                let sentenceTerminators = CharacterSet(charactersIn: ".!?\n")
+                if let sentenceRange = firstLine.rangeOfCharacter(from: sentenceTerminators) {
+                    subject = String(firstLine[..<sentenceRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if subject.isEmpty {
+                    let words = firstLine.split(separator: " ")
+                    subject = words.prefix(8).joined(separator: " ")
+                }
+            }
+
+            if subject.isEmpty {
+                subject = "Topic \(summaries.count + 1)"
+            }
+
+            if body.isEmpty { body = chunk }
+
+            let referenceId: String?
+            if referenceIds.count == chunks.count {
+                referenceId = referenceIds[index]
+            } else if referenceIds.count == summaries.count + 1 {
+                referenceId = referenceIds[summaries.count]
+            } else {
+                referenceId = nil
+            }
+
+            summaries.append(
+                GlobalSummaryItem(subject: subject, summary: body, referenceId: referenceId)
+            )
+        }
+
+        guard !summaries.isEmpty else { return nil }
+
+        return GlobalSummaryResult(
+            source: source,
+            summaries: summaries,
+            error: nil
+        )
+    }
+
+    private struct MLXTimeoutError: LocalizedError {
+        var errorDescription: String? { "MLX generation timed out. Please try again." }
+    }
+
+    private func withMLXTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let operationTask = Task.detached(priority: .userInitiated) {
+            try await operation()
+        }
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                do {
+                    return try await operationTask.value
+                } catch is CancellationError {
+                    throw MLXTimeoutError()
+                } catch {
+                    throw error
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                operationTask.cancel()
+                throw MLXTimeoutError()
+            }
+            guard let result = try await group.next() else {
+                operationTask.cancel()
+                throw MLXTimeoutError()
+            }
+            group.cancelAll()
+            operationTask.cancel()
+            return result
+        }
+    }
+
+    private func fetchCommentsWithRetry(for post: RedditPost, limit: Int, retryRateLimit: Bool) async -> RedditCommentFetchResult {
+        var attempt = 0
+        while true {
+            let result = await redditService.fetchCommentsDetailed(for: post.id, in: post.subreddit, limit: limit, depth: 10)
+            let rateLimited = result.rateLimit?.isRateLimited == true
+            let retryableEmpty = result.comments.isEmpty && post.commentCount > 0
+            guard !Task.isCancelled, attempt < 2,
+                  result.errorDescription != nil || retryableEmpty || rateLimited,
+                  !rateLimited || retryRateLimit else { return result }
+            let backoff = pow(1.5, Double(attempt))
+            let delay = rateLimited
+                ? redditService.suggestedDelay(after: result.rateLimit, baseline: backoff)
+                : backoff
+            do { try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000)) }
+            catch { return result }
+            redditService.invalidateCommentCache(for: post.id, in: post.subreddit)
+            attempt += 1
+        }
     }
 }
 
@@ -1535,9 +1973,15 @@ class AppState: ObservableObject {
         let onSuccess: (String) -> Void
         let onFailure: (String) -> Void
         var automaticRetryCount: Int
+        var timeoutWorkItem: DispatchWorkItem? = nil
     }
 
-    private var pendingWebAIRequests: [UUID: PendingWebAIRequest] = [:]
+    private var pendingWebAIRequests: [UUID: PendingWebAIRequest] = [:] {
+        didSet { syncWebAIBackgroundWork() }
+    }
+    private let webAIRequestTimeoutSeconds: TimeInterval = 210
+    private var webAIBackgroundHandle: GeminiBackgroundTaskHandle?
+    private var webAIKeepAliveTimer: Timer?
 
     func isSummarizingArticle(_ article: Article?) -> Bool {
         guard let article else { return false }
@@ -1709,6 +2153,10 @@ class AppState: ObservableObject {
             }
         case .applePCCGateway:
             return try await performPCCGatewayRequestAsync(prompt: prompt, taskName: title)
+        case .chatGPT:
+            return try await performChatGPTRequestAsync(prompt: prompt, taskName: title)
+        case .openAICompatible:
+            return try await performOpenAICompatibleRequestAsync(prompt: prompt, taskName: title)
         case .summarizeDaemon:
             return try await performSummarizeRequestAsync(prompt: prompt, taskName: title)
         case .appleLocal:
@@ -1744,13 +2192,15 @@ class AppState: ObservableObject {
         guard !modelID.isEmpty else {
             throw BatchPodcastError.providerFailure("\(provider.displayName) model ID is not configured.")
         }
-        let metrics = try await CoreAIMLXLocalService.shared.generateTextWithMetrics(
+        let metrics = try await self.withMLXTimeout(seconds: 90) {
+            try await CoreAIMLXLocalService.shared.generateTextWithMetrics(
             prompt: boundedPrompt,
             systemPrompt: systemPrompt,
             modelID: modelID,
             maxOutputTokens: outputTokens,
             maxContextTokens: contextTokens
         )
+        }
         await CoreAIMLXLocalService.shared.clearTransientCache()
         recordMLXThroughput(metrics: metrics)
         return metrics.text
@@ -1782,6 +2232,479 @@ class AppState: ObservableObject {
         }
 
         return nil
+    }
+
+    private func handleCloudKitChange(_ change: CloudKitChange) {
+        var updateKinds: CloudUIUpdateKind = []
+        switch change {
+        case .reads(.article, let ids):
+            if persistenceManager.handleRemoteReadArticlesChange(ids) {
+                updateKinds.insert(.articleRead)
+            }
+        case .reads(.reddit, let ids):
+            if persistenceManager.handleRemoteReadRedditPostsChange(ids) {
+                updateKinds.insert(.redditRead)
+            }
+        case .favorites(let kind, let added, let removed, let removedRecordNames):
+            if persistenceManager.applyCloudKitFavorites(kind, added: added, removed: removed, removedRecordNames: removedRecordNames) {
+                updateKinds.insert(kind == .article ? .articleFavorite : .redditFavorite)
+            }
+        case .subscriptions(let upserted, let removedKeys, let removedRecordNames):
+            if persistenceManager.applyCloudKitSubscriptions(upserted: upserted, removedKeys: removedKeys, removedRecordNames: removedRecordNames) {
+                updateKinds.insert(.subscriptions)
+            }
+        }
+        scheduleCloudUIUpdates(updateKinds)
+    }
+
+    private func legacyChangeMatchesLastSnapshot(_ change: CloudSyncManager.CloudSyncChange) -> Bool {
+        guard let snapshot = lastCloudSnapshot else { return false }
+
+        switch change {
+        case .readArticles(let ids):
+            return ids == snapshot.readArticles
+        case .favoriteArticles(let ids):
+            return ids == snapshot.favoriteArticles
+        case .readRedditPosts(let ids):
+            return ids == snapshot.readRedditPosts
+        case .favoriteRedditPosts(let ids):
+            return ids == snapshot.favoriteRedditPosts
+        case .subscriptions(let subscriptions):
+            return subscriptions == snapshot.subscriptions
+        }
+    }
+
+    private func scheduleCloudUIUpdates(_ updateKinds: CloudUIUpdateKind) {
+        guard !updateKinds.isEmpty else { return }
+
+        pendingCloudUIUpdates.formUnion(updateKinds)
+        guard !cloudUIUpdateScheduled else { return }
+
+        cloudUIUpdateScheduled = true
+        // Defer state mutation to the next run loop and merge snapshot + legacy
+        // publisher deliveries into one targeted UI pass.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            let pendingUpdates = self.pendingCloudUIUpdates
+            self.pendingCloudUIUpdates = []
+            self.cloudUIUpdateScheduled = false
+
+            if pendingUpdates.contains(.articleRead) {
+                self.updateArticleReadStatesFromCloud()
+            }
+            if pendingUpdates.contains(.articleFavorite) {
+                self.updateArticleFavoriteStatesFromCloud()
+            }
+            if pendingUpdates.contains(.redditRead) {
+                self.updateRedditPostReadStatesFromCloud()
+            }
+            if pendingUpdates.contains(.redditFavorite) {
+                self.updateRedditPostFavoriteStatesFromCloud()
+            }
+            if !pendingUpdates.intersection([.articleRead, .redditRead]).isEmpty {
+                self.scheduleUnreadCacheRebuild()
+            }
+            if pendingUpdates.contains(.subscriptions) {
+                let latestSubscriptions = self.persistenceManager.loadSubscriptions()
+                if self.subscriptions != latestSubscriptions {
+                    self.subscriptions = latestSubscriptions
+                    self.refreshAllFeeds()
+                }
+            }
+        }
+    }
+
+    private static func computeCloudPollDiff(
+        articleProbes: [ArticleReadProbe],
+        redditProbes: [RedditReadProbe],
+        persistenceManager: PersistenceManager,
+        readState: PersistenceManager.CloudPollReadState
+    ) -> CloudPollDiff {
+        var changedArticleReadByID: [String: Bool] = [:]
+        changedArticleReadByID.reserveCapacity(min(articleProbes.count, 512))
+
+        for probe in articleProbes {
+            let tokens = persistenceManager.readTokensForPolling(
+                articleID: probe.id,
+                articleURL: probe.url,
+                title: probe.title,
+                feedURL: probe.feedURL
+            )
+            let isReadNow = persistenceManager.containsReadArticle(tokens: tokens, in: readState.readArticleTokens)
+            if isReadNow != probe.isRead {
+                changedArticleReadByID[probe.id] = isReadNow
+            }
+        }
+
+        var changedRedditReadByID: [String: Bool] = [:]
+        changedRedditReadByID.reserveCapacity(min(redditProbes.count, 512))
+
+        for probe in redditProbes {
+            let tokens = persistenceManager.readTokensForPolling(
+                postID: probe.id,
+                subreddit: probe.subreddit,
+                postURL: probe.url
+            )
+            let isReadNow = persistenceManager.containsReadRedditPost(tokens: tokens, in: readState.readRedditTokens)
+            if isReadNow != probe.isRead {
+                changedRedditReadByID[probe.id] = isReadNow
+            }
+        }
+
+        return CloudPollDiff(
+            readState: readState,
+            changedArticleReadByID: changedArticleReadByID,
+            changedRedditReadByID: changedRedditReadByID
+        )
+    }
+
+    private func applyCloudPollDiff(_ diff: CloudPollDiff) {
+        var didMutateArticles = false
+        if !diff.changedArticleReadByID.isEmpty {
+            for feedIndex in feeds.indices {
+                for articleIndex in feeds[feedIndex].articles.indices {
+                    let id = feeds[feedIndex].articles[articleIndex].id
+                    guard let isReadNow = diff.changedArticleReadByID[id] else { continue }
+                    if feeds[feedIndex].articles[articleIndex].isRead != isReadNow {
+                        feeds[feedIndex].articles[articleIndex].isRead = isReadNow
+                        didMutateArticles = true
+                    }
+                }
+            }
+            if didMutateArticles {
+                let updatedFeeds = feeds
+                feeds = updatedFeeds
+            }
+        }
+
+        var didMutateReddit = false
+        if !diff.changedRedditReadByID.isEmpty {
+            for feedIndex in redditFeeds.indices {
+                for postIndex in redditFeeds[feedIndex].posts.indices {
+                    let id = redditFeeds[feedIndex].posts[postIndex].id
+                    guard let isReadNow = diff.changedRedditReadByID[id] else { continue }
+                    if redditFeeds[feedIndex].posts[postIndex].isRead != isReadNow {
+                        redditFeeds[feedIndex].posts[postIndex].isRead = isReadNow
+                        didMutateReddit = true
+                    }
+                }
+            }
+            if didMutateReddit {
+                let updatedFeeds = redditFeeds
+                redditFeeds = updatedFeeds
+            }
+        }
+
+        if didMutateArticles || didMutateReddit {
+            scheduleUnreadCacheRebuild()
+            readStateRevision &+= 1
+        }
+    }
+
+    private struct ArticleReadProbe {
+        let id: String
+        let isRead: Bool
+        let url: URL?
+        let title: String
+        let feedURL: String
+    }
+
+    private struct RedditReadProbe {
+        let id: String
+        let isRead: Bool
+        let subreddit: String
+        let url: URL?
+    }
+
+    private struct CloudPollDiff {
+        let readState: PersistenceManager.CloudPollReadState
+        let changedArticleReadByID: [String: Bool]
+        let changedRedditReadByID: [String: Bool]
+    }
+
+    private let cloudPollQueue = DispatchQueue(label: "RSSReaderApp.cloud-poll", qos: .utility)
+    private var isCloudPollInFlight = false
+
+    private struct CloudUIUpdateKind: OptionSet {
+        let rawValue: Int
+
+        static let articleRead = CloudUIUpdateKind(rawValue: 1 << 0)
+        static let articleFavorite = CloudUIUpdateKind(rawValue: 1 << 1)
+        static let redditRead = CloudUIUpdateKind(rawValue: 1 << 2)
+        static let redditFavorite = CloudUIUpdateKind(rawValue: 1 << 3)
+        static let subscriptions = CloudUIUpdateKind(rawValue: 1 << 4)
+    }
+
+    private var pendingCloudUIUpdates: CloudUIUpdateKind = []
+    private var cloudUIUpdateScheduled = false
+    private var lastCloudSnapshot: CloudSyncManager.ReadStateSnapshot?
+
+
+
+    private var manualCloudStateChanged = false
+
+    private func categoryFilters(_ category: FeedCategory) -> (articles: (Article) -> Bool, posts: (RedditPost) -> Bool) {
+        let calendar = Calendar.current
+        switch category {
+        case .reddit:
+            return ({ _ in false }, { _ in true })
+        case .all:
+            return ({ _ in true }, { _ in false })
+        case .unread:
+            return ({ _ in true }, { _ in true })
+        case .today:
+            return ({ calendar.isDateInToday($0.publishDate) }, { calendar.isDateInToday($0.publishDate) })
+        case .favorites:
+            return ({ _ in false }, { _ in false })
+        }
+    }
+
+    func unreadCount(in category: FeedCategory) -> Int {
+        let filters = categoryFilters(category)
+        let articles = feeds.flatMap(\.articles).filter { !$0.isRead && filters.articles($0) }.count
+        let posts = redditFeeds.flatMap(\.posts).filter { !$0.isRead && filters.posts($0) }.count
+        return articles + posts
+    }
+
+    func markAllAsRead(in category: FeedCategory) {
+        let filters = categoryFilters(category)
+
+        var updatedFeeds = feeds
+        var articlesToPersist: [Article] = []
+        for feedIndex in updatedFeeds.indices {
+            for articleIndex in updatedFeeds[feedIndex].articles.indices {
+                let article = updatedFeeds[feedIndex].articles[articleIndex]
+                if !article.isRead && filters.articles(article) {
+                    updatedFeeds[feedIndex].articles[articleIndex].isRead = true
+                    articlesToPersist.append(updatedFeeds[feedIndex].articles[articleIndex])
+                }
+            }
+        }
+
+        var updatedRedditFeeds = redditFeeds
+        var postsToPersist: [RedditPost] = []
+        for feedIndex in updatedRedditFeeds.indices {
+            for postIndex in updatedRedditFeeds[feedIndex].posts.indices {
+                let post = updatedRedditFeeds[feedIndex].posts[postIndex]
+                if !post.isRead && filters.posts(post) {
+                    updatedRedditFeeds[feedIndex].posts[postIndex].isRead = true
+                    postsToPersist.append(updatedRedditFeeds[feedIndex].posts[postIndex])
+                }
+            }
+        }
+
+        if !articlesToPersist.isEmpty {
+            feeds = updatedFeeds
+            persistenceManager.markArticlesAsRead(articlesToPersist)
+        }
+        if !postsToPersist.isEmpty {
+            redditFeeds = updatedRedditFeeds
+            persistenceManager.markRedditPostsAsRead(postsToPersist)
+        }
+        print("📱 AppState: Marked \(articlesToPersist.count) articles and \(postsToPersist.count) Reddit posts as read (\(category.rawValue))")
+        if !articlesToPersist.isEmpty || !postsToPersist.isEmpty {
+            readStateRevision &+= 1
+            scheduleUnreadCacheRebuild()
+        }
+    }
+
+    private func displaceActiveWebAIRequestIfNeeded(replacingWith replacementTitle: String) -> (() -> Void)? {
+        guard let activeRequest = activeWebAIHandoffRequest,
+              let pending = pendingWebAIRequests.removeValue(forKey: activeRequest.id) else {
+            return nil
+        }
+
+        pending.timeoutWorkItem?.cancel()
+        WebAISessionManager.shared.cancelActiveRequest(for: activeRequest.provider)
+        activeWebAIHandoffRequest = nil
+        isWebAIHandoffMinimized = false
+        return {
+            pending.onFailure("\(pending.title) was replaced by \(replacementTitle). Please try again.")
+        }
+    }
+
+    private func makeWebAIRequestTimeoutWorkItem(for request: WebAIHandoffRequest) -> DispatchWorkItem {
+        let timeoutSeconds = webAIRequestTimeoutSeconds
+        return DispatchWorkItem { [weak self] in
+            self?.handleWebAIRequestFailure(
+                requestID: request.id,
+                message: "\(request.provider.displayName) did not return a response within \(Int(timeoutSeconds)) seconds. Please try again.",
+                dismissPanel: true
+            )
+        }
+    }
+
+    private func syncWebAIBackgroundWork() {
+        if pendingWebAIRequests.isEmpty {
+            webAIBackgroundHandle?.finish(success: true)
+            webAIBackgroundHandle = nil
+            webAIKeepAliveTimer?.invalidate()
+            webAIKeepAliveTimer = nil
+            return
+        }
+        if webAIBackgroundHandle == nil {
+            webAIBackgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(identifier: "WebAI", title: "Waiting for Web AI")
+        }
+        if webAIKeepAliveTimer == nil {
+            webAIKeepAliveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                Task { @MainActor in WebAISessionManager.shared.keepWebViewsAwake() }
+            }
+        }
+    }
+
+    private func recordPodcastClassification(_ subscription: Subscription) {
+        guard subscription.type == .rss else { return }
+
+        if podcastSubscriptionCanonicalKeys.insert(subscription.canonicalKey).inserted {
+            UserDefaults.standard.set(
+                podcastSubscriptionCanonicalKeys.sorted(),
+                forKey: "RSSReaderApp.PodcastSubscriptionCanonicalKeys.v1"
+            )
+        }
+    }
+
+    private func schedulePodcastTranscriptDiscard(episodeID: String, generation: UInt64) {
+        Task { [weak self] in
+            await Task.yield()
+            guard let self,
+                  self.activePodcastEpisodeSessionID != episodeID,
+                  self.podcastEpisodeSessionGenerations[episodeID] == generation else {
+                return
+            }
+            await self.podcastTranscriptService.discardTranscript(for: episodeID)
+        }
+    }
+
+    func refreshSingleRSSFeed(url: String) {
+        isLoading = true
+        isRefreshingFeeds = true
+        let subscription = subscriptions.first(where: { $0.type == .rss && $0.url == url })
+            ?? Subscription(title: "RSS", url: url, type: .rss)
+        fetchArticleFeed(for: subscription)
+            .receive(on: RunLoop.main)
+            .sink(receiveCompletion: { [weak self] _ in
+                self?.isLoading = false
+                self?.isRefreshingFeeds = false
+            }, receiveValue: { [weak self] feed in
+                guard let self = self else { return }
+                var processedFeed = feed
+                let existingSummaries = self.feeds
+                    .first(where: { $0.url == url })?
+                    .articles
+                    .reduce(into: [String: String]()) { result, article in
+                        if let summary = article.summary, !summary.isEmpty {
+                            result[article.id] = summary
+                        }
+                    } ?? [:]
+                for i in 0..<processedFeed.articles.count {
+                    let id = processedFeed.articles[i].id
+                    processedFeed.articles[i].isRead = self.persistenceManager.isArticleRead(processedFeed.articles[i])
+                    processedFeed.articles[i].isFavorite = self.persistenceManager.isArticleFavorite(id)
+                    if processedFeed.articles[i].summary == nil {
+                        processedFeed.articles[i].summary = existingSummaries[id]
+                    }
+                }
+                if let index = self.feeds.firstIndex(where: { $0.url == url }) {
+                    self.feeds[index] = processedFeed
+                } else {
+                    self.feeds.append(processedFeed)
+                }
+                self.scheduleUnreadCacheRebuild()
+            })
+            .store(in: &cancellables)
+    }
+
+    private var podcastSubscriptionCanonicalKeys = Set(UserDefaults.standard.stringArray(forKey: "RSSReaderApp.PodcastSubscriptionCanonicalKeys.v1") ?? [])
+
+    private func resetNavigationHistory() {
+        navigationHistory.removeAll()
+        currentHistoryIndex = -1
+    }
+
+    func exitActiveSubscriptionView() {
+        activeSubscriptionURL = nil
+        selectedArticle = nil
+        selectedRedditPost = nil
+        selectedArticleId = nil
+        selectedRedditPostId = nil
+        resetNavigationHistory()
+    }
+
+    private func shouldRerouteLocalPrompt(_ prompt: String, outputTokens: Int? = nil) async -> Bool {
+        await localPromptFits(prompt, outputTokens: outputTokens) == false
+    }
+
+    func globalSummarySelectionSourceContext(
+        referenceId: String?,
+        isReddit: Bool
+    ) -> (label: String, text: String)? {
+        let normalizedId = referenceId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if !normalizedId.isEmpty {
+            if isReddit, let post = redditPostForGlobalSummaryReference(normalizedId) {
+                let cachedComments = globalSummaryComments.first { $0.0.id == post.id }?.1 ?? []
+                return (
+                    cachedComments.isEmpty ? "Original Reddit post source" : "Original Reddit post and comments source",
+                    redditSelectionSourceText(post: post, commentTexts: cachedComments)
+                )
+            }
+
+            if !isReddit, let article = articleForGlobalSummaryReference(normalizedId) {
+                return articleSelectionSourceContext(for: article)
+            }
+        }
+
+        if isReddit {
+            let contexts = !globalSummaryComments.isEmpty
+                ? globalSummaryComments
+                : globalSummaryPosts.prefix(20).map { ($0, []) }
+            guard !contexts.isEmpty else { return nil }
+            let text = contexts.prefix(20).enumerated().map { index, entry in
+                let post = entry.0
+                let comments = entry.1
+                return """
+                Reddit Item \(index + 1):
+                \(redditSelectionSourceText(post: post, commentTexts: comments))
+                """
+            }.joined(separator: "\n\n")
+            return ("Original Reddit batch source", text)
+        }
+
+        guard !globalSummaryArticles.isEmpty else { return nil }
+        let text = globalSummaryArticles.prefix(20).enumerated().map { index, article in
+            let content = cleanedArticleContent(article)
+            return """
+            Article \(index + 1):
+            Title: \(article.title)
+            Source: \(article.feedTitle)
+            Link: \(article.url?.absoluteString ?? article.feedURL)
+            Content:
+            \(normalizedSummarySourceText(content, maxCharacters: 1_500))
+            """
+        }.joined(separator: "\n\n")
+        return ("Original article batch source", text)
+    }
+
+    private func redditSelectionSourceText(post: RedditPost, commentTexts: [String]) -> String {
+        let commentSection: String
+        if commentTexts.isEmpty {
+            commentSection = "No comments captured."
+        } else {
+            commentSection = commentTexts
+                .map { "- \(normalizedSummarySourceText($0))" }
+                .joined(separator: "\n")
+        }
+
+        return """
+        Title: \(post.title)
+        Subreddit: r/\(post.subreddit)
+        Post:
+        \(normalizedSummarySourceText(post.content))
+
+        Comments:
+        \(commentSection)
+        """
     }
 
     // MARK: - Services
@@ -1984,6 +2907,14 @@ class AppState: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // CloudKit: changes made on other updated devices.
+        CloudKitSyncManager.shared.changes
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] change in
+                self?.handleCloudKitChange(change)
+            }
+            .store(in: &cancellables)
+
         // Also keep legacy publisher for individual change notifications
         CloudSyncManager.shared.remoteChangesPublisher
             .receive(on: DispatchQueue.main)
@@ -2009,63 +2940,113 @@ class AppState: ObservableObject {
 
     private func handleSnapshotChange(_ snapshot: CloudSyncManager.ReadStateSnapshot) {
         // Process the full snapshot - this handles late subscriber replay
-        persistenceManager.handleRemoteReadArticlesChange(snapshot.readArticles)
-        persistenceManager.handleRemoteFavoriteArticlesChange(snapshot.favoriteArticles)
-        persistenceManager.handleRemoteReadRedditPostsChange(snapshot.readRedditPosts)
-        persistenceManager.handleRemoteFavoriteRedditPostsChange(snapshot.favoriteRedditPosts)
-
-        // Defer UI state updates to next runloop to avoid "Modifying state during view update" warning
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.updateArticleReadStatesFromCloud()
-            self.updateArticleFavoriteStatesFromCloud()
-            self.updateRedditPostReadStatesFromCloud()
-            self.updateRedditPostFavoriteStatesFromCloud()
+        lastCloudSnapshot = snapshot
+        var updateKinds: CloudUIUpdateKind = []
+        if persistenceManager.handleRemoteReadArticlesChange(snapshot.readArticles) {
+            updateKinds.insert(.articleRead)
         }
+        if persistenceManager.handleRemoteFavoriteArticlesChange(snapshot.favoriteArticles) {
+            updateKinds.insert(.articleFavorite)
+        }
+        if persistenceManager.handleRemoteReadRedditPostsChange(snapshot.readRedditPosts) {
+            updateKinds.insert(.redditRead)
+        }
+        if persistenceManager.handleRemoteFavoriteRedditPostsChange(snapshot.favoriteRedditPosts) {
+            updateKinds.insert(.redditFavorite)
+        }
+        let hasCloudSubscriptionState = !snapshot.subscriptions.isEmpty
+            || CloudSyncManager.shared.hasCloudSubscriptionsValue()
+            || CloudSyncManager.shared.hasCloudPodcastSubscriptionRecords()
+        if hasCloudSubscriptionState,
+           persistenceManager.handleRemoteSubscriptionsChange(snapshot.subscriptions) {
+            updateKinds.insert(.subscriptions)
+        }
+        scheduleCloudUIUpdates(updateKinds)
     }
 
     private func pollCloudForChanges() {
-        // Pull-only: read from cloud, merge into local, but do NOT write back
-        // This avoids race conditions where stale reads overwrite other devices' changes
-        persistenceManager.pullFromCloud()
-        updateArticleReadStatesFromCloud()
-        updateRedditPostReadStatesFromCloud()
+        guard !isCloudPollInFlight else { return }
+        isCloudPollInFlight = true
+
+        let articleProbes: [ArticleReadProbe] = feeds.flatMap { feed in
+            feed.articles.map { article in
+                ArticleReadProbe(
+                    id: article.id,
+                    isRead: article.isRead,
+                    url: article.url,
+                    title: article.title,
+                    feedURL: article.feedURL
+                )
+            }
+        }
+
+        let redditProbes: [RedditReadProbe] = redditFeeds.flatMap { feed in
+            feed.posts.map { post in
+                RedditReadProbe(
+                    id: post.id,
+                    isRead: post.isRead,
+                    subreddit: post.subreddit,
+                    url: post.url
+                )
+            }
+        }
+
+        let persistenceManager = self.persistenceManager
+        cloudPollQueue.async { [weak self] in
+            let readState = persistenceManager.pullFromCloudReadState()
+            let diff = AppState.computeCloudPollDiff(
+                articleProbes: articleProbes,
+                redditProbes: redditProbes,
+                persistenceManager: persistenceManager,
+                readState: readState
+            )
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.persistenceManager.applyCloudPollReadState(diff.readState)
+                self.applyCloudPollDiff(diff)
+                self.isCloudPollInFlight = false
+            }
+        }
     }
 
     private func handleRemoteCloudChange(_ change: CloudSyncManager.CloudSyncChange) {
+        // CloudSyncManager publishes a snapshot followed by legacy events for
+        // compatibility. The matching legacy event carries no new information.
+        if legacyChangeMatchesLastSnapshot(change) {
+            return
+        }
+
+        var updateKinds: CloudUIUpdateKind = []
+
         switch change {
         case .readArticles(let ids):
-            persistenceManager.handleRemoteReadArticlesChange(ids)
-            DispatchQueue.main.async { [weak self] in
-                self?.updateArticleReadStatesFromCloud()
+            if persistenceManager.handleRemoteReadArticlesChange(ids) {
+                updateKinds.insert(.articleRead)
             }
 
         case .favoriteArticles(let ids):
-            persistenceManager.handleRemoteFavoriteArticlesChange(ids)
-            DispatchQueue.main.async { [weak self] in
-                self?.updateArticleFavoriteStatesFromCloud()
+            if persistenceManager.handleRemoteFavoriteArticlesChange(ids) {
+                updateKinds.insert(.articleFavorite)
             }
 
         case .readRedditPosts(let ids):
-            persistenceManager.handleRemoteReadRedditPostsChange(ids)
-            DispatchQueue.main.async { [weak self] in
-                self?.updateRedditPostReadStatesFromCloud()
+            if persistenceManager.handleRemoteReadRedditPostsChange(ids) {
+                updateKinds.insert(.redditRead)
             }
 
         case .favoriteRedditPosts(let ids):
-            persistenceManager.handleRemoteFavoriteRedditPostsChange(ids)
-            DispatchQueue.main.async { [weak self] in
-                self?.updateRedditPostFavoriteStatesFromCloud()
+            if persistenceManager.handleRemoteFavoriteRedditPostsChange(ids) {
+                updateKinds.insert(.redditFavorite)
             }
 
         case .subscriptions(let subs):
-            persistenceManager.handleRemoteSubscriptionsChange(subs)
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.subscriptions = self.persistenceManager.loadSubscriptions()
-                self.refreshAllFeeds()
+            if persistenceManager.handleRemoteSubscriptionsChange(subs, allowEmptyCloudValue: true) {
+                updateKinds.insert(.subscriptions)
             }
         }
+
+        scheduleCloudUIUpdates(updateKinds)
     }
 
     private func updateArticleReadStatesFromCloud() {
@@ -2253,8 +3234,10 @@ class AppState: ObservableObject {
         }
 
         manualCloudSyncState = .syncing
+        manualCloudStateChanged = false
         manualCloudSyncStatusMessage = "Sync requested..."
         print("☁️ AppState: Manual iCloud sync requested")
+        CloudKitSyncManager.shared.syncNow()
         _ = CloudSyncManager.shared.forceSynchronize()
 
         // Run a second pull pass because KVS propagation can land slightly after synchronize().
@@ -2265,15 +3248,22 @@ class AppState: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self else { return }
                 _ = CloudSyncManager.shared.forceSynchronize()
-                self.persistenceManager.manualPullFromCloud()
-                self.subscriptions = self.persistenceManager.loadSubscriptions()
-                self.updateArticleReadStatesFromCloud()
-                self.updateArticleFavoriteStatesFromCloud()
-                self.updateRedditPostReadStatesFromCloud()
-                self.updateRedditPostFavoriteStatesFromCloud()
-                self.refreshAllFeeds()
+                self.manualCloudStateChanged = self.persistenceManager.manualPullFromCloud(synchronize: false) || self.manualCloudStateChanged
 
                 if index == finalIndex {
+                    let shouldRefreshFeeds = self.manualCloudStateChanged
+                    self.manualCloudStateChanged = false
+                    let latestSubscriptions = self.persistenceManager.loadSubscriptions()
+                    if self.subscriptions != latestSubscriptions {
+                        self.subscriptions = latestSubscriptions
+                    }
+                    self.updateArticleReadStatesFromCloud()
+                    self.updateArticleFavoriteStatesFromCloud()
+                    self.updateRedditPostReadStatesFromCloud()
+                    self.updateRedditPostFavoriteStatesFromCloud()
+                    if shouldRefreshFeeds {
+                        self.refreshAllFeeds()
+                    }
                     self.manualCloudSyncState = .completed
                     self.manualCloudSyncStatusMessage = "Sync complete"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -2345,7 +3335,10 @@ class AppState: ObservableObject {
     }
 
     func isPodcastSubscription(_ subscription: Subscription) -> Bool {
-        subscription.isPodcast || feeds.first(where: { $0.url == subscription.url })?.articles.contains(where: { $0.isPodcastEpisode }) == true
+        if subscription.isPodcast || podcastSubscriptionCanonicalKeys.contains(subscription.canonicalKey) { return true }
+        let detected = feeds.first(where: { $0.url == subscription.url })?.articles.contains(where: \.isPodcastEpisode) == true
+        if detected { recordPodcastClassification(subscription) }
+        return detected
     }
 
     func searchPodcasts(_ query: String) async throws -> [PodcastSearchResult] {
@@ -2988,11 +3981,16 @@ class AppState: ObservableObject {
             shouldAutoCapture: false,
             shouldStartMinimized: true
         )
+        let displacedCompletion = displaceActiveWebAIRequestIfNeeded(replacingWith: title)
         isWebAIHandoffMinimized = request.shouldStartMinimized
         activeWebAIHandoffRequest = request
+        displacedCompletion?()
     }
 
     func openWebAILoginSession(for provider: WebAIProvider) {
+        let displacedCompletion = displaceActiveWebAIRequestIfNeeded(replacingWith: "Login")
+        defer { displacedCompletion?() }
+
         let request = WebAIHandoffRequest(
             provider: provider,
             title: "\(provider.displayName) Login",
@@ -3040,6 +4038,8 @@ class AppState: ObservableObject {
             shouldStartMinimized: true
         )
 
+        let displacedCompletion = displaceActiveWebAIRequestIfNeeded(replacingWith: title)
+        let timeoutWorkItem = makeWebAIRequestTimeoutWorkItem(for: request)
         pendingWebAIRequests[request.id] = PendingWebAIRequest(
             title: title,
             provider: resolvedProvider,
@@ -3047,12 +4047,15 @@ class AppState: ObservableObject {
             responseFormat: responseFormat,
             onSuccess: onSuccess,
             onFailure: onFailure,
-            automaticRetryCount: 0
+            automaticRetryCount: 0,
+            timeoutWorkItem: timeoutWorkItem
         )
         if activeWebAIHandoffRequest == nil && !isWebAIBatchHandoffInProgress {
             isWebAIHandoffMinimized = request.shouldStartMinimized
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + webAIRequestTimeoutSeconds, execute: timeoutWorkItem)
         activeWebAIHandoffRequest = request
+        displacedCompletion?()
         return request.id
     }
 
@@ -3079,6 +4082,7 @@ class AppState: ObservableObject {
             normalized.contains("message box") ||
             normalized.contains("composer") ||
             normalized.contains("automatic response capture") ||
+            normalized.contains("did not return a response") ||
             normalized.contains("web process terminated") ||
             normalized.contains("something went wrong")
     }
@@ -3094,6 +4098,8 @@ class AppState: ObservableObject {
             return false
         }
 
+        pending.timeoutWorkItem?.cancel()
+        WebAISessionManager.shared.cancelActiveRequest(for: failedRequest.provider)
         let retryRequest = WebAIHandoffRequest(
             provider: failedRequest.provider,
             title: failedRequest.title,
@@ -3104,6 +4110,9 @@ class AppState: ObservableObject {
         )
 
         pending.automaticRetryCount += 1
+        let timeoutWorkItem = makeWebAIRequestTimeoutWorkItem(for: retryRequest)
+        pending.timeoutWorkItem = timeoutWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + webAIRequestTimeoutSeconds, execute: timeoutWorkItem)
         pendingWebAIRequests[retryRequest.id] = pending
         isWebAIHandoffMinimized = retryRequest.shouldStartMinimized
         activeWebAIHandoffRequest = retryRequest
@@ -3154,6 +4163,7 @@ class AppState: ObservableObject {
 
     func handleCapturedWebAIResponse(requestID: UUID, response: String) {
         guard var pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+        pending.timeoutWorkItem?.cancel()
         let completedRequest = activeWebAIHandoffRequest?.id == requestID
             ? activeWebAIHandoffRequest
             : nil
@@ -3194,6 +4204,7 @@ class AppState: ObservableObject {
 
     func handleWebAIRequestFailure(requestID: UUID, message: String, dismissPanel: Bool = false) {
         guard var pending = pendingWebAIRequests.removeValue(forKey: requestID) else { return }
+        pending.timeoutWorkItem?.cancel()
 
         if let failedRequest = activeWebAIHandoffRequest,
            failedRequest.id == requestID,
@@ -3228,6 +4239,8 @@ class AppState: ObservableObject {
 
         if userInitiated,
            let pending = pendingWebAIRequests.removeValue(forKey: request.id) {
+            pending.timeoutWorkItem?.cancel()
+            WebAISessionManager.shared.cancelActiveRequest(for: request.provider)
             pending.onFailure("\(pending.title) was cancelled before a response was captured.")
         }
     }
@@ -4191,6 +5204,40 @@ class AppState: ObservableObject {
             performMLXLocalSummary(prompt: trimmed, completion: deliver)
         case .webAI:
             performExplicitWebAIQuestion(title: "Ask AI", prompt: trimmed, completion: deliver)
+        case .chatGPT:
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithChatGPT(prompt: trimmed, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordChatGPTThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("ChatGPT Plan error: \(error.localizedDescription)")
+                    }
+                }
+            }
+        case .openAICompatible:
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithOpenAICompatible(prompt: trimmed, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordOpenAICompatibleThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("Custom Server error: \(error.localizedDescription)")
+                    }
+                }
+            }
         case .summarizeDaemon:
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
@@ -4484,7 +5531,7 @@ class AppState: ObservableObject {
             }
         }
     }
-    
+
     private func generatePodcastText(
         prompt: String,
         title: String,
@@ -4524,6 +5571,10 @@ class AppState: ObservableObject {
                 prompt: prompt,
                 taskName: title
             )
+        case .chatGPT:
+            output = try await performChatGPTRequestAsync(prompt: prompt, taskName: title)
+        case .openAICompatible:
+            output = try await performOpenAICompatibleRequestAsync(prompt: prompt, taskName: title)
         case .summarizeDaemon:
             output = try await performSummarizeRequestAsync(prompt: prompt, taskName: title)
         case .appleLocal:
@@ -4589,27 +5640,29 @@ class AppState: ObservableObject {
     // reopened episode's cache.
     func beginPodcastEpisodeSession(for article: Article) {
         guard article.isPodcastEpisode else { return }
-        let previous = activePodcastEpisodeSessionID
+        let previousEpisodeID = activePodcastEpisodeSessionID
         podcastEpisodeSessionGenerations[article.id, default: 0] &+= 1
         activePodcastEpisodeSessionID = article.id
-        if let previous, previous != article.id {
-            Task { await podcastTranscriptService.discardTranscript(for: previous) }
+
+        if let previousEpisodeID, previousEpisodeID != article.id {
+            podcastTranscriptAvailability[previousEpisodeID] = nil
+            schedulePodcastTranscriptDiscard(
+                episodeID: previousEpisodeID,
+                generation: podcastEpisodeSessionGenerations[previousEpisodeID, default: 0]
+            )
         }
     }
 
     func endPodcastEpisodeSession(for article: Article) {
         guard article.isPodcastEpisode else { return }
-        if activePodcastEpisodeSessionID == article.id { activePodcastEpisodeSessionID = nil }
-        podcastTranscriptAvailability[article.id] = nil
-        let generation = podcastEpisodeSessionGenerations[article.id, default: 0]
-        Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard let self,
-                  self.activePodcastEpisodeSessionID != article.id,
-                  self.podcastEpisodeSessionGenerations[article.id] == generation else { return }
-            await self.podcastTranscriptService.discardTranscript(for: article.id)
-            self.setPodcastStatusMessage(nil, for: article.id)
+        if activePodcastEpisodeSessionID == article.id {
+            activePodcastEpisodeSessionID = nil
         }
+        podcastTranscriptAvailability[article.id] = nil
+        schedulePodcastTranscriptDiscard(
+            episodeID: article.id,
+            generation: podcastEpisodeSessionGenerations[article.id, default: 0]
+        )
     }
 
     func refreshPodcastTranscriptAvailability(for article: Article) async {
@@ -4971,6 +6024,60 @@ class AppState: ObservableObject {
             } else {
                 finishSummary(article: article, redditPost: redditPost)
                 isLoading = false
+            }
+            return
+        }
+
+        if settings.selectedSummaryProvider == .chatGPT {
+            let prompt: String
+            let taskName: String
+            if let article = article {
+                prompt = articleFullContextSummaryPrompt(for: article)
+                taskName = "Article Summary"
+            } else if let post = redditPost {
+                prompt = redditFullSummaryPrompt(post: post, comments: redditComments)
+                taskName = "Reddit Summary"
+            } else {
+                finishSummary(article: article, redditPost: redditPost)
+                isLoading = false
+                return
+            }
+
+            performChatGPTSummaryPublic(prompt: prompt, taskName: taskName) { [weak self] summary in
+                if let article = article {
+                    let sourceText = self?.cleanedArticleContent(article) ?? ""
+                    let constrained = self?.enforceArticleSummaryLength(summary, sourceText: sourceText) ?? summary
+                    self?.updateArticleSummaryFromCloud(article, summary: constrained)
+                } else if let post = redditPost {
+                    self?.updateRedditPostSummaryFromCloud(post, summary: summary)
+                }
+            }
+            return
+        }
+
+        if settings.selectedSummaryProvider == .openAICompatible {
+            let prompt: String
+            let taskName: String
+            if let article = article {
+                prompt = articleFullContextSummaryPrompt(for: article)
+                taskName = "Article Summary"
+            } else if let post = redditPost {
+                prompt = redditFullSummaryPrompt(post: post, comments: redditComments)
+                taskName = "Reddit Summary"
+            } else {
+                finishSummary(article: article, redditPost: redditPost)
+                isLoading = false
+                return
+            }
+
+            performOpenAICompatibleSummaryPublic(prompt: prompt, taskName: taskName) { [weak self] summary in
+                if let article = article {
+                    let sourceText = self?.cleanedArticleContent(article) ?? ""
+                    let constrained = self?.enforceArticleSummaryLength(summary, sourceText: sourceText) ?? summary
+                    self?.updateArticleSummaryFromCloud(article, summary: constrained)
+                } else if let post = redditPost {
+                    self?.updateRedditPostSummaryFromCloud(post, summary: summary)
+                }
             }
             return
         }
@@ -5884,6 +6991,10 @@ class AppState: ObservableObject {
                     onFailure: { promise(.success($0)) }
                 )
             }.eraseToAnyPublisher()
+        case .chatGPT:
+            return summaryService.summarizeWithSummarizePublisher(prompt: prompt, settings: settings)
+        case .openAICompatible:
+            return summaryService.summarizeWithSummarizePublisher(prompt: prompt, settings: settings)
         case .summarizeDaemon:
             return summaryService.summarizeWithSummarizePublisher(prompt: prompt, settings: settings)
         }
@@ -6018,7 +7129,7 @@ class AppState: ObservableObject {
             return "Apple Local"
         case .coreAIMLXLocal:
             return "CoreAI MLX Local"
-        case .gemini, .appleCloud, .applePCCGateway, .webAI, .summarizeDaemon:
+        case .gemini, .appleCloud, .applePCCGateway, .webAI, .summarizeDaemon, .chatGPT, .openAICompatible:
             return nil
         }
     }
@@ -6086,31 +7197,23 @@ class AppState: ObservableObject {
         hasCachedSummary = true
         showGlobalSummary = true
 
-        if providerOverride == nil, let providerName = selectedOverallLocalProviderName {
-            presentOverallSummaryReroute(
-                providerName: providerName,
-                itemCount: articles.count,
-                sourceName: "articles"
-            ) { [weak self] provider in
-                    self?.performArticlesSummary(
-                        articles: articles,
-                        context: context,
-                        emptyMessage: emptyMessage,
-                        logMessage: logMessage,
-                        providerOverride: provider.summaryProvider
-                    )
-            }
-            return
+        let resolution = resolveOverallSummaryProvider(for: providerOverride ?? settings.selectedSummaryProvider)
+        if let message = resolution.fallbackNotification {
+            fallbackNotification = message
+            showFallbackNotification = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.showFallbackNotification = false }
         }
 
-        let effectiveProvider = providerOverride ?? settings.selectedSummaryProvider
+
+
+        let effectiveProvider = resolution.effectiveProvider
         if effectiveProvider == .webAI {
             summarizeArticlesGloballyWithWebAI(articles)
             return
         }
 
         globalSummaryService
-            .summarizeArticlesGlobally(articles: articles, providerOverride: providerOverride)
+            .summarizeArticlesGlobally(articles: articles, providerOverride: effectiveProvider)
             .receive(on: RunLoop.main)
             .sink { [weak self] result in
                 self?.handleSummaryResult(result)
@@ -6157,32 +7260,23 @@ class AppState: ObservableObject {
         hasCachedSummary = true
         showGlobalSummary = true
 
-        if providerOverride == nil, let providerName = selectedOverallLocalProviderName {
-            presentOverallSummaryReroute(
-                providerName: providerName,
-                itemCount: posts.count,
-                sourceName: "Reddit posts"
-            ) { [weak self] provider in
-                    self?.performRedditSummary(
-                        posts: posts,
-                        topComments: topComments,
-                        context: context,
-                        emptyMessage: emptyMessage,
-                        logMessage: logMessage,
-                        providerOverride: provider.summaryProvider
-                    )
-            }
-            return
+        let resolution = resolveOverallSummaryProvider(for: providerOverride ?? settings.selectedSummaryProvider)
+        if let message = resolution.fallbackNotification {
+            fallbackNotification = message
+            showFallbackNotification = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.showFallbackNotification = false }
         }
 
-        let effectiveProvider = providerOverride ?? settings.selectedSummaryProvider
+
+
+        let effectiveProvider = resolution.effectiveProvider
         if effectiveProvider == .webAI {
             summarizeRedditPostsGloballyWithWebAI(posts, topComments: topComments)
             return
         }
 
         globalSummaryService
-            .summarizeRedditGlobally(posts: posts, topComments: topComments, providerOverride: providerOverride)
+            .summarizeRedditGlobally(posts: posts, topComments: topComments, providerOverride: effectiveProvider)
             .receive(on: RunLoop.main)
             .sink { [weak self] result in
                 self?.handleSummaryResult(result)
@@ -6692,32 +7786,14 @@ class AppState: ObservableObject {
         aggregateSummaryProviderName = nil
 
         let prompt = buildAggregatePrompt(from: result)
-        if let providerName = selectedOverallLocalProviderName {
-            presentLocalReroute(
-                providerName: providerName,
-                prompt: prompt,
-                taskName: "Overall Summary",
-                appleRequestType: .summary,
-                completion: { [weak self] routedSummary in
-                    guard let self else { return }
-                    let trimmed = routedSummary.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let lowercased = trimmed.lowercased()
-                    if trimmed.isEmpty || lowercased.hasPrefix("error") || lowercased.contains("api key not configured") || lowercased.contains("choose a cloud or remote provider") {
-                        self.aggregateSummaryError = trimmed.isEmpty ? "Failed to generate combined summary." : trimmed
-                        self.aggregateSummaryProviderName = nil
-                    } else {
-                        self.aggregateSummaryText = self.formatLLMAnswer(trimmed)
-                        self.aggregateSummaryProviderName = "Rerouted"
-                    }
-                    self.isGeneratingAggregateSummary = false
-                },
-                onCancel: { [weak self] in
-                    self?.isGeneratingAggregateSummary = false
-                    self?.aggregateSummaryError = "Overall Summary routing cancelled."
-                }
-            )
-            return
+        let resolution = resolveOverallSummaryProvider(for: settings.selectedSummaryProvider)
+        let effectiveProvider = resolution.effectiveProvider
+        if let message = resolution.fallbackNotification {
+            fallbackNotification = message
+            showFallbackNotification = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.showFallbackNotification = false }
         }
+
 
         Task { [weak self] in
             guard let self = self else { return }
@@ -6725,29 +7801,43 @@ class AppState: ObservableObject {
             do {
                 let summary: String
                 let providerName: String
-                if self.settings.selectedSummaryProvider == .summarizeDaemon {
+                if effectiveProvider == .chatGPT {
+                    print("⚙️ Aggregate: Using ChatGPT Plan for combined summary")
+                    providerName = effectiveProvider.displayName
+                    summary = try await self.performChatGPTRequestAsync(
+                        prompt: prompt,
+                        taskName: result.source == "reddit" ? "Combined Reddit Summary" : "Combined Article Summary"
+                    )
+                } else if effectiveProvider == .openAICompatible {
+                    print("⚙️ Aggregate: Using Custom Server for combined summary")
+                    providerName = effectiveProvider.displayName
+                    summary = try await self.performOpenAICompatibleRequestAsync(
+                        prompt: prompt,
+                        taskName: result.source == "reddit" ? "Combined Reddit Summary" : "Combined Article Summary"
+                    )
+                } else if effectiveProvider == .summarizeDaemon {
                     print("⚙️ Aggregate: Using Codex / Summarize for combined summary")
-                    providerName = self.settings.selectedSummaryProvider.displayName
+                    providerName = effectiveProvider.displayName
                     summary = try await self.performSummarizeRequestAsync(
                         prompt: prompt,
                         taskName: result.source == "reddit" ? "Combined Reddit Summary" : "Combined Article Summary"
                     )
-                } else if self.settings.selectedSummaryProvider == .applePCCGateway {
+                } else if effectiveProvider == .applePCCGateway {
                     print("☁️ Aggregate: Using Apple PCC fm CLI for combined summary")
-                    providerName = self.settings.selectedSummaryProvider.displayName
+                    providerName = effectiveProvider.displayName
                     summary = try await self.performPCCPlainTextRequestAsync(
                         prompt: prompt,
                         taskName: result.source == "reddit" ? "Combined Reddit Summary" : "Combined Article Summary"
                     )
-                } else if self.settings.selectedSummaryProvider == .appleCloud {
+                } else if effectiveProvider == .appleCloud {
                     print("☁️ Aggregate: Using Apple Cloud for combined summary")
-                    providerName = self.settings.selectedSummaryProvider.displayName
+                    providerName = effectiveProvider.displayName
                     summary = await withCheckedContinuation { continuation in
                         self.launchCloudRequest(for: prompt, type: .summary) { result in
                             continuation.resume(returning: result)
                         }
                     }
-                } else if self.settings.selectedSummaryProvider == .webAI {
+                } else if effectiveProvider == .webAI {
                     print("🌐 Aggregate: Using \(self.settings.selectedWebAIProvider.displayName) for combined summary")
                     providerName = self.settings.selectedWebAIProvider.displayName
                     await MainActor.run {
@@ -7915,6 +9005,48 @@ class AppState: ObservableObject {
                 }
             }
 
+        case .chatGPT:
+            isLoading = true
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithChatGPT(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordChatGPTThroughput(text: answer, elapsed: elapsed, isQA: isQA)
+                        self.isLoading = false
+                        completion(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isLoading = false
+                        completion("ChatGPT Plan error: \(error.localizedDescription)")
+                    }
+                }
+            }
+
+        case .openAICompatible:
+            isLoading = true
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithOpenAICompatible(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordOpenAICompatibleThroughput(text: answer, elapsed: elapsed, isQA: isQA)
+                        self.isLoading = false
+                        completion(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isLoading = false
+                        completion("Custom Server error: \(error.localizedDescription)")
+                    }
+                }
+            }
+
         case .summarizeDaemon:
             isLoading = true
             Task(priority: .userInitiated) { [weak self] in
@@ -8101,6 +9233,48 @@ class AppState: ObservableObject {
                     cleanedCompletion(message)
                 }
             )
+            return
+        }
+
+        if settings.selectedSummaryProvider == .chatGPT {
+            let prompt = articleFullQAPrompt(article: article, question: question)
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithChatGPT(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordChatGPTThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        cleanedCompletion(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        cleanedCompletion("ChatGPT Plan error: \(error.localizedDescription)")
+                    }
+                }
+            }
+            return
+        }
+
+        if settings.selectedSummaryProvider == .openAICompatible {
+            let prompt = articleFullQAPrompt(article: article, question: question)
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithOpenAICompatible(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordOpenAICompatibleThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        cleanedCompletion(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        cleanedCompletion("Custom Server error: \(error.localizedDescription)")
+                    }
+                }
+            }
             return
         }
 
@@ -8325,6 +9499,48 @@ class AppState: ObservableObject {
                     cleanedCompletion(message)
                 }
             )
+            return
+        }
+
+        if settings.selectedSummaryProvider == .chatGPT {
+            let prompt = redditFullQAPrompt(post: post, comments: comments, question: question)
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithChatGPT(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordChatGPTThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("ChatGPT Plan error: \(error.localizedDescription)")
+                    }
+                }
+            }
+            return
+        }
+
+        if settings.selectedSummaryProvider == .openAICompatible {
+            let prompt = redditFullQAPrompt(post: post, comments: comments, question: question)
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithOpenAICompatible(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordOpenAICompatibleThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("Custom Server error: \(error.localizedDescription)")
+                    }
+                }
+            }
             return
         }
 
@@ -8645,24 +9861,45 @@ class AppState: ObservableObject {
     /// processed in 40,000-character chunks and consolidated into one answer.
     func askQuestionAboutGlobalSummarySelection(
         selectedText: String,
+        extractedContext: String = "",
+        referenceId: String? = nil,
         useWebAI: Bool,
         completion: @escaping (String) -> Void
     ) {
         let selected = normalizedGlobalSelectionText(selectedText, limit: 8_000)
+        let nearby = normalizedGlobalSelectionText(extractedContext, limit: 16_000)
         guard !selected.isEmpty else {
             completion("Select some text first.")
             return
         }
 
-        let currentPostIDs = Set(globalSummaryPosts.map { $0.id })
-        let contexts = globalSummaryComments.filter { currentPostIDs.isEmpty || currentPostIDs.contains($0.0.id) }
+        let normalizedReference = referenceId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var contexts = globalSummaryComments
+        if !normalizedReference.isEmpty {
+            contexts = contexts.filter { $0.0.id == normalizedReference }
+        } else if !globalSummaryPosts.isEmpty {
+            let currentPostIds = Set(globalSummaryPosts.map { $0.id })
+            contexts = contexts.filter { currentPostIds.contains($0.0.id) }
+        }
+
         guard !contexts.isEmpty else {
-            let fallbackPrompt = savedSummarySelectionPrompt(selectedText: selected)
+            let source = globalSummarySelectionSourceContext(referenceId: referenceId, isReddit: !globalSummaryPosts.isEmpty)
+            let fallbackPrompt = buildAskAISelectionPrompt(
+                selectedText: selected,
+                extractedContext: nearby,
+                sourceContext: source?.text ?? "",
+                sourceLabel: source?.label ?? "",
+                explainSelection: !useWebAI && settings.selectedSummaryProvider != .webAI
+            )
             guard !fallbackPrompt.isEmpty else {
                 completion("No saved source material is available for this selection.")
                 return
             }
-            executeGlobalSelectionPrompt(fallbackPrompt, useWebAI: useWebAI, completion: completion)
+            if useWebAI {
+                askWebQuestionAboutSelection(prompt: fallbackPrompt, completion: completion)
+            } else {
+                askQuestionAboutSelection(prompt: fallbackPrompt, completion: completion)
+            }
             return
         }
 
@@ -8676,7 +9913,7 @@ class AppState: ObservableObject {
             Subreddit: r/\(post.subreddit)
             Title: \(post.title)
             Post:
-            \(normalizedGlobalSelectionText(post.content, limit: 2_000))
+            \(normalizedSummarySourceText(post.content))
             Extracted comments used for the summary:
             \(comments)
             """
@@ -8688,25 +9925,35 @@ class AppState: ObservableObject {
         }
 
         if chunks.count == 1 {
-            let prompt = globalSelectionAnswerPrompt(selected: selected, source: chunks[0])
+            let prompt = globalSelectionAnswerPrompt(selected: selected, nearby: nearby, source: chunks[0], useWebAI: useWebAI)
             executeGlobalSelectionPrompt(prompt, useWebAI: useWebAI, completion: completion)
             return
         }
 
         func processChunk(_ index: Int, evidence: [String]) {
             guard index < chunks.count else {
-                let evidenceText = evidence.enumerated().map { "Chunk \($0.offset + 1):\n\($0.element)" }.joined(separator: "\n\n")
-                let finalPrompt = """
-                Produce the final answer about the selected text using only the evidence extracted from all source chunks below.
+                var finalPrompt = """
+                Produce the final answer to the selection question using only the evidence extracted from all source chunks below.
 
                 Selected text:
                 \(selected)
 
-                CHUNK EVIDENCE:
-                \(evidenceText)
+                Nearby rendered context:
+                \(nearby.isEmpty ? "(None captured.)" : nearby)
 
-                If the evidence does not answer it, say so explicitly. Return plain text only, using short paragraphs and no Markdown symbols, headings, bullets, or code fences.
+                CHUNK EVIDENCE:
+                \(evidence.enumerated().map { "Chunk \($0.offset + 1):\n\($0.element)" }.joined(separator: "\n\n"))
+
+                If the evidence does not answer the selection, say that explicitly. Return plain text only, using short paragraphs and no Markdown symbols, headings, bullets, or code fences.
                 """
+                if !useWebAI && self.settings.selectedSummaryProvider != .webAI {
+                    // Preserve every chunk's evidence; do not reapply a source truncation limit.
+                    finalPrompt += """
+
+
+                    Explain what the selected passage means, rather than repeating or paraphrasing the surrounding summary. Resolve references, wordplay, contrasts and implied relationships using the evidence. Start with the explanation, distinguish source claims from facts, and do not invent missing details. Give any supported partial explanation and identify only the specific uncertainty that remains.
+                    """
+                }
                 executeGlobalSelectionPrompt(finalPrompt, useWebAI: useWebAI, completion: completion)
                 return
             }
@@ -8716,6 +9963,9 @@ class AppState: ObservableObject {
 
             Selected text:
             \(selected)
+
+            Nearby rendered context:
+            \(nearby.isEmpty ? "(None captured.)" : nearby)
 
             SOURCE CHUNK \(index + 1) OF \(chunks.count):
             \(chunks[index])
@@ -8762,12 +10012,24 @@ class AppState: ObservableObject {
         }
     }
 
-    private func globalSelectionAnswerPrompt(selected: String, source: String) -> String {
-        """
+    private func globalSelectionAnswerPrompt(selected: String, nearby: String, source: String, useWebAI: Bool) -> String {
+        if !useWebAI && settings.selectedSummaryProvider != .webAI {
+            return buildAskAISelectionPrompt(
+                selectedText: selected,
+                extractedContext: nearby,
+                sourceContext: source,
+                sourceLabel: "Saved Reddit posts and extracted comments",
+                explainSelection: true
+            )
+        }
+        return """
         Answer what the saved Reddit posts and extracted comments say about the selected text. Use only the supplied source material.
 
         Selected text:
         \(selected)
+
+        Nearby rendered context:
+        \(nearby.isEmpty ? "(None captured.)" : nearby)
 
         SAVED SOURCE MATERIAL:
         \(source)
@@ -8857,6 +10119,40 @@ class AppState: ObservableObject {
                 onSuccess: deliver,
                 onFailure: { deliver($0) }
             )
+        case .chatGPT:
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithChatGPT(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordChatGPTThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("ChatGPT Plan error: \(error.localizedDescription)")
+                    }
+                }
+            }
+        case .openAICompatible:
+            Task(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                do {
+                    let start = Date()
+                    let answer = try await self.summaryService.generateContentWithOpenAICompatible(prompt: prompt, settings: self.settings)
+                    let elapsed = Date().timeIntervalSince(start)
+                    await MainActor.run {
+                        self.recordOpenAICompatibleThroughput(text: answer, elapsed: elapsed, isQA: true)
+                        deliver(answer)
+                    }
+                } catch {
+                    await MainActor.run {
+                        deliver("Custom Server error: \(error.localizedDescription)")
+                    }
+                }
+            }
         case .summarizeDaemon:
             Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
@@ -9284,7 +10580,7 @@ class AppState: ObservableObject {
 
         Task {
             await MainActor.run { self.mlxStreamingText = "" }
-            if await self.localPromptFits(prompt) == false {
+            if await self.shouldRerouteLocalPrompt(prompt) {
                 await MainActor.run {
                     self.presentLocalReroute(
                         providerName: self.selectedLocalProviderName(),
@@ -9351,7 +10647,8 @@ class AppState: ObservableObject {
             : AppSettings.normalizedCoreAIMLXOutputTokens(configuredOutput, contextTokens: maxContextTokens)
         let summaryPrompt = isGemma4 ? adaptedPromptForGemma4Summary(prompt) : prompt
         let systemPrompt = isGemma4 ? gemma4SummarySystemPrompt() : nil
-        return try await CoreAIMLXLocalService.shared.generateTextWithMetrics(
+        return try await self.withMLXTimeout(seconds: 90) {
+            try await CoreAIMLXLocalService.shared.generateTextWithMetrics(
             prompt: summaryPrompt,
             systemPrompt: systemPrompt,
             modelID: modelID,
@@ -9361,6 +10658,7 @@ class AppState: ObservableObject {
                 Task { @MainActor [weak self] in self?.mlxStreamingText += chunk }
             }
         )
+        }
     }
 
     /// For structured JSON output (infographics/whiteboards), MLX redirects to Apple Local
@@ -9585,7 +10883,8 @@ class AppState: ObservableObject {
             guard let self else { return }
             await MainActor.run { self.mlxStreamingText = "" }
             do {
-                let metrics = try await MLXLocalService.shared.generateTextWithMetrics(
+                let metrics = try await self.withMLXTimeout(seconds: 90) {
+            try await MLXLocalService.shared.generateTextWithMetrics(
                     prompt: truncatedPrompt,
                     modelID: modelID,
                     maxOutputTokens: maxOutputTokens,
@@ -9594,6 +10893,7 @@ class AppState: ObservableObject {
                         Task { @MainActor [weak self] in self?.mlxStreamingText += chunk }
                     }
                 )
+        }
                 await MainActor.run {
                     self.mlxStreamingText = ""
                     self.recordMLXThroughput(metrics: metrics)
@@ -9605,6 +10905,42 @@ class AppState: ObservableObject {
                     completion("MLX analysis error: \(error.localizedDescription)")
                 }
             }
+        }
+    }
+
+    private struct AppStateMLXTimeoutError: LocalizedError {
+        var errorDescription: String? { "MLX generation timed out. Please try again." }
+    }
+
+    private func withMLXTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let operationTask = Task.detached(priority: .userInitiated) {
+            try await operation()
+        }
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                do {
+                    return try await operationTask.value
+                } catch is CancellationError {
+                    throw AppStateMLXTimeoutError()
+                } catch {
+                    throw error
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                operationTask.cancel()
+                throw AppStateMLXTimeoutError()
+            }
+            guard let result = try await group.next() else {
+                operationTask.cancel()
+                throw AppStateMLXTimeoutError()
+            }
+            group.cancelAll()
+            operationTask.cancel()
+            return result
         }
     }
 }

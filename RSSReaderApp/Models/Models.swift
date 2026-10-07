@@ -30,12 +30,18 @@ struct AppSettings: Codable {
     var pccGatewayPort: Int = AppSettings.defaultPCCGatewayPort
     var pccGatewayToken: String = ""
     var pccGatewayModel: String = AppSettings.defaultPCCGatewayModel
+    // Custom Server provider (oMLX, Ollama, LM Studio...). The API key lives in the Keychain.
+    var openAICompatibleBaseURL: String = ""
+    var openAICompatibleAPIKey: String = ""
+    var openAICompatibleModelID: String = ""
+    var openAICompatibleMaxTokens: Int = AppSettings.defaultOpenAICompatibleMaxTokens
+    var openAICompatibleDisableThinking: Bool = false
     var localTTSEngine: LocalTTSEngine = .system
     var kokoroVoice: String = KokoroVoice.defaultVoice.rawValue
     var kokoroSpeed: Double = 1.0
     var kokoroPrecacheEnabled: Bool = false
-    /// Opt-in so existing RSS and Reddit installations keep their current UI
-    /// and refresh behavior until YouTube is explicitly enabled.
+    /// Experimental YouTube integration is opt-in so existing installations
+    /// retain their exact RSS/Reddit UI and refresh behavior by default.
     var youtubeSupportEnabled: Bool = false
 
     // Reddit OAuth fields
@@ -44,6 +50,7 @@ struct AppSettings: Codable {
     var redditRefreshToken: String = ""
     var redditTokenExpiry: Date? = nil
     var redditUsername: String = ""
+    var redditGrantedScopes: String = ""
 
     enum FeedViewType: String, Codable {
         case list, compact, magazine
@@ -57,21 +64,36 @@ struct AppSettings: Codable {
         case coreAIMLXLocal = "CoreAI MLX Local"
         case webAI = "Web AI"
         case summarizeDaemon = "Codex / Summarize"
+        /// The user's own ChatGPT plan via Sign in with ChatGPT. Xcode builds only.
+        case chatGPT = "ChatGPT Plan"
+        /// Any OpenAI-style server: oMLX, Ollama, LM Studio, llama.cpp...
+        case openAICompatible = "Custom Server"
 
-        /// Legacy "MLX Local" values now resolve to CoreAI MLX Local.
+        /// "MLX Local" was the stored value of the removed LiteRT provider; map it
+        /// (and any other unknown value) to CoreAI MLX Local so settings still decode.
         init(from decoder: Decoder) throws {
             let rawValue = try decoder.singleValueContainer().decode(String.self)
             self = SummaryProvider(rawValue: rawValue) ?? .coreAIMLXLocal
+            // Hidden providers (see selectableCases) fall back to the default provider.
+            if !SummaryProvider.selectableCases.contains(self) {
+                self = .appleCloud
+            }
+        }
+
+        /// Providers kept in code but not offered in Settings.
+        static let hiddenCases: Set<SummaryProvider> = []
+
+        /// Providers offered in pickers; ChatGPT Plan only in builds installed from Xcode.
+        static var selectableCases: [SummaryProvider] {
+            allCases.filter {
+                !hiddenCases.contains($0) && ($0 != .chatGPT || ChatGPTPlanAvailability.isEnabled)
+            }
         }
 
         var displayName: String {
             switch self {
             case .applePCCGateway:
-                #if os(macOS)
                 return "Apple PCC (fm CLI)"
-                #else
-                return self.rawValue
-                #endif
             case .coreAIMLXLocal:
                 return "CoreAI MLX Local"
             default:
@@ -80,7 +102,7 @@ struct AppSettings: Codable {
         }
     }
 
-    // MLX Local settings. Keep the old setting keys for migration.
+    // MLX Local settings, used by MLXLocalService (structured JSON, external model downloads).
     var mlxModelID: String = CoreAIMLXLocalService.defaultModelRepo
     var mlxMaxOutputTokens: Int = 256
     var mlxMaxContextTokens: Int = 0
@@ -92,9 +114,13 @@ struct AppSettings: Codable {
 
     static let defaultSummarizeDaemonModel = "gpt-fast"
     static let defaultSummarizeBridgePort = 8790
-    static let defaultPCCGatewayHost = "127.0.0.1"
     static let defaultPCCGatewayPort = 1977
     static let defaultPCCGatewayModel = "pcc"
+    #if os(macOS)
+    static let defaultPCCGatewayHost = "127.0.0.1"
+    #else
+    static let defaultPCCGatewayHost = ""
+    #endif
 
     static func normalizedSummarizeDaemonModel(_ rawValue: String) -> String {
         let model = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -123,6 +149,12 @@ struct AppSettings: Codable {
 
     static func sanitizedSummarizePort(_ rawValue: Int, fallback: Int) -> Int {
         (1...65_535).contains(rawValue) ? rawValue : fallback
+    }
+
+    static let defaultOpenAICompatibleMaxTokens = 4096
+
+    static func normalizedOpenAICompatibleMaxTokens(_ value: Int) -> Int {
+        min(max(value, 256), 32_768)
     }
 
     static func normalizedPCCGatewayModel(_ rawValue: String) -> String {
@@ -191,6 +223,10 @@ struct AppSettings: Codable {
         case pccGatewayPort
         case pccGatewayToken
         case pccGatewayModel
+        case openAICompatibleBaseURL
+        case openAICompatibleModelID
+        case openAICompatibleMaxTokens
+        case openAICompatibleDisableThinking
         case localTTSEngine
         case kokoroVoice
         case kokoroSpeed
@@ -201,6 +237,7 @@ struct AppSettings: Codable {
         case redditRefreshToken
         case redditTokenExpiry
         case redditUsername
+        case redditGrantedScopes
         case mlxModelID
         case mlxMaxOutputTokens
         case mlxMaxContextTokens
@@ -235,6 +272,12 @@ struct AppSettings: Codable {
         pccGatewayPort = AppSettings.sanitizedSummarizePort(try container.decodeIfPresent(Int.self, forKey: .pccGatewayPort) ?? AppSettings.defaultPCCGatewayPort, fallback: AppSettings.defaultPCCGatewayPort)
         pccGatewayToken = AppSettings.sanitizedSummarizeSecret(try container.decodeIfPresent(String.self, forKey: .pccGatewayToken) ?? "")
         pccGatewayModel = AppSettings.normalizedPCCGatewayModel(try container.decodeIfPresent(String.self, forKey: .pccGatewayModel) ?? AppSettings.defaultPCCGatewayModel)
+        openAICompatibleBaseURL = try container.decodeIfPresent(String.self, forKey: .openAICompatibleBaseURL) ?? ""
+        openAICompatibleModelID = try container.decodeIfPresent(String.self, forKey: .openAICompatibleModelID) ?? ""
+        openAICompatibleMaxTokens = AppSettings.normalizedOpenAICompatibleMaxTokens(
+            try container.decodeIfPresent(Int.self, forKey: .openAICompatibleMaxTokens) ?? AppSettings.defaultOpenAICompatibleMaxTokens
+        )
+        openAICompatibleDisableThinking = try container.decodeIfPresent(Bool.self, forKey: .openAICompatibleDisableThinking) ?? false
         localTTSEngine = try container.decodeIfPresent(LocalTTSEngine.self, forKey: .localTTSEngine) ?? .system
         kokoroVoice = try container.decodeIfPresent(String.self, forKey: .kokoroVoice) ?? KokoroVoice.defaultVoice.rawValue
         kokoroSpeed = try container.decodeIfPresent(Double.self, forKey: .kokoroSpeed) ?? 1.0
@@ -245,7 +288,8 @@ struct AppSettings: Codable {
         redditRefreshToken = try container.decodeIfPresent(String.self, forKey: .redditRefreshToken) ?? ""
         redditTokenExpiry = try container.decodeIfPresent(Date.self, forKey: .redditTokenExpiry)
         redditUsername = try container.decodeIfPresent(String.self, forKey: .redditUsername) ?? ""
-        mlxModelID = CoreAIMLXLocalService.normalizedModelID(try container.decodeIfPresent(String.self, forKey: .mlxModelID) ?? CoreAIMLXLocalService.defaultModelRepo)
+        redditGrantedScopes = try container.decodeIfPresent(String.self, forKey: .redditGrantedScopes) ?? ""
+        mlxModelID = MLXLocalService.normalizedModelIdentifier(from: try container.decodeIfPresent(String.self, forKey: .mlxModelID) ?? CoreAIMLXLocalService.defaultModelRepo)
         mlxMaxContextTokens = AppSettings.normalizedMLXContextTokens(try container.decodeIfPresent(Int.self, forKey: .mlxMaxContextTokens) ?? 0)
         mlxMaxOutputTokens = AppSettings.normalizedMLXOutputTokens(
             try container.decodeIfPresent(Int.self, forKey: .mlxMaxOutputTokens) ?? 256,
@@ -257,6 +301,50 @@ struct AppSettings: Codable {
             try container.decodeIfPresent(Int.self, forKey: .coreAIMLXMaxOutputTokens) ?? 256,
             contextTokens: AppSettings.effectiveCoreAIMLXContextTokens(coreAIMLXMaxContextTokens)
         )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(refreshInterval, forKey: .refreshInterval)
+        try container.encode(showUnreadOnly, forKey: .showUnreadOnly)
+        try container.encode(markReadOnScroll, forKey: .markReadOnScroll)
+        try container.encode(geminiApiKey, forKey: .geminiApiKey)
+        try container.encode(openaiApiKey, forKey: .openaiApiKey)
+        try container.encode(defaultFeedView, forKey: .defaultFeedView)
+        try container.encode(selectedTTSProvider, forKey: .selectedTTSProvider)
+        try container.encode(selectedGeminiVoice, forKey: .selectedGeminiVoice)
+        try container.encode(selectedOpenAIVoice, forKey: .selectedOpenAIVoice)
+        try container.encode(selectedSummaryProvider, forKey: .selectedSummaryProvider)
+        try container.encode(selectedWebAIProvider, forKey: .selectedWebAIProvider)
+        try container.encode(summarizeDaemonHost, forKey: .summarizeDaemonHost)
+        try container.encode(summarizeDaemonPort, forKey: .summarizeDaemonPort)
+        try container.encode(summarizeDaemonModel, forKey: .summarizeDaemonModel)
+        try container.encode(summarizeBridgeHost, forKey: .summarizeBridgeHost)
+        try container.encode(summarizeBridgePort, forKey: .summarizeBridgePort)
+        try container.encode(pccGatewayHost, forKey: .pccGatewayHost)
+        try container.encode(pccGatewayPort, forKey: .pccGatewayPort)
+        try container.encode(pccGatewayModel, forKey: .pccGatewayModel)
+        try container.encode(openAICompatibleBaseURL, forKey: .openAICompatibleBaseURL)
+        try container.encode(openAICompatibleModelID, forKey: .openAICompatibleModelID)
+        try container.encode(openAICompatibleMaxTokens, forKey: .openAICompatibleMaxTokens)
+        try container.encode(openAICompatibleDisableThinking, forKey: .openAICompatibleDisableThinking)
+        try container.encode(localTTSEngine, forKey: .localTTSEngine)
+        try container.encode(kokoroVoice, forKey: .kokoroVoice)
+        try container.encode(kokoroSpeed, forKey: .kokoroSpeed)
+        try container.encode(kokoroPrecacheEnabled, forKey: .kokoroPrecacheEnabled)
+        try container.encode(youtubeSupportEnabled, forKey: .youtubeSupportEnabled)
+        try container.encode(redditClientId, forKey: .redditClientId)
+        try container.encode(redditAccessToken, forKey: .redditAccessToken)
+        try container.encode(redditRefreshToken, forKey: .redditRefreshToken)
+        try container.encodeIfPresent(redditTokenExpiry, forKey: .redditTokenExpiry)
+        try container.encode(redditUsername, forKey: .redditUsername)
+        try container.encode(redditGrantedScopes, forKey: .redditGrantedScopes)
+        try container.encode(mlxModelID, forKey: .mlxModelID)
+        try container.encode(mlxMaxOutputTokens, forKey: .mlxMaxOutputTokens)
+        try container.encode(mlxMaxContextTokens, forKey: .mlxMaxContextTokens)
+        try container.encode(coreAIMLXModelID, forKey: .coreAIMLXModelID)
+        try container.encode(coreAIMLXMaxOutputTokens, forKey: .coreAIMLXMaxOutputTokens)
+        try container.encode(coreAIMLXMaxContextTokens, forKey: .coreAIMLXMaxContextTokens)
     }
 }
 
@@ -289,21 +377,25 @@ enum LocalRerouteProvider: String, CaseIterable, Identifiable {
     case gemini
     case applePCCGateway
     case summarizeDaemon
+    case chatGPT
+    case openAICompatible
     case appleCloud
     case webAI
 
     var id: String { rawValue }
 
+    /// Reroute targets offered in the UI: the same providers Settings offers.
+    static var available: [LocalRerouteProvider] {
+        allCases.filter { AppSettings.SummaryProvider.selectableCases.contains($0.summaryProvider) }
+    }
+
     var displayName: String {
         switch self {
         case .gemini: return "Gemini"
-        case .applePCCGateway:
-            #if os(macOS)
-            return "Apple PCC (fm CLI)"
-            #else
-            return "Apple PCC Gateway"
-            #endif
+        case .applePCCGateway: return "Apple PCC (fm CLI)"
         case .summarizeDaemon: return "Codex / Summarize"
+        case .chatGPT: return "ChatGPT Plan"
+        case .openAICompatible: return "Custom Server"
         case .appleCloud: return "Apple Cloud"
         case .webAI: return "Web AI"
         }
@@ -314,6 +406,8 @@ enum LocalRerouteProvider: String, CaseIterable, Identifiable {
         case .gemini: return .gemini
         case .applePCCGateway: return .applePCCGateway
         case .summarizeDaemon: return .summarizeDaemon
+        case .chatGPT: return .chatGPT
+        case .openAICompatible: return .openAICompatible
         case .appleCloud: return .appleCloud
         case .webAI: return .webAI
         }
@@ -503,6 +597,7 @@ struct Article: Identifiable {
     let id: String
     let title: String
     var content: String
+    var previewText: String
     let url: URL?
     let publishDate: Date
     let author: String?
@@ -522,6 +617,7 @@ struct Article: Identifiable {
     init(id: String,
          title: String,
          content: String,
+         previewText: String? = nil,
          url: URL?,
          publishDate: Date,
          author: String? = nil,
@@ -538,6 +634,7 @@ struct Article: Identifiable {
         self.id = id
         self.title = title
         self.content = content
+        self.previewText = previewText ?? Self.makePreviewText(from: content)
         self.url = url
         self.publishDate = publishDate
         self.author = author
@@ -551,6 +648,20 @@ struct Article: Identifiable {
         self.isRead = isRead
         self.isFavorite = isFavorite
         self.summary = summary
+    }
+
+    static func makePreviewText(from content: String) -> String {
+        var cleaned = content
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&[^;]+;", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if cleaned.count > 140 {
+            cleaned = String(cleaned.prefix(140)) + "..."
+        }
+
+        return cleaned
     }
 }
 
@@ -672,6 +783,7 @@ struct RedditPost: Identifiable {
     let title: String
     var content: String
     let url: URL?
+    let resolvedImageURL: URL?
     let publishDate: Date
     let author: String
     let subreddit: String
@@ -692,6 +804,7 @@ struct RedditPost: Identifiable {
          title: String,
          content: String,
          url: URL?,
+         resolvedImageURL: URL? = nil,
          publishDate: Date,
          author: String,
          subreddit: String,
@@ -709,6 +822,14 @@ struct RedditPost: Identifiable {
         self.title = title
         self.content = content
         self.url = url
+        self.resolvedImageURL = resolvedImageURL ?? resolveBestRedditImageURL(
+            content: content,
+            url: url,
+            thumbnail: thumbnail,
+            preview: preview,
+            mediaMetadata: media_metadata,
+            galleryData: gallery_data
+        )
         self.publishDate = publishDate
         self.author = author
         self.subreddit = subreddit
@@ -743,369 +864,183 @@ private func parseFirstImageURL(in text: String) -> URL? {
     return nil
 }
 
+private func decodedRedditMediaURL(from value: String?) -> URL? {
+    guard let value, !value.isEmpty else { return nil }
+    let decoded = value
+        .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "amp;", with: "")
+    return URL(string: decoded)
+}
+
+private func decodedThumbnailURL(from thumbnail: String?) -> URL? {
+    guard let thumbnail,
+          !thumbnail.isEmpty,
+          thumbnail != "self",
+          thumbnail != "default",
+          thumbnail != "nsfw",
+          thumbnail != "spoiler" else {
+        return nil
+    }
+
+    let decoded = thumbnail
+        .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "&lt;", with: "<")
+        .replacingOccurrences(of: "&gt;", with: ">")
+        .replacingOccurrences(of: "&quot;", with: "\"")
+        .replacingOccurrences(of: "&#39;", with: "'")
+        .replacingOccurrences(of: "&nbsp;", with: " ")
+
+    return URL(string: decoded)
+}
+
+private func resolveBestRedditImageURL(
+    content: String,
+    url: URL?,
+    thumbnail: String?,
+    preview: Preview?,
+    mediaMetadata: [String: MediaMetadata]?,
+    galleryData: GalleryData?
+) -> URL? {
+    if let gallery = galleryData, let mediaMetadata {
+        for item in gallery.items {
+            guard let mediaItem = mediaMetadata[item.media_id], mediaItem.status == "valid" else {
+                continue
+            }
+
+            if let fullURL = decodedRedditMediaURL(from: mediaItem.s?.u) {
+                return fullURL
+            }
+
+            if let bestResolution = mediaItem.p?.first(where: {
+                guard let width = $0.x, let height = $0.y else { return false }
+                return width > 320 && height > 240
+            }), let resolutionURL = decodedRedditMediaURL(from: bestResolution.u) {
+                return resolutionURL
+            }
+        }
+    }
+
+    if let postURL = url, postURL.absoluteString.contains("v.redd.it"),
+       let thumbURL = decodedThumbnailURL(from: thumbnail) {
+        return thumbURL
+    }
+
+    if let postURL = url {
+        let urlString = postURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercasedURL = urlString.lowercased()
+        let pathExtension = postURL.pathExtension.lowercased()
+        let validExtensions = ["jpg", "jpeg", "png", "gif", "webp"]
+        let isKnownImageHost =
+            urlString.contains("i.redd.it") ||
+            urlString.contains("i.imgur.com") ||
+            urlString.contains("gfycat.com") ||
+            urlString.contains("cdn.discordapp.com") ||
+            urlString.contains("media.discordapp.net")
+
+        if isKnownImageHost || validExtensions.contains(pathExtension) {
+            return postURL
+        }
+
+        if validExtensions.contains(where: { lowercasedURL.hasSuffix(".\($0)") }) {
+            return postURL
+        }
+
+        if urlString.contains("imgur.com/"),
+           !urlString.contains("i.imgur.com"),
+           !urlString.contains("/gallery/"),
+           !urlString.contains("/a/"),
+           let imgurID = urlString.split(separator: "/").last {
+            return URL(string: "https://i.imgur.com/\(imgurID).jpg")
+        }
+    }
+
+    if let preview, let firstImage = preview.images.first {
+        if let sourceURL = decodedRedditMediaURL(from: firstImage.source.url) {
+            return sourceURL
+        }
+
+        if let bestResolution = firstImage.resolutions.last(where: { $0.width > 320 && $0.height > 240 }),
+           let resolutionURL = decodedRedditMediaURL(from: bestResolution.url) {
+            return resolutionURL
+        }
+    }
+
+    if let urlString = url?.absoluteString,
+       urlString.contains("reddit.com/media"),
+       let components = URLComponents(string: urlString),
+       let actualItem = components.queryItems?.first(where: { $0.name == "url" }),
+       let decodedURLString = actualItem.value?.removingPercentEncoding,
+       let actualURL = URL(string: decodedURLString) {
+        return actualURL
+    }
+
+    if let inlineURL = parseFirstImageURL(in: content) {
+        return inlineURL
+    }
+
+    return decodedThumbnailURL(from: thumbnail)
+}
+
 // MARK: - RedditPost Computed Properties
 
 extension RedditPost {
     /// Returns the best available image URL using multiple sources.
     var bestImageURL: URL? {
-        print("🔍 DEBUG: Finding best image URL for post '\(title.prefix(50))...'")
-        print("  - post.url: \(url?.absoluteString ?? "nil")")
-        print("  - has preview: \(preview != nil)")
-        print("  - has gallery_data: \(gallery_data != nil)")
-        print("  - has media_metadata: \(media_metadata != nil)")
-        print("  - has thumbnail: \(thumbnail ?? "nil")")
-        
-        // 1) PRIORITY: Gallery posts with media_metadata (keep galleries working as they are)
-        if let gallery = gallery_data, let media = media_metadata {
-            print("  - Processing gallery with \(gallery.items.count) items")
-            print("  - Media metadata keys: \(Array(media.keys))")
-            
-            for (index, item) in gallery.items.enumerated() {
-                print("    - Gallery item \(index): media_id=\(item.media_id)")
-                
-                if let mediaItem = media[item.media_id] {
-                    print("      - Found media item, status=\(mediaItem.status), type=\(mediaItem.e)")
-                    print("      - Has full-res (s): \(mediaItem.s != nil)")
-                    print("      - Has resolutions (p): \(mediaItem.p?.count ?? 0) versions")
-                    
-                    if mediaItem.status == "valid" {
-                        // Try full resolution first
-                        if let fullURLString = mediaItem.s?.u?.replacingOccurrences(of: "&amp;", with: "&"),
-                           let fullURL = URL(string: fullURLString) {
-                            print("✅ Using media_metadata full URL: \(fullURL)")
-                            return fullURL
-                        }
-                        // Try high-res versions only (skip thumbnails)
-                        if let resolutions = mediaItem.p {
-                            print("        - Available resolutions: \(resolutions.map { "\($0.x ?? 0)x\($0.y ?? 0)" })")
-                            let highResVersions = resolutions.filter { 
-                                guard let width = $0.x, let height = $0.y else { return false }
-                                return width > 320 && height > 240
-                            }
-                            print("        - High-res versions: \(highResVersions.count)")
-                            if let firstHighRes = highResVersions.first,
-                               let resURLString = firstHighRes.u?.replacingOccurrences(of: "&amp;", with: "&"),
-                               let resURL = URL(string: resURLString) {
-                                print("✅ Using media_metadata high-res URL (\(firstHighRes.x ?? 0)x\(firstHighRes.y ?? 0)): \(resURL)")
-                                return resURL
-                            }
-                        }
-                    } else {
-                        print("      - Skipping invalid media item")
-                    }
-                } else {
-                    print("      - No media item found for ID: \(item.media_id)")
-                }
-            }
-            print("  - No valid images found in gallery metadata")
-        } else {
-            if gallery_data == nil { print("  - No gallery_data") }
-            if media_metadata == nil { print("  - No media_metadata") }
-        }
-        
-        // 2) For video posts (v.redd.it), use thumbnail directly (preview is often broken)
-        if let postURL = url, postURL.absoluteString.contains("v.redd.it") {
-            print("  - This is a video post (v.redd.it), using thumbnail instead of preview...")
-            if let thumb = thumbnail,
-               !thumb.isEmpty,
-               thumb != "self",
-               thumb != "default",
-               thumb != "nsfw",
-               thumb != "spoiler" {
-                let decodedThumb = thumb
-                    .replacingOccurrences(of: "&amp;", with: "&")
-                if let thumbURL = URL(string: decodedThumb) {
-                    print("✅ Using video thumbnail (preview often broken for videos): \(thumbURL)")
-                    return thumbURL
-                }
-            }
-        }
-        
-        // 3) Check if the post's url directly points to an image (including i.redd.it)
-                print("  - Checking if URL is direct image...")
-                if let postURL = url {
-                    let urlString = postURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
-                    print("    - Original URL: \(urlString)")
-                    
-                    // Test the URL detection logic
-                    testImageURLDetection(postURL)
-                    
-                    // Use pathExtension for more reliable extension detection (handles query params)
-                    let pathExtension = postURL.pathExtension.lowercased()
-                    print("    - Path extension: '\(pathExtension)'")
-                    
-                    // Check for common image hosting domains that don't always use extensions
-                    let lowercasedURL = urlString.lowercased()
-                    let isRedditImage = urlString.contains("i.redd.it")
-                    let isImgurDirect = urlString.contains("i.imgur.com")
-                    let isGfycatImage = urlString.contains("gfycat.com")
-                    let isDiscordImage = urlString.contains("cdn.discordapp.com") || urlString.contains("media.discordapp.net")
-                    
-                    // Handle Imgur URLs that need transformation (imgur.com/XXXXX -> i.imgur.com/XXXXX.jpg)
-                    if urlString.contains("imgur.com/") && !urlString.contains("i.imgur.com") && 
-                       !urlString.contains("/gallery/") && !urlString.contains("/a/") {
-                        // Extract the image ID and convert to direct image URL
-                        if let imgurID = urlString.split(separator: "/").last {
-                            let directImageURL = "https://i.imgur.com/\(imgurID).jpg"
-                            if let transformedURL = URL(string: directImageURL) {
-                                print("✅ Transformed Imgur URL to direct image: \(transformedURL)")
-                                return transformedURL
-                            }
-                        }
-                    }
-                    
-                    print("    - Image host checks: i.redd.it=\(isRedditImage), i.imgur=\(isImgurDirect), gfycat=\(isGfycatImage), discord=\(isDiscordImage)")
-                    
-                    // If it's from a known image host, use it even without extension
-                    if isRedditImage || isImgurDirect || isGfycatImage || isDiscordImage {
-                        print("✅ Using URL from known image host: \(postURL)")
-                        return postURL
-                    }
-                    
-                    // Also check with suffix method as fallback
-                    let hasSuffixJPG = lowercasedURL.hasSuffix(".jpg")
-                    let hasSuffixJPEG = lowercasedURL.hasSuffix(".jpeg")
-                    let hasSuffixPNG = lowercasedURL.hasSuffix(".png")
-                    let hasSuffixGIF = lowercasedURL.hasSuffix(".gif")
-                    let hasSuffixWEBP = lowercasedURL.hasSuffix(".webp")
-                    
-                    print("    - Suffix checks: jpg=\(hasSuffixJPG), jpeg=\(hasSuffixJPEG), png=\(hasSuffixPNG), gif=\(hasSuffixGIF), webp=\(hasSuffixWEBP)")
-                    
-                    // Check using pathExtension first (more reliable)
-                    let validExtensions = ["jpg", "jpeg", "png", "gif", "webp"]
-                    let isPathExtensionValid = validExtensions.contains(pathExtension)
-                    print("    - Is pathExtension '\(pathExtension)' in validExtensions: \(isPathExtensionValid)")
-                    
-                    if isPathExtensionValid {
-                        print("✅ Using direct post url (via pathExtension): \(postURL)")
-                        return postURL
-                    }
-                    
-                    // Fallback to suffix check (for edge cases)
-                    let hasValidSuffix = hasSuffixJPG || hasSuffixJPEG || hasSuffixPNG || hasSuffixGIF || hasSuffixWEBP
-                    print("    - Has valid suffix: \(hasValidSuffix)")
-                    
-                    if hasValidSuffix {
-                        print("✅ Using direct post url (via suffix): \(postURL)")
-                        return postURL
-                    }
-                    
-                    print("    - Not detected as image URL")
-                }
-        
-        // 4) Preview images (skip for videos as they're often broken)
-        if let preview = preview, let firstImage = preview.images.first {
-            // Try to get the source (full resolution) first
-            let sourceURLString = firstImage.source.url
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "amp;", with: "") // Sometimes double-encoded
-            
-            if let url = URL(string: sourceURLString) {
-                print("✅ Using preview source URL (full res): \(url)")
-                return url
-            }
-            
-            // If source fails, try the highest resolution available
-            let highResolutions = firstImage.resolutions.filter { $0.width > 320 && $0.height > 240 }
-            if let bestResolution = highResolutions.last {
-                let resURLString = bestResolution.url
-                    .replacingOccurrences(of: "&amp;", with: "&")
-                    .replacingOccurrences(of: "amp;", with: "") // Sometimes double-encoded
-                
-                if let url = URL(string: resURLString) {
-                    print("✅ Using preview high-res URL (\(bestResolution.width)x\(bestResolution.height)): \(url)")
-                    return url
-                }
-            }
-        }
-        
-        // 5) Special handling for gallery URLs as fallback
-        print("  - Checking for gallery URL fallback...")
-        if let urlString = url?.absoluteString,
-           urlString.contains("reddit.com/gallery/") {
-            print("    - This is a gallery URL, but metadata extraction failed")
-            print("    - Gallery URL: \(urlString)")
-            // For now, we'll return nil and show just the source link
-            // TODO: Implement gallery API fallback if needed
-        }
-        
-        // 6) If the post's url is a reddit.com/media link, extract the actual image URL from the query parameter.
-        print("  - Checking for reddit.com/media link...")
-        if let urlString = url?.absoluteString,
-           urlString.contains("reddit.com/media") {
-            print("    - Found reddit.com/media link, extracting actual URL...")
-            if let components = URLComponents(string: urlString),
-               let queryItems = components.queryItems,
-               let actualItem = queryItems.first(where: { $0.name == "url" }),
-               let encodedUrlString = actualItem.value,
-               let decodedUrlString = encodedUrlString.removingPercentEncoding,
-               let actualUrl = URL(string: decodedUrlString) {
-                print("✅ Using extracted media URL: \(actualUrl)")
-                return actualUrl
-            }
-        }
-        // 7) Parse the post's content for an inline image link BEFORE using thumbnail
-        print("  - Checking post content for inline images...")
-        if let inlineURL = parseFirstImageURL(in: content) {
-            print("✅ Using inline content URL: \(inlineURL)")
-            return inlineURL
-        }
-        // 8) Last resort: Use thumbnail if available (better than nothing)
-        print("  - Checking thumbnail as last resort...")
-        if let thumb = thumbnail,
-           !thumb.isEmpty,
-           thumb != "self",
-           thumb != "default",
-           thumb != "nsfw",
-           thumb != "spoiler" {
-            
-            let decodedThumb = thumb
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "&lt;", with: "<")
-                .replacingOccurrences(of: "&gt;", with: ">")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&#39;", with: "'")
-                .replacingOccurrences(of: "&nbsp;", with: " ")
-            
-            if let thumbURL = URL(string: decodedThumb) {
-                // Even low-quality thumbnails are better than no image at all
-                print("✅ Using thumbnail as last resort: \(thumbURL)")
-                return thumbURL
-            } else {
-                print("  - Failed to parse thumbnail URL: \(thumb)")
-            }
-        }
-        print("❌ No high-quality image found for post '\(title.prefix(30))...' (id: \(id))")
-                print("   This is normal for text posts or posts with only low-quality thumbnails")
-                return nil
-            }
-            
-            /// Test function to verify image URL detection logic
-            func testImageURLDetection(_ testURL: URL) {
-                print("🔍 Testing image URL detection for: \(testURL.absoluteString)")
-                
-                // Use pathExtension for more reliable extension detection (handles query params)
-                let pathExtension = testURL.pathExtension.lowercased()
-                print("  - Path extension: '\(pathExtension)'")
-                
-                // Also check with suffix method as fallback
-                let lowercasedURL = testURL.absoluteString.lowercased()
-                let hasSuffixJPG = lowercasedURL.hasSuffix(".jpg")
-                let hasSuffixJPEG = lowercasedURL.hasSuffix(".jpeg")
-                let hasSuffixPNG = lowercasedURL.hasSuffix(".png")
-                let hasSuffixGIF = lowercasedURL.hasSuffix(".gif")
-                let hasSuffixWEBP = lowercasedURL.hasSuffix(".webp")
-                
-                print("  - Suffix checks: jpg=\(hasSuffixJPG), jpeg=\(hasSuffixJPEG), png=\(hasSuffixPNG), gif=\(hasSuffixGIF), webp=\(hasSuffixWEBP)")
-                
-                // Check using pathExtension first (more reliable)
-                let validExtensions = ["jpg", "jpeg", "png", "gif", "webp"]
-                let isPathExtensionValid = validExtensions.contains(pathExtension)
-                print("  - Is pathExtension '\(pathExtension)' in validExtensions: \(isPathExtensionValid)")
-                
-                // Fallback to suffix check (for edge cases)
-                let hasValidSuffix = hasSuffixJPG || hasSuffixJPEG || hasSuffixPNG || hasSuffixGIF || hasSuffixWEBP
-                print("  - Has valid suffix: \(hasValidSuffix)")
-                
-                if isPathExtensionValid || hasValidSuffix {
-                    print("✅ Test URL would be detected as image URL")
-                } else {
-                    print("❌ Test URL would NOT be detected as image URL")
-                }
-            }
-            
-            /// Aggregates all potential image URLs, prioritizing higher resolution versions.
-            var allImageURLs: [URL] {
+        resolvedImageURL
+    }
+
+    /// All distinct images in the post. A gallery lists each of its images once; any other post has at most
+    /// one image, even though Reddit exposes it under several URLs (direct link, preview source, resized copies).
+    var allImageURLs: [URL] {
         var urls = [URL]()
-        // 1) From preview - try to get highest resolution versions.
-        if let preview = preview, let firstImage = preview.images.first {
-            // Add source (full resolution) first
-            let sourceURLString = firstImage.source.url.replacingOccurrences(of: "&amp;", with: "&")
-            if let url = URL(string: sourceURLString) {
+        var seenKeys = Set<String>()
+        func appendDistinct(_ url: URL) {
+            if seenKeys.insert(Self.imageIdentityKey(for: url)).inserted {
                 urls.append(url)
             }
-            // Add high resolution alternatives (skip low-res versions)
-            for resolution in firstImage.resolutions.reversed() {
-                let resURLString = resolution.url.replacingOccurrences(of: "&amp;", with: "&")
-                if let url = URL(string: resURLString), 
-                   !urls.contains(url),
-                   resolution.width > 320 { // Only include resolutions wider than 320px
-                    urls.append(url)
-                }
-            }
         }
-        // 2) From gallery (gallery_data + media_metadata).
+
+        // 1) Gallery (gallery_data + media_metadata): one entry per gallery item.
         if let gallery = gallery_data, let media = media_metadata {
             for item in gallery.items {
                 if let mediaItem = media[item.media_id],
                    mediaItem.status == "valid",
                    let urlString = mediaItem.s?.u?.replacingOccurrences(of: "&amp;", with: "&"),
-                   let url = URL(string: urlString),
-                   !urls.contains(url) { // Avoid duplicates
-                    urls.append(url)
+                   let url = URL(string: urlString) {
+                    appendDistinct(url)
                 }
             }
         }
-        // 3) Direct URL if it points to an image.
-        if let urlString = url?.absoluteString.lowercased(),
-           (urlString.hasSuffix(".jpg") ||
-            urlString.hasSuffix(".jpeg") ||
-            urlString.hasSuffix(".png") ||
-            urlString.hasSuffix(".gif") ||
-            urlString.hasSuffix(".webp")),
-           let validUrl = url,
-           !urls.contains(validUrl) {
-            urls.append(validUrl)
+        if !urls.isEmpty {
+            return urls
         }
-        // 3.5) If the direct URL is a reddit.com/media link, extract the image.
-        if let urlString = url?.absoluteString,
-           urlString.contains("reddit.com/media"),
-           let components = URLComponents(string: urlString),
-           let queryItems = components.queryItems,
-           let actualItem = queryItems.first(where: { $0.name == "url" }),
-           let encodedUrlString = actualItem.value,
-           let decodedUrlString = encodedUrlString.removingPercentEncoding,
-           let actualUrl = URL(string: decodedUrlString),
-           !urls.contains(actualUrl) {
-            urls.append(actualUrl)
+
+        // 2) Not a gallery: a single image, taken from the best available source.
+        if let resolvedImageURL {
+            return [resolvedImageURL]
         }
-        // 4) Parse the post's content for inline images BEFORE thumbnails.
-        if let inlineImageURL = parseFirstImageURL(in: content),
-           !urls.contains(inlineImageURL) {
-            urls.append(inlineImageURL)
+        if let preview = preview, let firstImage = preview.images.first,
+           let url = URL(string: firstImage.source.url.replacingOccurrences(of: "&amp;", with: "&")) {
+            return [url]
         }
-        // 5) AVOID thumbnails in gallery - they are low quality and look terrible
-        // Only include if we have no other images AND they're not Reddit's low-quality thumbnails
-        if urls.isEmpty {
-            if let thumb = thumbnail,
-               !thumb.isEmpty,
-               thumb != "self",
-               thumb != "default",
-               thumb != "nsfw",
-               thumb != "spoiler",
-               !thumb.contains("NSFW_") {
+        if let inlineImageURL = parseFirstImageURL(in: content) {
+            return [inlineImageURL]
+        }
+        return []
+    }
                 
-                let decodedThumb = thumb
-                    .replacingOccurrences(of: "&amp;", with: "&")
-                    .replacingOccurrences(of: "&lt;", with: "<")
-                    .replacingOccurrences(of: "&gt;", with: ">")
-                    .replacingOccurrences(of: "&quot;", with: "\"")
-                    .replacingOccurrences(of: "&#39;", with: "'")
-                    .replacingOccurrences(of: "&nbsp;", with: " ")
-                
-                // Skip Reddit's own low-quality thumbnails even in gallery
-                if decodedThumb.contains("redd.it") && 
-                   (decodedThumb.contains("://a.thumbs.redditmedia.com") || 
-                    decodedThumb.contains("://b.thumbs.redditmedia.com") ||
-                    decodedThumb.contains("external-preview.redd.it")) {
-                    print("Skipping low-quality Reddit thumbnail from gallery: \(decodedThumb)")
-                } else if let thumbURL = URL(string: decodedThumb) {
-                    urls.append(thumbURL)
-                    print("WARNING: Including thumbnail in gallery (may be low quality)")
-                }
+    /// Identifies an image independent of host, size and query, so that i.redd.it/abc.jpg,
+    /// preview.redd.it/abc.jpg?width=640 and preview.redd.it/some-title-v0-abc.png?... compare equal.
+    static func imageIdentityKey(for url: URL) -> String {
+        let host = url.host?.lowercased() ?? ""
+        var name = (url.lastPathComponent as NSString).deletingPathExtension.lowercased()
+        if host.hasSuffix("redd.it") || host.hasSuffix("redditmedia.com") {
+            if let range = name.range(of: "-v0-", options: .backwards) {
+                name = String(name[range.upperBound...])
             }
+            return "reddit:" + name
         }
-        return urls
+        return host + url.deletingPathExtension().path.lowercased()
     }
     
     /// Returns a cleaned preview text by stripping HTML tags and replacing image/link URLs.

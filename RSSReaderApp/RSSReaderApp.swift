@@ -1,9 +1,12 @@
 import SwiftUI
 import Combine
 import Kingfisher
+import AppKit
+import CloudKit
 
 @main
 struct RSSReaderApp: App {
+    @NSApplicationDelegateAdaptor(RSSReaderAppDelegate.self) private var appDelegate
     @StateObject private var appState = AppState()
     @AppStorage("appearanceMode") private var appearanceMode: Int = 0 // 0: System, 1: Light, 2: Dark
 
@@ -179,5 +182,18 @@ struct RSSReaderApp: App {
                 }
             }
         }
+    }
+}
+
+
+/// Registers the native Mac app for private CloudKit database push notifications.
+final class RSSReaderAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApplication.shared.registerForRemoteNotifications()
+    }
+
+    func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
+        guard CKNotification(fromRemoteNotificationDictionary: userInfo) != nil else { return }
+        CloudKitSyncManager.shared.syncNow()
     }
 }
