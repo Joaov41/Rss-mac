@@ -2,7 +2,7 @@
 
 Applied only to `/Volumes/screen/rss mac copy`. The iOS reference at `/Volumes/screen/rss latest ios27 - UI fix copy` was read only. All 68 initially captured Swift/project/plist/entitlement reference files still match their SHA-256 hashes.
 
-The existing Mac working tree was preserved in `/private/tmp/rss-mac-ios-port-baseline` before edits. That snapshot is a temporary local source backup, not a Git commit. No app build, install, launch, push, signing, CloudKit schema deployment, or external account operation was performed.
+The existing Mac working tree was preserved in `/private/tmp/rss-mac-ios-port-baseline` before edits. That snapshot is a temporary local source backup, not a Git commit. At source-port completion, no app build, install, launch, push, signing, CloudKit schema deployment, or external account operation had been performed. The subsequently requested development build and launch are recorded below.
 
 ## Features applied
 
@@ -28,12 +28,23 @@ The iOS widget target and phone-only layouts were not added to the Mac app.
 - Targeted compiler typechecks pass for sync/persistence/models, ChatGPT service, Custom Server service/controller/settings, Reddit OAuth/service, and native podcast service. Unrelated app dependencies were supplied as interface stubs where needed; these checks do not constitute a full target build.
 - The new behavioral fixture compiles and executes the actual settings, Reddit-media, selection-prompt, and CloudKit merge code. It checks legacy decode defaults, persisted settings, exclusion of the Custom Server key from JSON, token caps, image identity, explanation/Web prompt separation, and newer-removal/stale-upload ordering for favorites/subscriptions. It does not start CloudKit or make network requests.
 - **84 regression tests: 75 pass, 8 fail, 1 error.** The 8 failures and 1 error are exactly the baseline failures captured before this port; no new failures remain. Three existing source-level regression checks were updated for the replaced sync/selection implementations.
-- A read-only full-source typecheck using existing cached package modules was attempted. Cached package dependency resolution stopped it at a missing `yyjson` module, so full target compilation is unverified.
+- A read-only full-source typecheck using existing cached package modules was attempted. Cached package dependency resolution stopped it at a missing `yyjson` module, the subsequent full Xcode Debug build below succeeded.
 - iOS reference hashes are unchanged.
 
-## Build and runtime checks still needed
+## Verified Mac build and launch — 7 October 2026
 
-Build the native `RSSReaderApp (macOS)` scheme when requested, with DerivedData on a volume that has space. `/Volumes/screen` had about 1.2 GiB free at the start; no files were deleted for space.
+The native `RSSReaderApp (macOS)` Debug build succeeded after Xcode refreshed the development provisioning profile for iCloud/Push Notifications. The app was opened and its Today window was verified with loaded feed content.
+
+- App: `/Volumes/BackUP /DerivedData-rssmac-port/Build/Products/Debug/RSSReaderApp.app`
+- Bundle ID: `com.joaovalente.RSSReaderApp`
+- Signature: `codesign --verify --deep --strict` passed.
+- Entitlements: development push and `iCloud.com.joaovalente.RSSReaderApp` CloudKit container verified in the signed app.
+- Build fixes: attached the Reddit comment sheet to the correct detail view; used the Mac comment-status fields; split Settings provider/sync sections to avoid compiler type-check limits; shared the Mac button style with the ChatGPT panel; corrected the Custom Server panel initializer. The build script now allows Xcode automatic development provisioning updates, and the target records iCloud/Push capabilities.
+- Detailed feature and cross-device sync checks remain separate from this successful launch. No release or Production schema deployment was performed.
+
+## Remaining feature/runtime checks
+
+For future builds, keep DerivedData on a volume that has space. `/Volumes/screen` had about 1.2 GiB free at the start; no files were deleted for space.
 
 Verify Mac ↔ iPad reads, favorite/subscription removals, default-install protection, and remote badge updates. Exercise local-server summaries/Q&A and ChatGPT sign-in/inference in an eligible development build. Reconnect Reddit to grant comment permissions. Check media keys/Control Center, podcast playback/export, sidebar confirmations, navy colors, summary scrolling, and desktop back/forward.
 

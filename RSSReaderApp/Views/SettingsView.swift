@@ -111,7 +111,7 @@ private extension View {
     }
 
     @ViewBuilder
-    func settingsGlassButtonStyle(prominent: Bool = false, tintColor: Color? = nil) -> some View {
+    internal func settingsGlassButtonStyle(prominent: Bool = false, tintColor: Color? = nil) -> some View {
         #if os(macOS)
         if #available(macOS 26.0, *) {
             self.buttonStyle(MacSettingsGlassButtonStyle(prominent: prominent, tintColor: tintColor))
@@ -402,6 +402,180 @@ struct SettingsView: View {
     }
     #endif
     
+    private var summaryProviderSection: some View {
+        Section("Summary Provider") {
+        #if os(macOS)
+        macSummaryProviderSelector
+            .padding(.vertical, 4)
+            .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
+                summaryProviderDidChange(newValue)
+            }
+        #else
+        Picker("Summary Source", selection: $appState.settings.selectedSummaryProvider) {
+            ForEach(AppSettings.SummaryProvider.selectableCases, id: \.self) { provider in
+                Text(provider.displayName)
+                    .tag(provider)
+            }
+        }
+        .pickerStyle(.menu)
+        .padding(.vertical, 4)
+        .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
+            summaryProviderDidChange(newValue)
+        }
+        #endif
+
+    Text(summaryProviderDescription)
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .padding(.top, 4)
+
+        #if os(macOS)
+        macWebAISelector
+            .padding(.top, 6)
+        #else
+        Picker("Web AI Destination", selection: Binding(
+            get: { appState.settings.selectedWebAIProvider },
+            set: { newValue in
+                var newSettings = appState.settings
+                newSettings.selectedWebAIProvider = newValue
+                appState.updateSettings(newSettings)
+            }
+        )) {
+            ForEach(WebAIProvider.allCases) { provider in
+                Text(provider.displayName).tag(provider)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.top, 6)
+        #endif
+
+        Text(webAIUsageDescription)
+            .font(.caption)
+            .foregroundColor(.secondary)
+
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Persistent Web AI Sessions")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+
+            Text("Log in inside RSSReaderApp so ChatGPT and Gemini sessions are reused by the in-app WebAI browser.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            #if os(macOS)
+            macWebAISessionButtons
+            #else
+            HStack(spacing: 10) {
+                Button(chatGPTLoginButtonTitle) {
+                    pendingWebAILoginProvider = .chatgpt
+                }
+                .settingsGlassButtonStyle()
+
+                Button("Reset ChatGPT") {
+                    appState.resetWebAISession(for: .chatgpt)
+                    isChatGPTWebAILoggedIn = false
+                }
+                .settingsGlassButtonStyle()
+            }
+
+            HStack(spacing: 10) {
+                Button(geminiLoginButtonTitle) {
+                    pendingWebAILoginProvider = .gemini
+                }
+                .settingsGlassButtonStyle()
+
+                Button("Reset Gemini") {
+                    appState.resetWebAISession(for: .gemini)
+                    isGeminiWebAILoggedIn = false
+                }
+                .settingsGlassButtonStyle()
+            }
+            #endif
+        }
+
+        if appState.settings.selectedSummaryProvider == .coreAIMLXLocal {
+            coreAIMLXSettingsView
+        }
+
+        #if os(iOS)
+        if appState.settings.selectedSummaryProvider == .summarizeDaemon {
+            summarizeSettingsView
+        }
+        #endif
+
+        if appState.settings.selectedSummaryProvider == .openAICompatible {
+            OpenAICompatibleSettingsView()
+        }
+        if appState.settings.selectedSummaryProvider == .chatGPT {
+            ChatGPTPlanSettingsView()
+        }
+
+        if appState.settings.selectedSummaryProvider == .applePCCGateway {
+            pccGatewaySettingsView
+        }
+}
+    }
+
+    private var cloudSyncSection: some View {
+        Section("Cloud Sync") {
+    Button {
+        appState.manualCloudRefresh()
+    } label: {
+        if appState.manualCloudSyncState == .syncing {
+            Label("Syncing…", systemImage: "arrow.triangle.2.circlepath.circle.fill")
+        } else if appState.manualCloudSyncState == .completed {
+            Label("Synced", systemImage: "checkmark.circle.fill")
+        } else {
+            Label("Sync Now", systemImage: "arrow.clockwise.circle.fill")
+        }
+    }
+    .settingsGlassButtonStyle(prominent: true)
+    .tint(.blue)
+    .disabled(appState.manualCloudSyncState == .syncing)
+
+    Text("Pull the latest read states and subscriptions from iCloud immediately.")
+        .font(.caption)
+        .foregroundColor(.secondary)
+
+    if let status = appState.manualCloudSyncStatusMessage {
+        Text(status)
+            .font(.caption)
+            .foregroundColor(.green)
+    }
+
+    Text("Read states, favorites and subscriptions sync automatically across your devices signed in to the same iCloud account.")
+        .font(.caption)
+        .foregroundColor(.secondary)
+
+    // Plain sync status for everyone; the technical details stay collapsed for troubleshooting.
+    TimelineView(.periodic(from: .now, by: 3)) { _ in
+        let status = CloudKitSyncManager.shared.friendlyStatus()
+        VStack(alignment: .leading, spacing: 8) {
+            Label(status.text, systemImage: status.systemImage)
+                .font(.subheadline)
+                .foregroundColor(status.isProblem ? .orange : .secondary)
+
+            DisclosureGroup("Sync Details") {
+                Text(CloudKitSyncManager.shared.statusSummary())
+                    .font(.caption2.monospaced())
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .font(.caption)
+        }
+    }
+}
+    }
+
+    private var webAIUsageDescription: String {
+        let providerName = appState.settings.selectedWebAIProvider.displayName
+        if appState.settings.selectedSummaryProvider == .webAI {
+            return "Web AI summaries use \(providerName) in the in-app browser, send the prompt automatically when possible, and capture the reply back into the app."
+        }
+        return "Web-send buttons open \(providerName) in an in-app browser, paste the prompt, and try to send it automatically."
+    }
+
     var body: some View {
         settingsNavigationContainer {
             ZStack {
@@ -423,122 +597,8 @@ struct SettingsView: View {
                         .padding(.vertical, 4)
                         #endif
                     }
-                    
-                    Section("Summary Provider") {
-                        #if os(macOS)
-                        macSummaryProviderSelector
-                            .padding(.vertical, 4)
-                            .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
-                                summaryProviderDidChange(newValue)
-                            }
-                        #else
-                        Picker("Summary Source", selection: $appState.settings.selectedSummaryProvider) {
-                            ForEach(AppSettings.SummaryProvider.selectableCases, id: \.self) { provider in
-                                Text(provider.displayName)
-                                    .tag(provider)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .padding(.vertical, 4)
-                        .onChange(of: appState.settings.selectedSummaryProvider) { newValue in
-                            summaryProviderDidChange(newValue)
-                        }
-                        #endif
-                        
-                    Text(summaryProviderDescription)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.top, 4)
 
-                        #if os(macOS)
-                        macWebAISelector
-                            .padding(.top, 6)
-                        #else
-                        Picker("Web AI Destination", selection: Binding(
-                            get: { appState.settings.selectedWebAIProvider },
-                            set: { newValue in
-                                var newSettings = appState.settings
-                                newSettings.selectedWebAIProvider = newValue
-                                appState.updateSettings(newSettings)
-                            }
-                        )) {
-                            ForEach(WebAIProvider.allCases) { provider in
-                                Text(provider.displayName).tag(provider)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .padding(.top, 6)
-                        #endif
-
-                        Text(
-                            appState.settings.selectedSummaryProvider == .webAI
-                            ? "Web AI summaries use \(appState.settings.selectedWebAIProvider.displayName) in the in-app browser, send the prompt automatically when possible, and capture the reply back into the app."
-                            : "Web-send buttons open \(appState.settings.selectedWebAIProvider.displayName) in an in-app browser, paste the prompt, and try to send it automatically."
-                        )
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Persistent Web AI Sessions")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-
-                            Text("Log in inside RSSReaderApp so ChatGPT and Gemini sessions are reused by the in-app WebAI browser.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            #if os(macOS)
-                            macWebAISessionButtons
-                            #else
-                            HStack(spacing: 10) {
-                                Button(chatGPTLoginButtonTitle) {
-                                    pendingWebAILoginProvider = .chatgpt
-                                }
-                                .settingsGlassButtonStyle()
-
-                                Button("Reset ChatGPT") {
-                                    appState.resetWebAISession(for: .chatgpt)
-                                    isChatGPTWebAILoggedIn = false
-                                }
-                                .settingsGlassButtonStyle()
-                            }
-
-                            HStack(spacing: 10) {
-                                Button(geminiLoginButtonTitle) {
-                                    pendingWebAILoginProvider = .gemini
-                                }
-                                .settingsGlassButtonStyle()
-
-                                Button("Reset Gemini") {
-                                    appState.resetWebAISession(for: .gemini)
-                                    isGeminiWebAILoggedIn = false
-                                }
-                                .settingsGlassButtonStyle()
-                            }
-                            #endif
-                        }
-
-                        if appState.settings.selectedSummaryProvider == .coreAIMLXLocal {
-                            coreAIMLXSettingsView
-                        }
-
-                        #if os(iOS)
-                        if appState.settings.selectedSummaryProvider == .summarizeDaemon {
-                            summarizeSettingsView
-                        }
-                        #endif
-
-                        if appState.settings.selectedSummaryProvider == .openAICompatible {
-                            OpenAICompatibleSettingsView(appState: appState)
-                        }
-                        if appState.settings.selectedSummaryProvider == .chatGPT {
-                            ChatGPTPlanSettingsView()
-                        }
-
-                        if appState.settings.selectedSummaryProvider == .applePCCGateway {
-                            pccGatewaySettingsView
-                        }
-                }
+                    summaryProviderSection
 
                 Section("YouTube") {
                     Toggle("YouTube Support", isOn: Binding(
@@ -558,55 +618,7 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section("Cloud Sync") {
-                    Button {
-                        appState.manualCloudRefresh()
-                    } label: {
-                        if appState.manualCloudSyncState == .syncing {
-                            Label("Syncing…", systemImage: "arrow.triangle.2.circlepath.circle.fill")
-                        } else if appState.manualCloudSyncState == .completed {
-                            Label("Synced", systemImage: "checkmark.circle.fill")
-                        } else {
-                            Label("Sync Now", systemImage: "arrow.clockwise.circle.fill")
-                        }
-                    }
-                    .settingsGlassButtonStyle(prominent: true)
-                    .tint(.blue)
-                    .disabled(appState.manualCloudSyncState == .syncing)
-
-                    Text("Pull the latest read states and subscriptions from iCloud immediately.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    if let status = appState.manualCloudSyncStatusMessage {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundColor(.green)
-                    }
-
-                    Text("Read states, favorites and subscriptions sync automatically across your devices signed in to the same iCloud account.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    // Plain sync status for everyone; the technical details stay collapsed for troubleshooting.
-                    TimelineView(.periodic(from: .now, by: 3)) { _ in
-                        let status = CloudKitSyncManager.shared.friendlyStatus()
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label(status.text, systemImage: status.systemImage)
-                                .font(.subheadline)
-                                .foregroundColor(status.isProblem ? .orange : .secondary)
-
-                            DisclosureGroup("Sync Details") {
-                                Text(CloudKitSyncManager.shared.statusSummary())
-                                    .font(.caption2.monospaced())
-                                    .foregroundColor(.secondary)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .font(.caption)
-                        }
-                    }
-                }
+                    cloudSyncSection
                     
                     Section("API Keys") {
                         SecureField("Gemini API Key", text: $geminiApiKey)

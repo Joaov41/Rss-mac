@@ -11,6 +11,7 @@ xcodebuild \
   -configuration Debug \
   -destination "platform=macOS" \
   -derivedDataPath "${DERIVED_DATA_PATH}" \
+  -allowProvisioningUpdates \
   build
 
 APP_PATH="${DERIVED_DATA_PATH}/Build/Products/Debug/RSSReaderApp.app"

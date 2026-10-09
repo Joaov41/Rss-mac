@@ -59,9 +59,6 @@ private struct RedditCommentsActionCapsule<Content: View>: View {
         }
         .modifier(RedditCommentsActionPillModifier())
         .accessibilityElement(children: .contain)
-        .sheet(item: $postCommentTarget) { post in
-            postCommentSheet(for: post)
-        }
 
     }
 }
@@ -397,6 +394,9 @@ struct RedditDetailView: View {
                       !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                 scrollToSummarySection(redditCommentSummaryAnchor, using: proxy)
             }
+        }
+        .sheet(item: $postCommentTarget) { post in
+            postCommentSheet(for: post)
         }
         .askAILoadingOverlay(isSelectionAskAIInFlight)
         .sheet(isPresented: $showSelectionAskAIResponse) {
@@ -1614,7 +1614,8 @@ struct RedditDetailView: View {
             displayedComments = Array(displayedComments.prefix(maxDisplayComments))
         }
         hasMoreCommentsToLoad = displayedComments.count < comments.count
-        commentLoadStatusMessage = nil
+        commentLoadError = nil
+        commentBanner = nil
 
         commentSummary = nil
         showCommentSummary = false

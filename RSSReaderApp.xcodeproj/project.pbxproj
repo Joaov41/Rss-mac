@@ -342,6 +342,10 @@
 				TargetAttributes = {
 					A1B2C3D4E5F6A7B8C9D0E233 = {
 						CreatedOnToolsVersion = 15.0;
+						SystemCapabilities = {
+							com.apple.Push = { enabled = 1; };
+							com.apple.iCloud = { enabled = 1; };
+						};
 					};
 				};
 			};
